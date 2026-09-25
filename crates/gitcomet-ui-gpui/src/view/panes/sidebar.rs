@@ -1217,7 +1217,17 @@ impl SidebarPaneView {
         let content = match mode {
             SidebarMode::Branches => self.render_branches_content(theme, cx),
             SidebarMode::Files => self.render_file_browser_content(theme, cx),
-            SidebarMode::PullRequests => self.render_pull_requests_content(theme, cx),
+            SidebarMode::PullRequests => {
+                let reviewing = self
+                    .root_view
+                    .upgrade()
+                    .is_some_and(|root| root.read(cx).active_review().is_some());
+                if reviewing {
+                    self.render_review_files_content(theme, cx)
+                } else {
+                    self.render_pull_requests_content(theme, cx)
+                }
+            }
         };
 
         // `size_full`, not just `h_full`: mounted as a cached view this is laid
@@ -3130,6 +3140,198 @@ impl SidebarPaneView {
 }
 
 impl SidebarPaneView {
+    /// Review mode's file list: which files are viewed and where the pending
+    /// comments are.
+    fn render_review_files_content(
+        &mut self,
+        theme: AppTheme,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let Some(root) = self.root_view.upgrade() else {
+            return div().into_any_element();
+        };
+        let (number, title, current, rows) = {
+            let root = root.read(cx);
+            let Some(review) = root.active_review() else {
+                return div().into_any_element();
+            };
+            let rows: Vec<(String, bool, usize, usize)> = review
+                .files
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        review.draft.viewed.contains(path),
+                        review.comments_on(path),
+                        review.threads_on(path),
+                    )
+                })
+                .collect();
+            (review.number, review.title.clone(), review.file_ix, rows)
+        };
+        let viewed = rows.iter().filter(|(_, viewed, ..)| *viewed).count();
+        let total = rows.len();
+        let secondary = theme.colors.foreground.secondary;
+        let success = theme.colors.status.success.foreground;
+        let warning = theme.colors.status.warning.foreground;
+
+        let file_rows =
+            rows.into_iter()
+                .enumerate()
+                .map(|(ix, (path, is_viewed, comments, threads))| {
+                    let name = path
+                        .rsplit_once('/')
+                        .map_or(path.as_str(), |(_, name)| name);
+                    div()
+                        .id(SharedString::from(format!("review_file_{ix}")))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_1()
+                        .px_2()
+                        .py(px(4.0))
+                        .rounded(px(theme.radii.control))
+                        .control_interaction(
+                            controls::InteractionStyle::new(theme),
+                            controls::InteractionState::default().selected(
+                                ix == current,
+                                theme.colors.interaction.selected_background,
+                            ),
+                        )
+                        .on_activate(
+                            false,
+                            controls::ControlActivation::Composite,
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                window.focus(&this.panel_focus_handle, cx);
+                                // The root repaints this pane; it can't while we're mid-update.
+                                let root = this.root_view.clone();
+                                cx.defer(move |cx| {
+                                    let _ =
+                                        root.update(cx, |root, cx| root.review_open_file(ix, cx));
+                                });
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.0))
+                                .border_1()
+                                .border_color(if is_viewed { success } else { secondary })
+                                .when(is_viewed, |check| {
+                                    check.bg(success).child(crate::view::icons::svg_icon(
+                                        "icons/check.svg",
+                                        theme.colors.surface.chrome,
+                                        px(10.0),
+                                    ))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(theme.ui_text(12.5))
+                                        .when(is_viewed, |text| text.text_color(secondary))
+                                        .child(name.to_string()),
+                                )
+                                .when(name != path, |row| {
+                                    row.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(theme.ui_text(11.0))
+                                            .text_color(secondary)
+                                            .child(path.clone()),
+                                    )
+                                }),
+                        )
+                        .when(threads > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(secondary)
+                                    .child(format!(
+                                        "{threads} thread{}",
+                                        if threads == 1 { "" } else { "s" }
+                                    )),
+                            )
+                        })
+                        .when(comments > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(warning)
+                                    .child(crate::view::icons::svg_icon(
+                                        "icons/pencil.svg",
+                                        warning,
+                                        px(11.0),
+                                    ))
+                                    .child(comments.to_string()),
+                            )
+                        })
+                });
+
+        div()
+            .id("review_files")
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(12.0))
+                            .text_color(secondary)
+                            .child(format!("Reviewing #{number} · {viewed} of {total} viewed")),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .id("review_file_rows")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(file_rows),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(theme.ui_text(11.5))
+                    .text_color(secondary)
+                    .child("space viewed · ]/[ file · S submit · q leave"),
+            )
+            .into_any_element()
+    }
+
     /// The Pull requests tab: the repository's open PRs, listed through gh.
     fn render_pull_requests_content(
         &mut self,
@@ -3200,6 +3402,21 @@ impl SidebarPaneView {
         use crate::github::ReviewDecision;
 
         let secondary = theme.colors.foreground.secondary;
+        let drafts = self
+            .root_view
+            .upgrade()
+            .and_then(|root| {
+                root.read(cx)
+                    .active_pull_requests()
+                    .map(|prs| prs.drafts.clone())
+            })
+            .unwrap_or_default();
+        let ranks: Vec<u8> = list
+            .iter()
+            .map(|pr| super::super::pull_requests::inbox_rank(pr, &drafts))
+            .collect();
+        // Section titles only once something is waiting on you.
+        let sectioned = ranks.iter().any(|rank| *rank < 2);
         let header = div()
             .flex()
             .items_center()
@@ -3210,7 +3427,11 @@ impl SidebarPaneView {
                 div()
                     .text_size(theme.ui_text(12.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("Open · {}", list.len())),
+                    .child(if sectioned {
+                        format!("Pull requests · {}", list.len())
+                    } else {
+                        format!("Open · {}", list.len())
+                    }),
             )
             .child(div().flex_1())
             .child(
@@ -3220,9 +3441,15 @@ impl SidebarPaneView {
                     .child("n new · R refresh"),
             );
 
-        let rows = list.iter().map(|pr| {
+        let row = |pr: &crate::github::PullRequestSummary| {
             let number = pr.number;
             let mut badges: Vec<(String, gpui::Rgba)> = Vec::new();
+            if let Some(pending) = drafts.get(&number) {
+                badges.push((
+                    format!("{pending} drafted"),
+                    theme.colors.status.warning.foreground,
+                ));
+            }
             if pr.is_draft {
                 badges.push(("Draft".to_string(), secondary));
             }
@@ -3303,7 +3530,32 @@ impl SidebarPaneView {
                             div().flex_none().text_color(color).child(label)
                         })),
                 )
-        });
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (ix, pr) in list.iter().enumerate() {
+            let rank = ranks[ix];
+            if sectioned && (ix == 0 || ranks[ix - 1] != rank) {
+                let title = match rank {
+                    0 => "Waiting for your review",
+                    1 => "Your reviews in progress",
+                    _ => "Open",
+                };
+                let count = ranks.iter().filter(|other| **other == rank).count();
+                rows.push(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(theme.ui_text(11.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(secondary)
+                        .child(format!("{title} · {count}"))
+                        .into_any_element(),
+                );
+            }
+            rows.push(row(pr));
+        }
 
         div()
             .flex()

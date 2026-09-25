@@ -1067,6 +1067,7 @@ impl GitCometView {
                     window.defer(cx, move |window, cx| window.focus(&handle, cx));
                 }
             }
+            self.review_after_render(window, cx);
             if self.focus_diff_when_open && diff_open {
                 self.focus_diff_when_open = false;
                 let view = cx.entity();

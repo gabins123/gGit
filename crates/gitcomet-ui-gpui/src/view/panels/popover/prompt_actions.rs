@@ -115,8 +115,17 @@ impl PopoverHost {
                 number,
                 kind,
             } => pull_request_review_prompt::panel(self, repo_id, number, kind, cx),
-            PopoverKind::CreatePullRequest { repo_id } => {
-                create_pull_request_prompt::panel(self, repo_id, cx)
+            PopoverKind::CreatePullRequest { repo_id, branch } => {
+                create_pull_request_prompt::panel(self, repo_id, branch, cx)
+            }
+            PopoverKind::ReviewComment {
+                anchor,
+                edit,
+                reply_to,
+                ..
+            } => review_comment_prompt::panel(self, anchor, edit, reply_to, cx),
+            PopoverKind::MergePullRequest { number, method, .. } => {
+                merge_pull_request_prompt::panel(self, number, method, cx)
             }
             PopoverKind::Repo { repo_id, kind } => match kind {
                 RepoPopoverKind::Remote(remote_kind) => match remote_kind {

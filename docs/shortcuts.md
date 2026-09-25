@@ -79,6 +79,8 @@ Single keys for everyday Git work, lazygit-style. Each one runs the same action 
 | Delete the branch | `Shift+D` twice | Sidebar | The first press asks for the second. Local branches other than the checked-out one. An unmerged branch then asks before force-deleting. |
 | Merge it into the current branch | `Shift+M` twice | Sidebar | The first press asks for the second. |
 | Rebase the current branch onto it | `Shift+R` | Sidebar | Confirms first. |
+| Open a pull request on GitHub | `o` | Sidebar | lazygit's key: GitHub's new pull request page for the branch, in the browser, against the default branch. The branch must already be on GitHub. |
+| Set up a pull request from the branch | `Shift+O` | Sidebar | The New pull request dialog for that branch (base, title, body, draft). `Ctrl+Enter` creates it through gh; `Alt+O` opens GitHub's page with the chosen base instead. |
 | Cherry-pick the commit | `Shift+C` | History | Confirms first. Not the HEAD commit. |
 | Revert the commit | `t` | History | Confirms first. |
 | Reset to the commit | `g` | History | A mixed reset, after confirming. Soft and hard resets are in the commit's menu (`m`). |
@@ -95,10 +97,35 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Next / previous pull request | `j` / `k` | Sidebar. Selecting one shows it in Details. |
 | Next / previous changed file | `j` / `k` | Details, while it shows a pull request. Moves the diff along once one is open. |
 | Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. Pull requests over 100 files or 20,000 changed lines are left to GitHub. |
-| New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, and `Ctrl+Enter` (`Cmd+Enter`) creates. |
-| Review | `r` | `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
+| New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, `Alt+O` opens GitHub's page for it instead, and `Ctrl+Enter` (`Cmd+Enter`) creates. From another branch: `Shift+O` on it in the Branches tab. |
+| Review | `r` | Opens review mode for the pull request (below), picking up a pending review of it where it was left. |
+| Your review queue | | The list leads with the pull requests waiting for your review, then the ones with a review of yours pending on this computer (with its count), then the rest; `j` / `k` follow that order. |
+| Quick review | `Shift+S` | Just a verdict and a summary, no line comments. `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
+| Check out locally | `Space` | Sidebar or Details. Runs `gh pr checkout`, which fetches the branch into a local branch of the same name and checks it out. A pull request from a fork (or one whose details haven't loaded) gets its own `pr/<number>` branch instead, so a same-named local branch is never fast-forwarded to someone else's commits. git refuses over conflicting uncommitted changes. |
+| Merge on GitHub | `Shift+M` | Confirms first. `Alt+M` / `Alt+S` / `Alt+R` pick merge commit, squash or rebase; `Alt+D` also deletes the branch on GitHub (not offered for forks); `Enter` merges. GitHub refuses if the branch moved since its details loaded, so only the commits you saw land. With a required merge queue, GitHub queues it instead. Local branches are left alone. |
+| Scroll the checks and conversation | `Shift+J` / `Shift+K` | Details. Below the changed files it lists each check (failing first) and the comments and reviews, oldest first, as plain text. Hidden comments are left out. |
 | Open on GitHub | `o` | The selected pull request, or the repository's pull request list. |
 | Refresh | `Shift+R` | The list loads when the tab first shows; there is no polling. |
+
+### Review mode
+
+`r` on a pull request reviews it file by file. Line comments wait as a pending review, saved on this computer (per repository and pull request) until `S` posts them all together as one GitHub review, through `gh api`, on the head commit the diff shows. If the pull request gets new commits, the review moves to them and asks you to check your comments' lines. Nothing reaches GitHub before that. The Sidebar lists the pull request's files, the main area shows the file's diff, and Details becomes Your review.
+
+| Action | Key | Where | Notes |
+| --- | --- | --- | --- |
+| Move the line cursor | `j` / `k`, `Down` / `Up` | Diff | The cursor starts on the file's first change. |
+| Select lines | `Shift+J` / `Shift+K`, `Shift+Down` / `Shift+Up` | Diff | Grows a selection from the cursor; a plain move drops it, as does `Escape`. No modes. |
+| Comment | `c` | Diff | On the line or the selected lines. `Ctrl+Enter` adds it to the review; `Escape` closes the box and keeps the text for those lines. GitHub only takes comments on changed lines and the 3 lines around them. |
+| Suggest a change | `Alt+S` | Comment box | Puts the selected lines in a GitHub suggestion block, after what's typed, to edit into the fix. GitHub then offers to commit it. Not on removed lines. |
+| Next / previous thread | `t` / `Shift+T` | Diff | Threads already on GitHub, marked in blue (your pending comments are amber). Details shows the thread under the cursor. |
+| Reply | `r` | Diff | To the thread on the line under the cursor. The reply waits with the rest of the review and posts right after it. |
+| Codex suggestions | `i` then `p` | Any panel | In review mode, Codex reviews the pull request's patch as suggested line comments, marked in grey; `t` steps to them too and Details shows the one under the cursor. Nothing is posted: `a` adopts it as your pending comment (edit or delete it like any other), `x` drops it. |
+| Next / previous change | `}` / `{` | Diff | |
+| Next / previous file | `]` / `[` | Any panel | `j` / `k` in the Sidebar too. |
+| Mark the file viewed | `Space` | Diff, Sidebar | Then goes to the next file not yet viewed. `Space` again unmarks it. |
+| Go to a pending comment | `Enter` | Details | `j` / `k` pick one; `e` edits it, `d` `d` deletes it. |
+| Submit | `Shift+S` | Any panel | The review dialog, with the verdict and summary, and the pending line comments going up with it; replies post right after. A Comment review with line comments needs no summary; Request changes always does, and pending replies alone post without a review. Whatever reaches GitHub leaves the draft, even if something after it fails; review mode closes once nothing is left. |
+| Leave | `q` | Any panel | Back to the pull request list. The pending review stays saved; `r` picks it up again. |
 
 ### Codex
 

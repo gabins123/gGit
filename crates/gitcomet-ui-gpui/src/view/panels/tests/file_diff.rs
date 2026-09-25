@@ -7325,6 +7325,7 @@ fn collapsed_diff_inline_unscrolled_unmeasured_render_keeps_horizontal_scroll_ra
 
 mod cache_and_blame;
 mod fixtures;
+mod review_cursor;
 mod scrolling;
 mod syntax;
 use fixtures::{BUILD_RELEASE_ARTIFACTS, COMMIT_PATCH, DEPLOYMENT_CI};

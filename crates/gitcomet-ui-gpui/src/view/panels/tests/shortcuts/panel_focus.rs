@@ -55,6 +55,21 @@ fn press(cx: &mut gpui::VisualTestContext, keys: &str) {
     draw_and_drain_test_window(cx);
 }
 
+/// A full press and release: a focused button clicks on the key-up, which
+/// `simulate_keystrokes` never sends.
+fn tap(cx: &mut gpui::VisualTestContext, key: &str) {
+    cx.simulate_keystrokes(key);
+    cx.update(|window, app| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).expect("valid key"),
+            }),
+            app,
+        );
+    });
+    draw_and_drain_test_window(cx);
+}
+
 fn focused(cx: &mut gpui::VisualTestContext, view: &View) -> Option<FocusPanel> {
     cx.update(|window, app| view.read(app).focused_panel(window, app))
 }
@@ -250,6 +265,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
                     is_draft: false,
                     review: None,
                     checks: Default::default(),
+                    review_requested: false,
                 }],
                 Some(7),
             );
@@ -264,7 +280,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
         number: 7,
         kind: crate::github::ReviewKind::Comment,
     };
-    press(cx, "r");
+    press(cx, "shift-s");
     assert!(popover_open(cx, &view, &review));
     // An empty comment can't post, so this is a no-op rather than a gh call.
     press(cx, "secondary-enter");
@@ -277,9 +293,49 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
     assert!(popover_open(
         cx,
         &view,
-        &PopoverKind::CreatePullRequest { repo_id: REPO }
+        &PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: None,
+        }
     ));
     press(cx, "escape");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+
+    // Merging opens a confirm dialog whose method switches on Alt chords;
+    // nothing reaches gh until Enter.
+    let merge = |method| PopoverKind::MergePullRequest {
+        repo_id: REPO,
+        number: 7,
+        method,
+    };
+    press(cx, "shift-m");
+    assert!(popover_open(
+        cx,
+        &view,
+        &merge(crate::github::MergeMethod::Merge)
+    ));
+    press(cx, "alt-s");
+    assert!(popover_open(
+        cx,
+        &view,
+        &merge(crate::github::MergeMethod::Squash)
+    ));
+    let submit_error = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_pull_requests()
+                .and_then(|prs| prs.submit_error.clone())
+        })
+    };
+    // Space is the checkout key, not a second way to merge.
+    tap(cx, "space");
+    assert_eq!(submit_error(cx), None);
+    // Enter merges, but only onto a head the details have shown; they never
+    // loaded here, so it stops before gh.
+    tap(cx, "enter");
+    assert!(submit_error(cx).is_some_and(|error| error.contains("still loading")));
+    press(cx, "escape");
+    assert!(!popover_is_open(cx, &view));
     assert_eq!(focused(cx, &view), Some(Sidebar));
 }
 
@@ -488,4 +544,196 @@ fn enter_from_details_opens_the_diff_and_escape_comes_back(cx: &mut gpui::TestAp
     wait_until(cx, "focus back on Details", |cx| {
         diff_path(cx, &view).is_none() && focused(cx, &view) == Some(Details)
     });
+}
+
+#[gpui::test]
+fn shift_o_on_a_branch_sets_up_a_pull_request_from_it(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+        name: "origin".into(),
+        url: Some("https://github.com/owner/repo.git".into()),
+    }]));
+    repo.remotes_rev = 1;
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    let _ = select_feature_branch(cx, &view);
+    assert_key_opens(
+        cx,
+        &view,
+        "shift-o",
+        PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: Some("feature".into()),
+        },
+        Sidebar,
+    );
+    // `o` goes straight to GitHub, which needs the branch there; this one was
+    // never pushed, so it only says so.
+    press(cx, "o");
+    assert!(!popover_is_open(cx, &view));
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+}
+
+#[gpui::test]
+fn review_mode_walks_files_keeps_comments_and_leaves_with_q(cx: &mut gpui::TestAppContext) {
+    use crate::github::{ReviewAnchor, ReviewSide};
+
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let file = |path: &str| crate::github::PullRequestFile {
+        path: path.into(),
+        additions: 1,
+        deletions: 0,
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_pull_requests_for_test(REPO, vec![], Some(7));
+            this.seed_pull_request_detail_for_test(
+                REPO,
+                crate::github::PullRequestDetail {
+                    number: 7,
+                    title: "Keyboard nav".into(),
+                    body: String::new(),
+                    url: String::new(),
+                    author: "someone".into(),
+                    head: "feat".into(),
+                    head_oid: "a".repeat(40),
+                    base: "main".into(),
+                    base_oid: "b".repeat(40),
+                    is_draft: false,
+                    is_cross_repository: false,
+                    state: "OPEN".into(),
+                    review: None,
+                    mergeable: None,
+                    additions: 2,
+                    deletions: 0,
+                    changed_files: 2,
+                    files: vec![file("a.rs"), file("b.rs")],
+                    checks: Default::default(),
+                    check_runs: vec![],
+                    conversation: vec![],
+                },
+                "c".repeat(40),
+            );
+        })
+    });
+    apply_state(cx, &view, pull_request_state());
+    let review = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app).active_review().map(|review| {
+                (
+                    review.file_ix,
+                    review.draft.viewed.len(),
+                    review.draft.comments.len(),
+                )
+            })
+        })
+    };
+
+    press(cx, "1 r");
+    assert_eq!(review(cx), Some((0, 0, 0)));
+    press(cx, "1 ]");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(1));
+    // Viewed, then on to the first file still unviewed.
+    press(cx, "space");
+    assert_eq!(review(cx), Some((0, 1, 0)));
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.add_review_comment(
+                REPO,
+                7,
+                ReviewAnchor {
+                    path: "a.rs".into(),
+                    side: ReviewSide::Right,
+                    line: 1,
+                    start: None,
+                },
+                "Nit".into(),
+                None,
+                None,
+                cx,
+            );
+        })
+    });
+    assert_eq!(review(cx).map(|(.., comments)| comments), Some(1));
+    // The composer: typing, alt+s for the selected lines as a suggestion,
+    // then ctrl+enter lands the comment in the review.
+    let b_line_2 = ReviewAnchor {
+        path: "b.rs".into(),
+        side: ReviewSide::Right,
+        line: 2,
+        start: None,
+    };
+    let open = |cx: &mut gpui::VisualTestContext,
+                reply_to: Option<crate::github::ReplyTarget>,
+                suggestion: Option<String>| {
+        let anchor = b_line_2.clone();
+        cx.update(|window, app| {
+            view.update(app, |this, cx| {
+                this.open_review_composer(REPO, 7, anchor, None, reply_to, suggestion, window, cx);
+            })
+        });
+        draw_and_drain_test_window(cx);
+    };
+    let bodies = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_review()
+                .map(|review| {
+                    review
+                        .draft
+                        .comments
+                        .iter()
+                        .map(|comment| (comment.body.clone(), comment.reply_to.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    };
+    open(cx, None, Some("let x = 1;".into()));
+    press(cx, "o k alt-s secondary-enter");
+    assert!(!popover_is_open(cx, &view));
+    assert_eq!(
+        bodies(cx)[1],
+        (
+            "ok
+```suggestion
+let x = 1;
+```"
+            .to_string(),
+            None
+        )
+    );
+    // A reply to someone's thread waits in the review like any comment.
+    let octo = crate::github::ReplyTarget {
+        id: 99,
+        author: "octo".into(),
+    };
+    open(cx, Some(octo.clone()), None);
+    press(cx, "t y secondary-enter");
+    assert_eq!(bodies(cx)[2], ("ty".to_string(), Some(octo)));
+    // Your review: the second d deletes, a single one only asks.
+    press(cx, "4 j d");
+    assert_eq!(bodies(cx).len(), 3);
+    press(cx, "d");
+    assert_eq!(bodies(cx).len(), 2);
+
+    // S is the submit dialog for this pull request.
+    press(cx, "shift-s");
+    assert!(popover_open(
+        cx,
+        &view,
+        &PopoverKind::PullRequestReview {
+            repo_id: REPO,
+            number: 7,
+            kind: crate::github::ReviewKind::Comment,
+        }
+    ));
+    press(cx, "escape");
+
+    press(cx, "q");
+    assert_eq!(review(cx), None);
+    assert_eq!(focused(cx, &view), Some(Sidebar));
 }

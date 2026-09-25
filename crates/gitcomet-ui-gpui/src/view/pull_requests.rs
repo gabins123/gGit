@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::github::{
-    self, NewPullRequest, PrError, PullRequestDetail, PullRequestSummary, ReviewKind,
+    self, MergeRequest, NewPullRequest, PrError, PullRequestDetail, PullRequestSummary, ReviewKind,
 };
 use gitcomet_state::model::SidebarMode;
 
@@ -42,11 +42,162 @@ pub(super) struct RepoPullRequests {
     pub(super) selected_file: Option<usize>,
     /// Set while a review or create is with gh.
     pub(super) submitting: bool,
-    /// gh's refusal of the last review or create, shown in its dialog.
+    /// gh's refusal of the last review, create or merge, shown in its dialog.
     pub(super) submit_error: Option<String>,
+    /// The pull request `gh pr checkout` is working on.
+    checking_out: Option<u64>,
+    /// Pending comments of the reviews saved on this computer, by pull
+    /// request, as of the list's last load.
+    pub(super) drafts: FxHashMap<u64, usize>,
     list_seq: u64,
     detail_seq: u64,
     diff_seq: u64,
+}
+
+/// Why a branch can't head a new pull request yet.
+pub(super) enum HeadProblem {
+    Detached,
+    /// The branch has no upstream on GitHub: GitHub has never seen it.
+    NotPushed(String),
+}
+
+/// The branch a new pull request comes from, as `gh pr create --head` and
+/// GitHub's compare page take it: `branch` (default: the checked-out one) by
+/// its upstream, which must exist on the remote. Creating never pushes, so a
+/// branch without one can't head a pull request yet.
+pub(super) fn pull_request_head(
+    repo: &RepoState,
+    branch: Option<&str>,
+) -> Result<String, HeadProblem> {
+    let name = match (branch, &repo.head_branch) {
+        (Some(name), _) => name.to_string(),
+        (None, Loadable::Ready(head)) if head != "HEAD" => head.clone(),
+        _ => return Err(HeadProblem::Detached),
+    };
+    let upstream = repo
+        .branches
+        .ready()
+        .and_then(|branches| branches.iter().find(|candidate| candidate.name == name))
+        .and_then(|branch| branch.upstream.clone());
+    // Configured isn't pushed: the remote-tracking ref has to exist.
+    let live = upstream.as_ref().is_some_and(|upstream| {
+        repo.remote_branches.ready().is_some_and(|remote_branches| {
+            remote_branches.iter().any(|candidate| {
+                candidate.remote == upstream.remote && candidate.name == upstream.branch
+            })
+        })
+    });
+    match upstream {
+        Some(upstream) if live => Ok(remote_branch_head(repo, &upstream.remote, &upstream.branch)),
+        _ => Err(HeadProblem::NotPushed(name)),
+    }
+}
+
+/// `branch` on `remote` as a pull request head: bare on the pull requests' own
+/// GitHub remote, `owner:branch` on another GitHub repository (a fork).
+pub(super) fn remote_branch_head(repo: &RepoState, remote: &str, branch: &str) -> String {
+    let remotes = repo
+        .remotes
+        .ready()
+        .map(|remotes| remotes.as_slice())
+        .unwrap_or(&[]);
+    let target = super::permalink::github_remote(remotes).map(|(name, _)| name);
+    if target.as_deref() == Some(remote) {
+        return branch.to_string();
+    }
+    let owner = remotes
+        .iter()
+        .find(|candidate| candidate.name == remote)
+        .and_then(|candidate| super::permalink::github_slug(candidate.url.as_deref()?))
+        .and_then(|slug| slug.split('/').next().map(str::to_string));
+    match owner {
+        Some(owner) => format!("{owner}:{branch}"),
+        None => branch.to_string(),
+    }
+}
+
+/// Where a pull request sits in the list: waiting on your review first, then
+/// reviews you have pending, then the rest.
+pub(super) fn inbox_rank(pr: &PullRequestSummary, drafts: &FxHashMap<u64, usize>) -> u8 {
+    if pr.review_requested {
+        0
+    } else if drafts.contains_key(&pr.number) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Orders the list by `inbox_rank`, keeping GitHub's order within each part,
+/// so `j`/`k` walk it the way it reads.
+fn inbox_order(list: &mut [PullRequestSummary], drafts: &FxHashMap<u64, usize>) {
+    list.sort_by_key(|pr| inbox_rank(pr, drafts));
+}
+
+impl GitCometView {
+    /// A pending review's comment count as it is now, for the list's section
+    /// and badge; the list re-sorts so its sections still read in order.
+    pub(super) fn set_pending_count(&mut self, repo_id: RepoId, number: u64, count: usize) {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let changed = if count == 0 {
+            entry.drafts.remove(&number).is_some()
+        } else {
+            entry.drafts.insert(number, count) != Some(count)
+        };
+        if !changed {
+            return;
+        }
+        let drafts = entry.drafts.clone();
+        if let PrLoad::Ready(list) = &mut entry.list {
+            let list: &mut Vec<PullRequestSummary> = Arc::make_mut(list);
+            inbox_order(list, &drafts);
+        }
+    }
+}
+
+/// What a review submit got onto GitHub before anything failed.
+struct ReviewSubmitted {
+    /// The review itself (verdict, summary, line comments) went up.
+    review: bool,
+    /// The pending comments and replies now on GitHub.
+    comments: Vec<crate::github::ReviewComment>,
+    error: Option<PrError>,
+}
+
+/// The dialog a gh submit came from, so its outcome reaches that dialog and
+/// no other.
+#[derive(Clone, Copy)]
+enum PrDialog {
+    Review(u64),
+    Create,
+    Merge(u64),
+}
+
+impl PrDialog {
+    fn matches(self, repo_id: RepoId, kind: &PopoverKind) -> bool {
+        match (self, kind) {
+            (
+                Self::Review(number),
+                PopoverKind::PullRequestReview {
+                    repo_id: open,
+                    number: open_number,
+                    ..
+                },
+            )
+            | (
+                Self::Merge(number),
+                PopoverKind::MergePullRequest {
+                    repo_id: open,
+                    number: open_number,
+                    ..
+                },
+            ) => *open == repo_id && *open_number == number,
+            (Self::Create, PopoverKind::CreatePullRequest { repo_id: open, .. }) => {
+                *open == repo_id
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -67,8 +218,8 @@ impl PullRequestsState {
 /// The repository gh talks to for the active tab.
 #[derive(Clone)]
 pub(super) struct GitHubTarget {
-    repo_id: RepoId,
-    workdir: std::path::PathBuf,
+    pub(super) repo_id: RepoId,
+    pub(super) workdir: std::path::PathBuf,
     remote: String,
     pub(super) slug: String,
 }
@@ -79,7 +230,7 @@ impl GitCometView {
         self.github_target_for(self.active_repo_id()?)
     }
 
-    fn github_target_for(&self, repo_id: RepoId) -> Option<GitHubTarget> {
+    pub(super) fn github_target_for(&self, repo_id: RepoId) -> Option<GitHubTarget> {
         let repo = self.state.repos.iter().find(|repo| repo.id == repo_id)?;
         let Loadable::Ready(remotes) = &repo.remotes else {
             return None;
@@ -106,10 +257,14 @@ impl GitCometView {
     }
 
     /// The sidebar and details panes are cached views, so a change to pull
-    /// request state has to reach them explicitly.
-    fn notify_pull_request_panes(&mut self, cx: &mut gpui::Context<Self>) {
+    /// request state has to reach them explicitly; so does an open dialog
+    /// that shows it.
+    pub(super) fn notify_pull_request_panes(&mut self, cx: &mut gpui::Context<Self>) {
         self.sidebar_pane.update(cx, |_, cx| cx.notify());
         self.details_pane.update(cx, |_, cx| cx.notify());
+        // Deferred: this also runs inside the host's own submit handler.
+        let host = self.popover_host.clone();
+        cx.defer(move |cx| host.update(cx, |_, cx| cx.notify()));
         cx.notify();
     }
 
@@ -135,8 +290,13 @@ impl GitCometView {
         if entry.list.ready().is_none() {
             entry.list = PrLoad::Loading;
         }
-        let task =
-            cx.background_spawn(async move { github::list_open(&target.workdir, &target.slug) });
+        let task = cx.background_spawn(async move {
+            let drafts = super::review::pending_review_counts(&target.slug);
+            github::list_open(&target.workdir, &target.slug).map(|(mut list, requested_known)| {
+                inbox_order(&mut list, &drafts);
+                (list, drafts, requested_known)
+            })
+        });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
@@ -145,7 +305,20 @@ impl GitCometView {
                     return;
                 }
                 entry.list = match result {
-                    Ok(list) => PrLoad::Ready(Arc::new(list)),
+                    Ok((mut list, drafts, requested_known)) => {
+                        // gh couldn't say who is waiting this time: keep what
+                        // it said last, so rows don't jump sections.
+                        if !requested_known && let Some(previous) = entry.list.ready() {
+                            for pr in &mut list {
+                                pr.review_requested = previous
+                                    .iter()
+                                    .any(|old| old.number == pr.number && old.review_requested);
+                            }
+                            inbox_order(&mut list, &drafts);
+                        }
+                        entry.drafts = drafts;
+                        PrLoad::Ready(Arc::new(list))
+                    }
                     Err(err) => PrLoad::Failed(err),
                 };
                 this.notify_pull_request_panes(cx);
@@ -172,13 +345,36 @@ impl GitCometView {
         let entry = self.pull_requests.repo_mut(repo_id);
         entry.selected_file = None;
         entry.submit_error = None;
-        self.load_pull_request_detail(number, cx);
+        // `j`/`k` can pass many pull requests a second, and each load is
+        // several GitHub requests: gh runs for the one the selection settles on.
+        entry.detail_seq += 1;
+        let seq = entry.detail_seq;
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(200))
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                let settled = this
+                    .pull_requests
+                    .repo(repo_id)
+                    .is_some_and(|prs| prs.detail_seq == seq && prs.selected == Some(number));
+                if settled {
+                    this.load_pull_request_detail(repo_id, number, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Fetches `number`'s details, keeping whatever is on screen until they
     /// land; a review reloads this way so the panel does not flash empty.
-    fn load_pull_request_detail(&mut self, number: u64, cx: &mut gpui::Context<Self>) {
-        let Some(target) = self.github_target() else {
+    fn load_pull_request_detail(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
             return;
         };
         let repo_id = target.repo_id;
@@ -378,6 +574,59 @@ impl GitCometView {
         true
     }
 
+    /// `o` on a branch, as in lazygit: GitHub's page for opening a pull request
+    /// from it, in the browser.
+    pub(super) fn open_pull_request_compare(
+        &mut self,
+        target: &super::branch_sidebar::BranchMenuTarget,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use super::branch_sidebar::BranchMenuTarget;
+        let Some(github) = self.github_target() else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "Pull requests need a github.com remote.".to_string(),
+                cx,
+            );
+            return;
+        };
+        let Some(repo) = self.active_repo() else {
+            return;
+        };
+        let head = match target {
+            BranchMenuTarget::Local { name } => pull_request_head(repo, Some(name))
+                .map_err(|_| format!("{name} isn't on GitHub yet; push it first.")),
+            BranchMenuTarget::Remote { remote, branch } => {
+                Ok(remote_branch_head(repo, remote, branch))
+            }
+        };
+        match head {
+            Ok(head) => self.open_in_browser(
+                super::permalink::github_compare_url(&github.slug, None, &head),
+                cx,
+            ),
+            Err(message) => self.push_toast(components::ToastKind::Warning, message, cx),
+        }
+    }
+
+    /// The browser launch every other forge link goes through.
+    pub(super) fn open_in_browser(&mut self, url: String, cx: &mut gpui::Context<Self>) {
+        platform_open::spawn_launch(
+            cx,
+            move || platform_open::open_url_blocking(&url),
+            |this, result, cx| {
+                if let Err(err) = result {
+                    this.push_toast(
+                        components::ToastKind::Error,
+                        format!("Failed to open link: {err}"),
+                        cx,
+                    );
+                    cx.notify();
+                }
+            },
+        );
+    }
+
     /// Opens the selected PR (or the repository's PR list) on GitHub, reusing
     /// the browser launch every other forge link goes through.
     pub(super) fn open_pull_request_on_github(&mut self, cx: &mut gpui::Context<Self>) -> bool {
@@ -393,20 +642,7 @@ impl GitCometView {
             (_, Some(number)) => format!("https://github.com/{}/pull/{number}", target.slug),
             (_, None) => format!("https://github.com/{}/pulls", target.slug),
         };
-        platform_open::spawn_launch(
-            cx,
-            move || platform_open::open_url_blocking(&url),
-            |this, result, cx| {
-                if let Err(err) = result {
-                    this.push_toast(
-                        components::ToastKind::Error,
-                        format!("Failed to open link: {err}"),
-                        cx,
-                    );
-                    cx.notify();
-                }
-            },
-        );
+        self.open_in_browser(url, cx);
         true
     }
 
@@ -430,42 +666,313 @@ impl GitCometView {
         entry.submitting = true;
         entry.submit_error = None;
         let slug = target.slug.clone();
+        // A review in progress goes up with its line comments, pinned to the
+        // commit they were written against; replies follow, one per thread.
+        let pending = self
+            .review_of(repo_id, number)
+            .map(|review| (review.draft.head_oid.clone(), review.draft.comments.clone()));
+        let in_review = pending.is_some();
         let task = cx.background_spawn(async move {
-            github::review(&target.workdir, &target.slug, number, kind, &body)
+            let Some((head_oid, comments)) = pending else {
+                let result = github::review(&target.workdir, &target.slug, number, kind, &body);
+                return ReviewSubmitted {
+                    review: result.is_ok(),
+                    comments: Vec::new(),
+                    error: result.err(),
+                };
+            };
+            let (line_comments, replies): (Vec<_>, Vec<_>) = comments
+                .into_iter()
+                .partition(|comment| comment.reply_to.is_none());
+            let mut out = ReviewSubmitted {
+                review: false,
+                comments: Vec::new(),
+                error: None,
+            };
+            if super::review::review_needed(kind, &body, line_comments.len(), replies.len()) {
+                let result = if line_comments.is_empty() {
+                    github::review(&target.workdir, &target.slug, number, kind, &body)
+                } else {
+                    github::create_review(
+                        &target.workdir,
+                        &target.slug,
+                        number,
+                        &head_oid,
+                        kind,
+                        &body,
+                        &line_comments,
+                    )
+                };
+                if let Err(err) = result {
+                    out.error = Some(err);
+                    return out;
+                }
+                out.review = true;
+                out.comments.extend(line_comments);
+            }
+            for reply in replies {
+                let Some(to) = reply.reply_to.as_ref() else {
+                    continue;
+                };
+                match github::reply_to_thread(
+                    &target.workdir,
+                    &target.slug,
+                    number,
+                    to.id,
+                    &reply.body,
+                ) {
+                    Ok(()) => out.comments.push(reply),
+                    Err(err) => {
+                        out.error = Some(err);
+                        break;
+                    }
+                }
+            }
+            out
         });
         cx.spawn(async move |view, cx| {
-            let result = task.await;
+            let submitted = task.await;
             let _ = view.update(cx, |this, cx| {
-                let entry = this.pull_requests.repo_mut(repo_id);
-                entry.submitting = false;
-                match result {
-                    Ok(()) => {
-                        this.close_pull_request_prompt(cx);
-                        let verb = match kind {
-                            ReviewKind::Comment => "Commented on",
-                            ReviewKind::Approve => "Approved",
-                            ReviewKind::RequestChanges => "Requested changes on",
-                        };
+                this.pull_requests.repo_mut(repo_id).submitting = false;
+                // What reached GitHub leaves the draft, whatever failed after.
+                let posted_anything = submitted.review || !submitted.comments.is_empty();
+                let remaining = if in_review && posted_anything {
+                    this.finish_review(repo_id, number, &submitted.comments, submitted.review, cx)
+                } else {
+                    0
+                };
+                let replies = submitted
+                    .comments
+                    .iter()
+                    .filter(|comment| comment.reply_to.is_some())
+                    .count();
+                let line_comments = submitted.comments.len() - replies;
+                let plural = |n: usize, word: &str, words: &str| match n {
+                    0 => String::new(),
+                    1 => format!(" · 1 {word}"),
+                    n => format!(" · {n} {words}"),
+                };
+                let what = format!(
+                    "#{number}{}{}",
+                    plural(line_comments, "comment", "comments"),
+                    plural(replies, "reply", "replies")
+                );
+                let verb = match (submitted.review, kind) {
+                    (false, _) => "Replied on",
+                    (true, ReviewKind::Comment) => "Commented on",
+                    (true, ReviewKind::Approve) => "Approved",
+                    (true, ReviewKind::RequestChanges) => "Requested changes on",
+                };
+                match submitted.error {
+                    None => {
+                        this.close_pull_request_prompt(repo_id, PrDialog::Review(number), cx);
                         this.push_toast_with_link(
                             components::ToastKind::Success,
-                            format!("{verb} #{number}"),
+                            format!("{verb} {what}"),
                             format!("https://github.com/{slug}/pull/{number}"),
                             "View on GitHub".to_string(),
                             cx,
                         );
+                        if submitted.review && remaining > 0 {
+                            this.push_toast(
+                                components::ToastKind::Warning,
+                                format!(
+                                    "{remaining} comment{} added while it was posting {} still pending.",
+                                    if remaining == 1 { "" } else { "s" },
+                                    if remaining == 1 { "is" } else { "are" }
+                                ),
+                                cx,
+                            );
+                        }
                         // Pick up the new review decision, unless the user has
                         // moved on to another pull request meanwhile.
-                        if this.pull_requests.repo_mut(repo_id).selected == Some(number)
-                            && this.active_repo_id() == Some(repo_id)
-                        {
-                            this.load_pull_request_detail(number, cx);
-                        }
-                        this.refresh_pull_requests(cx);
+                        this.reload_pull_request(repo_id, number, cx);
                     }
-                    Err(err) => entry.submit_error = Some(err.to_string()),
+                    // Part of it is on GitHub: resubmitting would post that
+                    // part again, so the dialog closes and the rest waits.
+                    Some(err) if posted_anything => {
+                        this.close_pull_request_prompt(repo_id, PrDialog::Review(number), cx);
+                        this.push_toast(
+                            components::ToastKind::Error,
+                            format!(
+                                "{verb} {what}, but a reply didn't go up: {err}. What's left is still pending."
+                            ),
+                            cx,
+                        );
+                        this.reload_pull_request(repo_id, number, cx);
+                    }
+                    Some(err) => this.report_pull_request_error(
+                        repo_id,
+                        PrDialog::Review(number),
+                        format!("Couldn't post the review on #{number}: {err}"),
+                        err.to_string(),
+                        cx,
+                    ),
                 }
                 this.notify_pull_request_panes(cx);
-                this.popover_host.update(cx, |_, cx| cx.notify());
+            });
+        })
+        .detach();
+    }
+
+    /// Merges on GitHub. Runs only from the merge dialog's explicit confirm,
+    /// and only onto the head commit the details showed.
+    pub(super) fn submit_pull_request_merge(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        method: github::MergeMethod,
+        delete_branch: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let repo_id = target.repo_id;
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if entry.submitting {
+            return;
+        }
+        let Some(head_oid) = entry
+            .detail
+            .ready()
+            .filter(|detail| detail.number == number)
+            .map(|detail| detail.head_oid.clone())
+        else {
+            entry.submit_error = Some(format!(
+                "#{number} is still loading; merge once its details show."
+            ));
+            self.notify_pull_request_panes(cx);
+            return;
+        };
+        entry.submitting = true;
+        entry.submit_error = None;
+        let slug = target.slug.clone();
+        let request = MergeRequest {
+            method,
+            delete_branch,
+            head_oid,
+        };
+        let task = cx.background_spawn(async move {
+            github::merge(&target.workdir, &target.slug, number, &request)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.pull_requests.repo_mut(repo_id).submitting = false;
+                match result {
+                    Ok(()) => {
+                        this.close_pull_request_prompt(repo_id, PrDialog::Merge(number), cx);
+                        this.push_toast_with_link(
+                            components::ToastKind::Success,
+                            format!("Merged #{number}"),
+                            format!("https://github.com/{slug}/pull/{number}"),
+                            "View on GitHub".to_string(),
+                            cx,
+                        );
+                    }
+                    // gh also fails when the merge went through but deleting
+                    // the branch didn't, so the state is reloaded either way.
+                    Err(err) => this.report_pull_request_error(
+                        repo_id,
+                        PrDialog::Merge(number),
+                        format!("Merging #{number}: gh reported: {err}"),
+                        format!("gh reported: {err}"),
+                        cx,
+                    ),
+                }
+                this.reload_pull_request(repo_id, number, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// After a review or merge: the list, and the details if the user is
+    /// still on that pull request.
+    fn reload_pull_request(&mut self, repo_id: RepoId, number: u64, cx: &mut gpui::Context<Self>) {
+        if self.active_repo_id() != Some(repo_id) {
+            return;
+        }
+        if self.pull_requests.repo_mut(repo_id).selected == Some(number) {
+            self.load_pull_request_detail(repo_id, number, cx);
+        }
+        self.refresh_pull_requests(cx);
+    }
+
+    /// gh's refusal goes into the dialog it came from, or to a toast once that
+    /// dialog is gone.
+    fn report_pull_request_error(
+        &mut self,
+        repo_id: RepoId,
+        dialog: PrDialog,
+        toast: String,
+        in_dialog: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let open = self
+            .popover_host
+            .read(cx)
+            .open_popover_kind()
+            .is_some_and(|kind| dialog.matches(repo_id, kind));
+        if open {
+            self.pull_requests.repo_mut(repo_id).submit_error = Some(in_dialog);
+        } else {
+            self.push_toast(components::ToastKind::Error, toast, cx);
+        }
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// `space`: checks the selected pull request out into a local branch.
+    /// Local only; git refuses it over conflicting uncommitted changes.
+    pub(super) fn checkout_pull_request(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(target) = self.github_target() else {
+            return;
+        };
+        let repo_id = target.repo_id;
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let Some(number) = entry.selected else {
+            return;
+        };
+        if let Some(busy) = entry.checking_out {
+            self.push_toast(
+                components::ToastKind::Warning,
+                format!("Still checking out #{busy}…"),
+                cx,
+            );
+            return;
+        }
+        // A fork's branch name means nothing here: under it gh would
+        // fast-forward a same-named local branch (say `develop`) to the
+        // contributor's commits. Unless the details show the pull request is
+        // from this repository, it gets a branch of its own.
+        let same_repo = entry
+            .detail
+            .ready()
+            .is_some_and(|detail| detail.number == number && !detail.is_cross_repository);
+        let branch = (!same_repo).then(|| format!("pr/{number}"));
+        entry.checking_out = Some(number);
+        let task = cx.background_spawn(async move {
+            github::checkout(&target.workdir, &target.slug, number, branch.as_deref())
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.pull_requests.repo_mut(repo_id).checking_out = None;
+                match result {
+                    Ok(()) => {
+                        this.push_toast(
+                            components::ToastKind::Success,
+                            format!("Checked out #{number}"),
+                            cx,
+                        );
+                        this.store.dispatch(Msg::ReloadRepo { repo_id });
+                    }
+                    Err(err) => this.push_toast(
+                        components::ToastKind::Error,
+                        format!("Couldn't check out #{number}: {err}"),
+                        cx,
+                    ),
+                }
             });
         })
         .detach();
@@ -498,7 +1005,7 @@ impl GitCometView {
                 entry.submitting = false;
                 match result {
                     Ok(url) => {
-                        this.close_pull_request_prompt(cx);
+                        this.close_pull_request_prompt(repo_id, PrDialog::Create, cx);
                         this.push_toast_with_link(
                             components::ToastKind::Success,
                             "Pull request created".to_string(),
@@ -508,24 +1015,37 @@ impl GitCometView {
                         );
                         this.refresh_pull_requests(cx);
                     }
-                    Err(err) => entry.submit_error = Some(err.to_string()),
+                    Err(err) => this.report_pull_request_error(
+                        repo_id,
+                        PrDialog::Create,
+                        format!("Couldn't create the pull request: {err}"),
+                        err.to_string(),
+                        cx,
+                    ),
                 }
                 this.notify_pull_request_panes(cx);
-                this.popover_host.update(cx, |_, cx| cx.notify());
             });
         })
         .detach();
     }
 
-    /// Closes the review or create dialog after gh accepted it, handing focus
-    /// back where the dialog came from. Leaves any other dialog alone.
-    fn close_pull_request_prompt(&mut self, cx: &mut gpui::Context<Self>) {
+    /// Closes the dialog a gh submit came from after gh accepted it, handing
+    /// focus back where the dialog came from. Leaves any other dialog alone.
+    fn close_pull_request_prompt(
+        &mut self,
+        repo_id: RepoId,
+        dialog: PrDialog,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let host = self.popover_host.clone();
         let window_handle = self.window_handle;
         cx.defer(move |cx| {
             let _ = window_handle.update(cx, |_, window, cx| {
                 host.update(cx, |host, cx| {
-                    if host.pull_request_prompt_open() {
+                    let open = host
+                        .open_popover_kind()
+                        .is_some_and(|kind| dialog.matches(repo_id, kind));
+                    if open {
                         host.close_popover_and_restore_focus(window, cx);
                     }
                 });
@@ -545,10 +1065,50 @@ impl GitCometView {
         entry.selected = selected;
     }
 
+    /// The selected pull request's details, and its commits as already local
+    /// at `merge_base`, so tests never run gh or git.
+    #[cfg(test)]
+    pub(super) fn seed_pull_request_detail_for_test(
+        &mut self,
+        repo_id: RepoId,
+        detail: PullRequestDetail,
+        merge_base: String,
+    ) {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.detail = PrLoad::Ready(Arc::new(detail));
+        entry.diff_base = PrLoad::Ready(merge_base);
+    }
+
     /// Clears a stale gh refusal when a review or create dialog opens.
     pub(super) fn clear_pull_request_submit_error(&mut self) {
         if let Some(repo_id) = self.active_repo_id() {
             self.pull_requests.repo_mut(repo_id).submit_error = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_list_leads_with_reviews_waiting_on_you_then_yours_in_progress() {
+        let pr = |number, review_requested| PullRequestSummary {
+            number,
+            title: String::new(),
+            author: String::new(),
+            head: String::new(),
+            base: String::new(),
+            is_draft: false,
+            review: None,
+            checks: Default::default(),
+            review_requested,
+        };
+        let mut list = vec![pr(1, false), pr(2, false), pr(3, true), pr(4, false)];
+        let drafts = FxHashMap::from_iter([(4, 2usize)]);
+        inbox_order(&mut list, &drafts);
+        // GitHub's order holds within each part.
+        let numbers: Vec<u64> = list.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, [3, 4, 1, 2]);
     }
 }

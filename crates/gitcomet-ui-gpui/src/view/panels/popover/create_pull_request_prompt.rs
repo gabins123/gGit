@@ -1,68 +1,28 @@
 use super::*;
+use crate::view::pull_requests::{HeadProblem, pull_request_head};
 
-/// Why the checked-out branch can't head a new pull request yet.
-pub(super) enum HeadProblem {
-    Detached,
-    /// The branch has no upstream, so GitHub has never seen it.
-    NotPushed(String),
-}
-
-/// The branch a new pull request comes from, as `gh pr create --head` takes
-/// it: the checked-out branch's upstream, which must exist on the remote.
-/// Creating never pushes, so a branch without one blocks the dialog. When the
-/// upstream is a different GitHub repository than the pull request's (a
-/// fork), it is `owner:branch`.
-pub(super) fn pull_request_head(repo: &RepoState) -> Result<String, HeadProblem> {
-    let Loadable::Ready(head) = &repo.head_branch else {
-        return Err(HeadProblem::Detached);
+/// Local commits on `branch` (or the checked-out one) its upstream doesn't
+/// have yet.
+fn unpushed_commits(repo: &RepoState, branch: Option<&str>) -> usize {
+    let name = match (branch, &repo.head_branch) {
+        (Some(name), _) => name,
+        (None, Loadable::Ready(head)) => head.as_str(),
+        _ => return 0,
     };
-    if head == "HEAD" {
-        return Err(HeadProblem::Detached);
-    }
-    if !crate::view::mod_helpers::head_branch_has_live_upstream(repo) {
-        return Err(HeadProblem::NotPushed(head.clone()));
-    }
-    let upstream = match &repo.branches {
-        Loadable::Ready(branches) => branches
-            .iter()
-            .find(|branch| branch.name == *head)
-            .and_then(|branch| branch.upstream.clone()),
-        _ => None,
-    };
-    let Some(upstream) = upstream else {
-        return Err(HeadProblem::NotPushed(head.clone()));
-    };
-    let remotes = repo
-        .remotes
+    repo.branches
         .ready()
-        .map(|remotes| remotes.as_slice())
-        .unwrap_or(&[]);
-    let target = crate::view::permalink::github_remote(remotes).map(|(name, _)| name);
-    if target.as_deref() == Some(upstream.remote.as_str()) {
-        return Ok(upstream.branch);
-    }
-    let owner = remotes
-        .iter()
-        .find(|remote| remote.name == upstream.remote)
-        .and_then(|remote| crate::view::permalink::github_slug(remote.url.as_deref()?))
-        .and_then(|slug| slug.split('/').next().map(str::to_string));
-    Ok(match owner {
-        Some(owner) => format!("{owner}:{}", upstream.branch),
-        None => upstream.branch,
-    })
-}
-
-/// Local commits on the head branch that its upstream doesn't have yet.
-fn unpushed_commits(repo: &RepoState) -> usize {
-    let (Loadable::Ready(head), Loadable::Ready(branches)) = (&repo.head_branch, &repo.branches)
-    else {
-        return 0;
-    };
-    branches
-        .iter()
-        .find(|branch| branch.name == *head)
+        .and_then(|branches| branches.iter().find(|candidate| candidate.name == name))
         .and_then(|branch| branch.divergence.as_ref())
         .map_or(0, |divergence| divergence.ahead)
+}
+
+/// Whether `branch` is the checked-out one, which Alt+P can push.
+fn is_checked_out(repo: &RepoState, branch: Option<&str>) -> bool {
+    match (branch, &repo.head_branch) {
+        (None, _) => true,
+        (Some(name), Loadable::Ready(head)) => name == head,
+        _ => false,
+    }
 }
 
 fn notice(theme: AppTheme, warning: bool, text: String) -> gpui::Div {
@@ -88,6 +48,7 @@ fn notice(theme: AppTheme, warning: bool, text: String) -> gpui::Div {
 pub(super) fn panel(
     this: &mut PopoverHost,
     repo_id: RepoId,
+    branch: Option<String>,
     cx: &mut gpui::Context<PopoverHost>,
 ) -> gpui::Div {
     let theme = this.theme;
@@ -97,8 +58,9 @@ pub(super) fn panel(
     let error = this.pull_request_submit_error(cx);
     let draft = this.pull_request_draft;
     let repo = this.state.repos.iter().find(|repo| repo.id == repo_id);
-    let head = repo.map(pull_request_head);
-    let unpushed = repo.map_or(0, unpushed_commits);
+    let head = repo.map(|repo| pull_request_head(repo, branch.as_deref()));
+    let unpushed = repo.map_or(0, |repo| unpushed_commits(repo, branch.as_deref()));
+    let can_push = repo.is_some_and(|repo| is_checked_out(repo, branch.as_deref()));
 
     let head_notice = match &head {
         Some(Err(HeadProblem::Detached)) | None => Some(notice(
@@ -106,11 +68,18 @@ pub(super) fn panel(
             true,
             "Check out a branch first: a detached HEAD can't open a pull request.".to_string(),
         )),
-        Some(Err(HeadProblem::NotPushed(name))) => Some(notice(
+        Some(Err(HeadProblem::NotPushed(name))) if can_push => Some(notice(
             theme,
             true,
             format!(
                 "{name} isn't on GitHub yet. Push it first (Alt+P): creating a pull request never pushes."
+            ),
+        )),
+        Some(Err(HeadProblem::NotPushed(name))) => Some(notice(
+            theme,
+            true,
+            format!(
+                "{name} isn't on GitHub yet. Check it out and push it first: creating a pull request never pushes."
             ),
         )),
         Some(Ok(_)) if unpushed > 0 => Some(notice(
@@ -123,10 +92,22 @@ pub(super) fn panel(
         )),
         Some(Ok(_)) => None,
     };
-    let from = match &head {
-        Some(Ok(branch)) => format!("From {branch}"),
+    let from = match (&head, &branch) {
+        (Some(Ok(head)), _) => format!("From {head}"),
+        (_, Some(branch)) => format!("From {branch}"),
         _ => "From the checked-out branch".to_string(),
     };
+    let open_on_github =
+        components::Button::new("create_pull_request_on_github", "Open on GitHub instead")
+            .end_slot(super::hotkey_hint(
+                theme,
+                "create_pull_request_on_github_hint",
+                "Alt+O",
+            ))
+            .style(components::ButtonStyle::Subtle)
+            .on_click(theme, cx, |this, _e, window, cx| {
+                this.open_pull_request_compare_from_dialog(window, cx);
+            });
 
     let draft_toggle = components::Button::new(
         "create_pull_request_draft",
@@ -157,26 +138,30 @@ pub(super) fn panel(
                 }
             },
         ))
-        .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
-            let mods = e.keystroke.modifiers;
-            if !mods.alt || mods.control || mods.platform || mods.shift {
-                return;
-            }
-            match e.keystroke.key.as_str() {
-                "d" => this.toggle_pull_request_draft(cx),
-                // The normal push flow, run only because the user asked.
-                "p" => {
-                    let root = this.root_view.clone();
-                    window.defer(cx, move |window, cx| {
-                        let _ = root.update(cx, |root, cx| {
-                            root.execute_command("push", Some(window), cx);
-                        });
-                    });
+        .on_key_down(
+            cx.listener(move |this, e: &gpui::KeyDownEvent, window, cx| {
+                let mods = e.keystroke.modifiers;
+                if !mods.alt || mods.control || mods.platform || mods.shift {
+                    return;
                 }
-                _ => return,
-            }
-            cx.stop_propagation();
-        }))
+                match e.keystroke.key.as_str() {
+                    "d" => this.toggle_pull_request_draft(cx),
+                    "o" => this.open_pull_request_compare_from_dialog(window, cx),
+                    // The normal push flow, run only because the user asked; it
+                    // pushes the checked-out branch, so only for that one.
+                    "p" if can_push => {
+                        let root = this.root_view.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = root.update(cx, |root, cx| {
+                                root.execute_command("push", Some(window), cx);
+                            });
+                        });
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }),
+        )
         .child(popover_title(theme, "New pull request"))
         .child(super::popover_rule(theme))
         .child(super::popover_detail(theme, from))
@@ -211,7 +196,16 @@ pub(super) fn panel(
                 .render(theme, this.pull_request_body_input.clone()),
             ),
         )
-        .child(div().px_2().py_1().child(draft_toggle))
+        .child(
+            div()
+                .px_2()
+                .py_1()
+                .flex()
+                .gap_1()
+                .child(draft_toggle)
+                .child(div().flex_1())
+                .child(open_on_github),
+        )
         .when_some(error, |panel, error| {
             panel.child(notice(
                 theme,

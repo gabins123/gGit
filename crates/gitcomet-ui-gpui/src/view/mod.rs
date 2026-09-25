@@ -254,6 +254,7 @@ mod pull_requests;
 mod reflog_panel;
 mod repo_open;
 mod reveal_commit;
+mod review;
 pub(crate) mod rows;
 mod settings_window;
 pub(crate) mod shortcut_labels;

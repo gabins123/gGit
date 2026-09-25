@@ -3260,6 +3260,14 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) diff_selection_anchor: Option<usize>,
     pub(in crate::view) diff_selection_range: Option<(usize, usize)>,
     pub(in crate::view) diff_focused_change_block: Option<DiffFocusedChangeBlock>,
+    /// Review mode drives the diff from the keyboard: j/k move a line cursor, shift extends it.
+    pub(in crate::view) review_active: bool,
+    /// Lines of the shown file that carry a pending review comment.
+    pub(in crate::view) review_marks: FxHashSet<(crate::github::ReviewSide, u32)>,
+    /// Lines of the shown file with a review thread already on GitHub.
+    pub(in crate::view) review_thread_marks: FxHashSet<(crate::github::ReviewSide, u32)>,
+    /// Lines of the shown file with a Codex suggestion waiting to be adopted.
+    pub(in crate::view) review_suggestion_marks: FxHashSet<(crate::github::ReviewSide, u32)>,
     pub(in crate::view) diff_text_selecting: bool,
     pub(in crate::view) diff_text_anchor: Option<DiffTextPos>,
     pub(in crate::view) diff_text_head: Option<DiffTextPos>,

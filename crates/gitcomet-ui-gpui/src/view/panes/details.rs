@@ -92,6 +92,11 @@ pub(in super::super) struct DetailsPaneView {
     /// Keyboard focus for the pane as a whole (`4`, `h`/`l`), for the commit
     /// views that have no status section to focus.
     pub(in super::super) panel_focus_handle: FocusHandle,
+    /// The pull request view's files, checks and conversation.
+    pull_request_scroll: ScrollHandle,
+    /// What that view last scrolled for, so a new pull request starts at the
+    /// top and `j`/`k` keep the selected file in sight.
+    pull_request_scrolled: (u64, Option<usize>),
 
     pub(in super::super) untracked_scroll: UniformListScrollHandle,
     pub(in super::super) unstaged_scroll: UniformListScrollHandle,
@@ -513,6 +518,8 @@ impl DetailsPaneView {
             status_section_resize: None,
             status_section_focus_handles: std::array::from_fn(|_| cx.focus_handle()),
             panel_focus_handle: cx.focus_handle().tab_index(0).tab_stop(false),
+            pull_request_scroll: ScrollHandle::new(),
+            pull_request_scrolled: (0, None),
             untracked_scroll: UniformListScrollHandle::default(),
             unstaged_scroll: UniformListScrollHandle::default(),
             staged_scroll: UniformListScrollHandle::default(),
@@ -2422,7 +2429,265 @@ impl DetailsPaneView {
 }
 
 impl DetailsPaneView {
-    /// The selected pull request: its state, branches, checks and files.
+    /// Review mode's Your review panel: the pending comments, and what
+    /// submitting will do.
+    fn review_panel_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let secondary = theme.colors.foreground.secondary;
+        let warning = theme.colors.status.warning.foreground;
+        let Some(root) = self.root_view.upgrade() else {
+            return div().into_any_element();
+        };
+        let (comments, selected, head_moved, thread, suggested) = {
+            let root = root.read(cx);
+            let Some(review) = root.active_review() else {
+                return div().into_any_element();
+            };
+            (
+                review.draft.comments.clone(),
+                review.selected_comment,
+                review.head_moved,
+                root.review_threads_at_cursor(cx)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                root.review_suggestions_at_cursor(cx)
+                    .into_iter()
+                    .map(|(_, suggestion)| suggestion.body.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let count = comments.len();
+        let rows = comments.into_iter().enumerate().map(|(ix, comment)| {
+            let file = comment
+                .anchor
+                .path
+                .rsplit_once('/')
+                .map_or(comment.anchor.path.as_str(), |(_, name)| name)
+                .to_string();
+            let first_line = comment.body.lines().next().unwrap_or_default().to_string();
+            let where_ = match &comment.reply_to {
+                Some(to) => format!("reply to {} · {}", to.author, comment.anchor.lines_label()),
+                None => comment.anchor.lines_label(),
+            };
+            div()
+                .id(SharedString::from(format!("review_comment_{ix}")))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .mx_1()
+                .px_2()
+                .py_1()
+                .rounded(px(theme.radii.control))
+                .control_interaction(
+                    controls::InteractionStyle::new(theme),
+                    controls::InteractionState::default().selected(
+                        selected == Some(ix),
+                        theme.colors.interaction.selected_background,
+                    ),
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        let root = this.root_view.clone();
+                        // The root repaints this pane; it can't while we're mid-update.
+                        window.defer(cx, move |window, cx| {
+                            let _ = root
+                                .update(cx, |root, cx| root.review_jump_to_comment(ix, window, cx));
+                        });
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_size(theme.ui_text(11.5))
+                        .text_color(secondary)
+                        .child(div().truncate().child(file))
+                        .child(div().flex_none().child(where_)),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(theme.ui_text(12.5))
+                        .child(first_line),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Your review"))
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(11.5))
+                            .text_color(warning)
+                            .child(format!("{count} pending")),
+                    ),
+            )
+            .when(head_moved, |panel| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(warning)
+                        .child("The pull request has new commits since your pending comments were written. Check their lines before submitting."),
+                )
+            })
+            .child(
+                div()
+                    .id("review_comment_rows")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .when(count == 0, |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(theme.ui_text(12.5))
+                                .text_color(secondary)
+                                .child("No comments yet. In the diff, c comments on the line under the cursor; shift+j/k selects more lines."),
+                        )
+                    })
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(secondary)
+                    .child("Saved on this computer. Nothing is on GitHub until you submit: the comments go up as one review, replies right after it.")
+                    .child("enter go to line · e edit · d d delete · S submit"),
+            )
+            .when(!suggested.is_empty(), |panel| {
+                // Codex's text, shown plain; it only becomes yours with `a`.
+                panel.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(theme.colors.stroke.default)
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(theme.ui_text(12.5))
+                                        .child("Codex suggestion on this line"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme.ui_text(11.5))
+                                        .text_color(secondary)
+                                        .child("in the diff: a add to my review · x drop"),
+                                ),
+                        )
+                        .children(
+                            suggested
+                                .into_iter()
+                                .map(|body| div().text_size(theme.ui_text(12.5)).child(body)),
+                        ),
+                )
+            })
+            .when(!thread.is_empty(), |panel| {
+                let heading = if thread.len() == 1 {
+                    "Thread on this line".to_string()
+                } else {
+                    format!("{} threads on this line", thread.len())
+                };
+                // GitHub text from anyone who can comment: plain text only.
+                let said = thread.into_iter().flat_map(|thread| thread.comments).map(|comment| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(theme.ui_text(11.0))
+                                .text_color(secondary)
+                                .child(format!(
+                                    "{} · {}",
+                                    comment.author,
+                                    comment.at.get(..10).unwrap_or(&comment.at)
+                                )),
+                        )
+                        .child(div().text_size(theme.ui_text(12.5)).child(comment.body))
+                });
+                panel.child(
+                    div()
+                        .id("review_thread_at_cursor")
+                        .max_h(px(260.0))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(theme.colors.stroke.default)
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(theme.ui_text(12.5))
+                                        .child(heading),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme.ui_text(11.5))
+                                        .text_color(secondary)
+                                        .child("in the diff: r reply · t next thread"),
+                                ),
+                        )
+                        .children(said),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// `J`/`K`: scrolls the pull request view most of a page.
+    pub(in crate::view) fn scroll_pull_request_details(
+        &mut self,
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let handle = &self.pull_request_scroll;
+        let page = handle.bounds().size.height * 0.8;
+        let mut offset = handle.offset();
+        offset.y = (offset.y - page * f32::from(direction)).clamp(-handle.max_offset().y, px(0.0));
+        handle.set_offset(offset);
+        cx.notify();
+    }
+
+    /// The selected pull request: its state, branches, files, checks and
+    /// conversation.
     fn pull_request_details_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         use super::super::pull_requests::PrLoad;
 
@@ -2483,6 +2748,69 @@ impl DetailsPaneView {
             Some(false) => "Has conflicts",
             None => "Checking for conflicts",
         };
+        if self.pull_request_scrolled.0 != number {
+            self.pull_request_scroll.set_offset(point(px(0.0), px(0.0)));
+            self.pull_request_scrolled = (number, None);
+        }
+        if selected_file.is_some() && self.pull_request_scrolled.1 != selected_file {
+            // Files are the scroll area's first children, so a file's index is
+            // its item index.
+            if let Some(ix) = selected_file {
+                self.pull_request_scroll.scroll_to_item(ix);
+            }
+            self.pull_request_scrolled.1 = selected_file;
+        }
+        let section_title = |text: String| {
+            div()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .text_size(theme.ui_text(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text)
+        };
+        let check_rows = detail.check_runs.iter().map(|run| {
+            use crate::github::CheckState;
+            let (mark, color) = match run.state {
+                CheckState::Failing => ("✗", theme.colors.status.danger.foreground),
+                CheckState::Pending => ("•", theme.colors.status.warning.foreground),
+                CheckState::Passing => ("✓", theme.colors.status.success.foreground),
+            };
+            div()
+                .px_3()
+                .flex()
+                .gap_2()
+                .text_size(theme.ui_text(12.0))
+                .child(div().flex_none().text_color(color).child(mark))
+                .child(div().min_w(px(0.0)).truncate().child(run.name.clone()))
+        });
+        // GitHub text from anyone who can comment: plain text only.
+        let conversation_rows = detail.conversation.iter().map(|entry| {
+            div()
+                .px_3()
+                .py_1()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(theme.ui_text(11.0))
+                        .text_color(secondary)
+                        .child(format!(
+                            "{} {} · {}",
+                            entry.author,
+                            entry.verb,
+                            entry.at.get(..10).unwrap_or(&entry.at)
+                        )),
+                )
+                .when(!entry.body.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .text_size(theme.ui_text(12.0))
+                            .child(entry.body.clone()),
+                    )
+                })
+        });
         let checks = detail.checks;
         let checks_line = if checks.total() == 0 {
             "No checks".to_string()
@@ -2592,12 +2920,27 @@ impl DetailsPaneView {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-                    .children(files),
+                    .track_scroll(&self.pull_request_scroll)
+                    .children(files)
+                    .when(!detail.check_runs.is_empty(), |list| {
+                        list.child(section_title(format!(
+                            "Checks ({})",
+                            detail.check_runs.len()
+                        )))
+                        .children(check_rows)
+                    })
+                    .when(!detail.conversation.is_empty(), |list| {
+                        list.child(section_title(format!(
+                            "Conversation ({})",
+                            detail.conversation.len()
+                        )))
+                        .children(conversation_rows)
+                    }),
             )
             .child(line(if fetching {
                 "Fetching the pull request's commits…".to_string()
             } else {
-                "enter opens the diff · r review · o GitHub".to_string()
+                "enter diff · space checkout · r review · M merge · J/K scroll".to_string()
             }))
             .into_any_element()
     }
@@ -2605,11 +2948,20 @@ impl DetailsPaneView {
 
 impl Render for DetailsPaneView {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let pull_request = self
+        let (reviewing, pull_request) = self
             .root_view
             .upgrade()
-            .is_some_and(|root| root.read(cx).pull_request_details_active());
-        let content = if pull_request {
+            .map(|root| {
+                let root = root.read(cx);
+                (
+                    root.active_review().is_some(),
+                    root.pull_request_details_active(),
+                )
+            })
+            .unwrap_or_default();
+        let content = if reviewing {
+            self.review_panel_view(cx)
+        } else if pull_request {
             self.pull_request_details_view(cx)
         } else {
             self.commit_details_view(cx)

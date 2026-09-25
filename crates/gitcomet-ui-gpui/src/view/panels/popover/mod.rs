@@ -28,6 +28,7 @@ mod force_remove_worktree_confirm;
 mod hook_activity;
 mod merge_abort_confirm;
 mod merge_commit_confirm;
+mod merge_pull_request_prompt;
 mod picker_nav;
 mod picker_row_menu;
 mod pull_reconcile_prompt;
@@ -41,6 +42,7 @@ mod rename_branch_prompt;
 mod repo_picker;
 mod reset_prompt;
 mod revert_commit_confirm;
+mod review_comment_prompt;
 mod rows_cache;
 mod search_inputs;
 mod squash_prompt;
@@ -363,11 +365,19 @@ pub(in super::super) struct PopoverHost {
     create_tag_focus: DialogFocus,
     pull_request_review_input: Entity<components::TextInput>,
     pull_request_review_scroll: ScrollHandle,
+    review_comment_input: Entity<components::TextInput>,
+    review_comment_scroll: ScrollHandle,
+    /// Text of a new line comment closed with esc, reopened on the same lines.
+    review_comment_unsaved: Option<(crate::github::ReviewAnchor, Option<u64>, String)>,
+    /// The selected lines' new text, which alt+s turns into a suggestion.
+    review_comment_suggestion: Option<String>,
     pull_request_title_input: Entity<components::TextInput>,
     pull_request_base_input: Entity<components::TextInput>,
     pull_request_body_input: Entity<components::TextInput>,
     pull_request_body_scroll: ScrollHandle,
     pull_request_draft: bool,
+    pull_request_delete_branch: bool,
+    pull_request_merge_focus_handle: FocusHandle,
     remote_add_focus: DialogFocus,
     remote_edit_focus: DialogFocus,
     push_upstream_focus: DialogFocus,
@@ -548,6 +558,7 @@ fn popover_is_confirm_dialog(kind: &PopoverKind) -> bool {
     matches!(
         kind,
         PopoverKind::StashDropConfirm { .. }
+            | PopoverKind::MergePullRequest { .. }
             | PopoverKind::ForcePushConfirm { .. }
             | PopoverKind::CherryPickCommitConfirm { .. }
             | PopoverKind::RevertCommitConfirm { .. }
@@ -894,6 +905,8 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::RenameBranchPrompt { .. }
         | PopoverKind::CheckoutRemoteBranchPrompt { .. }
         | PopoverKind::PullRequestReview { .. }
+        | PopoverKind::MergePullRequest { .. }
+        | PopoverKind::ReviewComment { .. }
         | PopoverKind::CreatePullRequest { .. } => Some(DIALOG_540_WIDTH),
         PopoverKind::StashDropConfirm { .. }
         | PopoverKind::Repo {

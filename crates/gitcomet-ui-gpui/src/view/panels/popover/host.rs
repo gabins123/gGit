@@ -396,6 +396,9 @@ impl PopoverHost {
         let pull_request_review_scroll = ScrollHandle::new();
         let pull_request_review_input =
             multiline_input("Leave a comment", &pull_request_review_scroll, window, cx);
+        let review_comment_scroll = ScrollHandle::new();
+        let review_comment_input =
+            multiline_input("Leave a comment", &review_comment_scroll, window, cx);
         let pull_request_body_scroll = ScrollHandle::new();
         let pull_request_body_input = multiline_input(
             "Describe the change (Markdown)",
@@ -695,13 +698,18 @@ impl PopoverHost {
             },
         ));
         // The submit buttons enable on text, so typing has to repaint them.
-        for input in [&pull_request_review_input, &pull_request_title_input] {
+        for input in [
+            &pull_request_review_input,
+            &pull_request_title_input,
+            &review_comment_input,
+        ] {
             prompt_input_subscriptions.push(cx.observe(input, |this, _input, cx| {
                 if matches!(
                     this.popover,
                     Some(
                         PopoverKind::PullRequestReview { .. }
                             | PopoverKind::CreatePullRequest { .. }
+                            | PopoverKind::ReviewComment { .. }
                     )
                 ) {
                     cx.notify();
@@ -1024,11 +1032,17 @@ impl PopoverHost {
             create_tag_focus,
             pull_request_review_input,
             pull_request_review_scroll,
+            review_comment_input,
+            review_comment_scroll,
+            review_comment_unsaved: None,
+            review_comment_suggestion: None,
             pull_request_title_input,
             pull_request_base_input,
             pull_request_body_input,
             pull_request_body_scroll,
             pull_request_draft: false,
+            pull_request_delete_branch: false,
+            pull_request_merge_focus_handle: cx.focus_handle().tab_index(0).tab_stop(true),
             remote_add_focus,
             remote_edit_focus,
             push_upstream_focus,
@@ -1066,6 +1080,7 @@ impl PopoverHost {
             &self.create_tag_input,
             &self.create_tag_message_input,
             &self.pull_request_review_input,
+            &self.review_comment_input,
             &self.pull_request_title_input,
             &self.pull_request_base_input,
             &self.pull_request_body_input,
@@ -1508,6 +1523,7 @@ impl PopoverHost {
                 | Some(PopoverKind::CloneRepo)
                 | Some(PopoverKind::CreateTagPrompt { .. })
                 | Some(PopoverKind::PullRequestReview { .. })
+                | Some(PopoverKind::ReviewComment { .. })
                 | Some(PopoverKind::CreatePullRequest { .. })
                 | Some(PopoverKind::SquashPrompt { .. })
                 | Some(PopoverKind::PushSetUpstreamPrompt { .. })
@@ -1639,6 +1655,23 @@ impl PopoverHost {
             }) => self.dismiss_inline_popover(window, cx),
             Some(PopoverKind::PullRequestReview { .. })
             | Some(PopoverKind::CreatePullRequest { .. }) => {
+                self.close_popover_and_restore_focus(window, cx)
+            }
+            Some(PopoverKind::ReviewComment {
+                anchor,
+                edit,
+                reply_to,
+                ..
+            }) => {
+                // A new comment's text waits for the same lines; an edit or a
+                // reply is just abandoned, the pending review is unchanged.
+                let text = self
+                    .review_comment_input
+                    .read_with(cx, |input, _| input.text().to_string());
+                if edit.is_none() && !text.trim().is_empty() {
+                    let reply = reply_to.as_ref().map(|to| to.id);
+                    self.review_comment_unsaved = Some((anchor.clone(), reply, text));
+                }
                 self.close_popover_and_restore_focus(window, cx)
             }
             Some(PopoverKind::CloneRepo)
@@ -1841,11 +1874,160 @@ impl PopoverHost {
         cx.notify();
     }
 
-    pub(in crate::view) fn pull_request_prompt_open(&self) -> bool {
-        matches!(
-            self.popover,
-            Some(PopoverKind::PullRequestReview { .. } | PopoverKind::CreatePullRequest { .. })
-        )
+    /// Opens an edit with the pending comment's text; the root sets it once
+    /// the dialog is open, since the dialog can't read the root while it opens.
+    pub(in crate::view) fn prefill_review_comment(
+        &mut self,
+        text: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if matches!(self.popover, Some(PopoverKind::ReviewComment { .. })) {
+            self.review_comment_input
+                .update(cx, |input, cx| input.set_text(text, cx));
+            cx.notify();
+        }
+    }
+
+    /// The selected lines' new text for alt+s; the root sets it once the
+    /// dialog is open.
+    pub(in crate::view) fn set_review_suggestion(
+        &mut self,
+        text: Option<String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if matches!(self.popover, Some(PopoverKind::ReviewComment { .. })) {
+            self.review_comment_suggestion = text;
+            cx.notify();
+        }
+    }
+
+    /// alt+s: the selected lines as a GitHub suggestion block, after whatever
+    /// has been typed, to edit into the fix.
+    pub(super) fn insert_review_suggestion(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(lines) = self.review_comment_suggestion.clone() else {
+            return false;
+        };
+        self.review_comment_input.update(cx, |input, cx| {
+            let typed = input.text().trim_end().to_string();
+            let lead = if typed.is_empty() {
+                String::new()
+            } else {
+                format!("{typed}\n")
+            };
+            // Longer than any run of backticks in the code, so the code can't
+            // close the block early.
+            let longest = lines.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+            let fence = "`".repeat((longest + 1).max(3));
+            input.set_text(format!("{lead}{fence}suggestion\n{lines}\n{fence}"), cx);
+        });
+        cx.notify();
+        true
+    }
+
+    /// ctrl+enter in the comment box: the comment joins the pending review.
+    pub(super) fn submit_review_comment(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(PopoverKind::ReviewComment {
+            repo_id,
+            number,
+            anchor,
+            edit,
+            reply_to,
+        }) = self.popover.clone()
+        else {
+            return false;
+        };
+        let body = self
+            .review_comment_input
+            .read_with(cx, |input, _| input.text().to_string());
+        if body.trim().is_empty() {
+            return true;
+        }
+        let landed = self
+            .root_view
+            .update(cx, |root, cx| {
+                root.add_review_comment(repo_id, number, anchor, body, edit, reply_to, cx)
+            })
+            .unwrap_or(false);
+        if landed {
+            self.review_comment_unsaved = None;
+            self.close_popover_and_restore_focus(window, cx);
+        }
+        true
+    }
+
+    /// How many line comments the review of `number` would post with it.
+    pub(super) fn pending_review_counts(
+        &self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<(usize, usize, bool)> {
+        let root = self.root_view.upgrade()?;
+        let root = root.read(cx);
+        let review = root.review_of(repo_id, number)?;
+        Some((
+            review.draft.comments.len(),
+            review.files_commented(),
+            review.head_moved,
+        ))
+    }
+
+    pub(in crate::view) fn open_popover_kind(&self) -> Option<&PopoverKind> {
+        self.popover.as_ref()
+    }
+
+    /// The open pull request dialog's repository state, not the active tab's:
+    /// the tab can change under an open dialog.
+    fn open_pull_request_state<R>(
+        &self,
+        cx: &mut gpui::Context<Self>,
+        read: impl FnOnce(&crate::view::pull_requests::RepoPullRequests) -> R,
+    ) -> Option<R> {
+        let repo_id = match self.popover {
+            Some(
+                PopoverKind::PullRequestReview { repo_id, .. }
+                | PopoverKind::CreatePullRequest { repo_id, .. }
+                | PopoverKind::MergePullRequest { repo_id, .. },
+            ) => repo_id,
+            _ => return None,
+        };
+        let root = self.root_view.upgrade()?;
+        root.read(cx).pull_requests.repo(repo_id).map(read)
+    }
+
+    pub(super) fn set_pull_request_merge_method(
+        &mut self,
+        next: crate::github::MergeMethod,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(PopoverKind::MergePullRequest { method, .. }) = self.popover.as_mut()
+            && *method != next
+        {
+            *method = next;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_pull_request_delete_branch(&mut self, cx: &mut gpui::Context<Self>) {
+        if matches!(self.popover, Some(PopoverKind::MergePullRequest { .. })) {
+            self.pull_request_delete_branch = !self.pull_request_delete_branch;
+            cx.notify();
+        }
+    }
+
+    /// The pull request being merged, once its details are in.
+    pub(super) fn pull_request_merge_detail(
+        &self,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<Arc<crate::github::PullRequestDetail>> {
+        self.open_pull_request_state(cx, |prs| prs.detail.ready().cloned())
+            .flatten()
+            .filter(|detail| detail.number == number)
     }
 
     pub(super) fn toggle_pull_request_draft(&mut self, cx: &mut gpui::Context<Self>) {
@@ -1856,51 +2038,90 @@ impl PopoverHost {
     }
 
     pub(super) fn can_submit_pull_request_review(&self, cx: &mut gpui::Context<Self>) -> bool {
-        let Some(PopoverKind::PullRequestReview { kind, .. }) = self.popover else {
+        let Some(PopoverKind::PullRequestReview {
+            repo_id,
+            number,
+            kind,
+        }) = self.popover
+        else {
             return false;
         };
+        // A Comment review can be just its line comments; GitHub's own form
+        // posts those without a summary.
+        let line_comments = kind == crate::github::ReviewKind::Comment
+            && self
+                .pending_review_counts(repo_id, number, cx)
+                .is_some_and(|(comments, _, _)| comments > 0);
         !self.pull_request_submitting(cx)
             && (!kind.needs_body()
+                || line_comments
                 || self
                     .pull_request_review_input
                     .read_with(cx, |input, _| !input.text().trim().is_empty()))
     }
 
-    pub(super) fn can_submit_create_pull_request(&self, cx: &mut gpui::Context<Self>) -> bool {
-        let Some(PopoverKind::CreatePullRequest { repo_id }) = self.popover else {
-            return false;
+    /// The open create dialog's head, when it can head a pull request.
+    fn create_pull_request_head(&self) -> Option<(RepoId, String)> {
+        let Some(PopoverKind::CreatePullRequest { repo_id, branch }) = &self.popover else {
+            return None;
         };
+        let repo = self.state.repos.iter().find(|repo| repo.id == *repo_id)?;
+        crate::view::pull_requests::pull_request_head(repo, branch.as_deref())
+            .ok()
+            .map(|head| (*repo_id, head))
+    }
+
+    /// Alt+O in the create dialog: GitHub's own page for the same pull
+    /// request, with the base typed so far.
+    pub(super) fn open_pull_request_compare_from_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some((repo_id, head)) = self.create_pull_request_head() else {
+            return;
+        };
+        let slug = self
+            .state
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .and_then(|repo| repo.remotes.ready())
+            .and_then(|remotes| crate::view::permalink::github_remote(remotes))
+            .map(|(_, slug)| slug);
+        let Some(slug) = slug else {
+            return;
+        };
+        let base = self
+            .pull_request_base_input
+            .read_with(cx, |input, _| input.text().trim().to_string());
+        let url = crate::view::permalink::github_compare_url(
+            &slug,
+            Some(base.as_str()).filter(|base| !base.is_empty()),
+            &head,
+        );
+        let _ = self
+            .root_view
+            .update(cx, |root, cx| root.open_in_browser(url, cx));
+        self.close_popover_and_restore_focus(window, cx);
+    }
+
+    pub(super) fn can_submit_create_pull_request(&self, cx: &mut gpui::Context<Self>) -> bool {
         !self.pull_request_submitting(cx)
-            && self
-                .state
-                .repos
-                .iter()
-                .find(|repo| repo.id == repo_id)
-                .is_some_and(|repo| {
-                    super::create_pull_request_prompt::pull_request_head(repo).is_ok()
-                })
+            && self.create_pull_request_head().is_some()
             && self
                 .pull_request_title_input
                 .read_with(cx, |input, _| !input.text().trim().is_empty())
     }
 
     pub(super) fn pull_request_submitting(&self, cx: &mut gpui::Context<Self>) -> bool {
-        self.root_view
-            .upgrade()
-            .and_then(|root| {
-                root.read(cx)
-                    .active_pull_requests()
-                    .map(|prs| prs.submitting)
-            })
+        self.open_pull_request_state(cx, |prs| prs.submitting)
             .unwrap_or(false)
     }
 
     pub(super) fn pull_request_submit_error(&self, cx: &mut gpui::Context<Self>) -> Option<String> {
-        self.root_view.upgrade().and_then(|root| {
-            root.read(cx)
-                .active_pull_requests()
-                .and_then(|prs| prs.submit_error.clone())
-        })
+        self.open_pull_request_state(cx, |prs| prs.submit_error.clone())
+            .flatten()
     }
 
     /// `ctrl+enter` or the submit button. Posting is always this explicit step.
@@ -1925,17 +2146,10 @@ impl PopoverHost {
                 }
                 true
             }
-            Some(PopoverKind::CreatePullRequest { repo_id }) => {
+            Some(PopoverKind::CreatePullRequest { repo_id, .. }) => {
                 cx.notify();
                 if self.can_submit_create_pull_request(cx) {
-                    let head = self
-                        .state
-                        .repos
-                        .iter()
-                        .find(|repo| repo.id == repo_id)
-                        .and_then(|repo| {
-                            super::create_pull_request_prompt::pull_request_head(repo).ok()
-                        });
+                    let head = self.create_pull_request_head().map(|(_, head)| head);
                     if let Some(head) = head {
                         let read =
                             |input: &Entity<components::TextInput>,
@@ -1955,6 +2169,20 @@ impl PopoverHost {
                             .root_view
                             .update(cx, |root, cx| root.submit_new_pull_request(repo_id, pr, cx));
                     }
+                }
+                true
+            }
+            Some(PopoverKind::MergePullRequest {
+                repo_id,
+                number,
+                method,
+            }) => {
+                cx.notify();
+                if !self.pull_request_submitting(cx) {
+                    let delete_branch = self.pull_request_delete_branch;
+                    let _ = self.root_view.update(cx, |root, cx| {
+                        root.submit_pull_request_merge(repo_id, number, method, delete_branch, cx)
+                    });
                 }
                 true
             }
@@ -3095,6 +3323,34 @@ impl PopoverHost {
                         .read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
                 }
+                PopoverKind::ReviewComment {
+                    anchor,
+                    edit,
+                    reply_to,
+                    ..
+                } => {
+                    self.review_comment_suggestion = None;
+                    let reply = reply_to.as_ref().map(|to| to.id);
+                    let restored = match (edit, &self.review_comment_unsaved) {
+                        (None, Some((unsaved_at, unsaved_reply, text)))
+                            if unsaved_at == anchor && *unsaved_reply == reply =>
+                        {
+                            text.clone()
+                        }
+                        _ => String::new(),
+                    };
+                    let theme = self.theme;
+                    self.review_comment_input.update(cx, |input, cx| {
+                        input.clear_transient_key_presses();
+                        input.set_theme(theme, cx);
+                        input.set_text(restored, cx);
+                        cx.notify();
+                    });
+                    let focus = self
+                        .review_comment_input
+                        .read_with(cx, |i, _| i.focus_handle());
+                    window.focus(&focus, cx);
+                }
                 PopoverKind::PullRequestReview { .. } => {
                     self.reset_pull_request_inputs(&[&self.pull_request_review_input.clone()], cx);
                     let focus = self
@@ -3377,6 +3633,11 @@ impl PopoverHost {
                     // Focus the primary (Rebase) button so Enter confirms and
                     // Tab/Esc still reach Cancel.
                     window.focus(&self.rebase_onto_submit_focus_handle, cx);
+                }
+                PopoverKind::MergePullRequest { .. } => {
+                    // Enter merges; deleting the branch is always opted into.
+                    self.pull_request_delete_branch = false;
+                    window.focus(&self.pull_request_merge_focus_handle, cx);
                 }
                 // Must sit above the generic confirm-dialog arm below, which
                 // would otherwise swallow it and park focus on the tab group
