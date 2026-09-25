@@ -51,6 +51,68 @@ pub(super) struct RepoPullRequests {
     diff_seq: u64,
 }
 
+/// Why a branch can't head a new pull request yet.
+pub(super) enum HeadProblem {
+    Detached,
+    /// The branch has no upstream on GitHub: GitHub has never seen it.
+    NotPushed(String),
+}
+
+/// The branch a new pull request comes from, as `gh pr create --head` and
+/// GitHub's compare page take it: `branch` (default: the checked-out one) by
+/// its upstream, which must exist on the remote. Creating never pushes, so a
+/// branch without one can't head a pull request yet.
+pub(super) fn pull_request_head(
+    repo: &RepoState,
+    branch: Option<&str>,
+) -> Result<String, HeadProblem> {
+    let name = match (branch, &repo.head_branch) {
+        (Some(name), _) => name.to_string(),
+        (None, Loadable::Ready(head)) if head != "HEAD" => head.clone(),
+        _ => return Err(HeadProblem::Detached),
+    };
+    let upstream = repo
+        .branches
+        .ready()
+        .and_then(|branches| branches.iter().find(|candidate| candidate.name == name))
+        .and_then(|branch| branch.upstream.clone());
+    // Configured isn't pushed: the remote-tracking ref has to exist.
+    let live = upstream.as_ref().is_some_and(|upstream| {
+        repo.remote_branches.ready().is_some_and(|remote_branches| {
+            remote_branches.iter().any(|candidate| {
+                candidate.remote == upstream.remote && candidate.name == upstream.branch
+            })
+        })
+    });
+    match upstream {
+        Some(upstream) if live => Ok(remote_branch_head(repo, &upstream.remote, &upstream.branch)),
+        _ => Err(HeadProblem::NotPushed(name)),
+    }
+}
+
+/// `branch` on `remote` as a pull request head: bare on the pull requests' own
+/// GitHub remote, `owner:branch` on another GitHub repository (a fork).
+pub(super) fn remote_branch_head(repo: &RepoState, remote: &str, branch: &str) -> String {
+    let remotes = repo
+        .remotes
+        .ready()
+        .map(|remotes| remotes.as_slice())
+        .unwrap_or(&[]);
+    let target = super::permalink::github_remote(remotes).map(|(name, _)| name);
+    if target.as_deref() == Some(remote) {
+        return branch.to_string();
+    }
+    let owner = remotes
+        .iter()
+        .find(|candidate| candidate.name == remote)
+        .and_then(|candidate| super::permalink::github_slug(candidate.url.as_deref()?))
+        .and_then(|slug| slug.split('/').next().map(str::to_string));
+    match owner {
+        Some(owner) => format!("{owner}:{branch}"),
+        None => branch.to_string(),
+    }
+}
+
 /// The dialog a gh submit came from, so its outcome reaches that dialog and
 /// no other.
 #[derive(Clone, Copy)]
@@ -79,7 +141,9 @@ impl PrDialog {
                     ..
                 },
             ) => *open == repo_id && *open_number == number,
-            (Self::Create, PopoverKind::CreatePullRequest { repo_id: open }) => *open == repo_id,
+            (Self::Create, PopoverKind::CreatePullRequest { repo_id: open, .. }) => {
+                *open == repo_id
+            }
             _ => false,
         }
     }
@@ -441,6 +505,59 @@ impl GitCometView {
         true
     }
 
+    /// `o` on a branch, as in lazygit: GitHub's page for opening a pull request
+    /// from it, in the browser.
+    pub(super) fn open_pull_request_compare(
+        &mut self,
+        target: &super::branch_sidebar::BranchMenuTarget,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use super::branch_sidebar::BranchMenuTarget;
+        let Some(github) = self.github_target() else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "Pull requests need a github.com remote.".to_string(),
+                cx,
+            );
+            return;
+        };
+        let Some(repo) = self.active_repo() else {
+            return;
+        };
+        let head = match target {
+            BranchMenuTarget::Local { name } => pull_request_head(repo, Some(name))
+                .map_err(|_| format!("{name} isn't on GitHub yet; push it first.")),
+            BranchMenuTarget::Remote { remote, branch } => {
+                Ok(remote_branch_head(repo, remote, branch))
+            }
+        };
+        match head {
+            Ok(head) => self.open_in_browser(
+                super::permalink::github_compare_url(&github.slug, None, &head),
+                cx,
+            ),
+            Err(message) => self.push_toast(components::ToastKind::Warning, message, cx),
+        }
+    }
+
+    /// The browser launch every other forge link goes through.
+    pub(super) fn open_in_browser(&mut self, url: String, cx: &mut gpui::Context<Self>) {
+        platform_open::spawn_launch(
+            cx,
+            move || platform_open::open_url_blocking(&url),
+            |this, result, cx| {
+                if let Err(err) = result {
+                    this.push_toast(
+                        components::ToastKind::Error,
+                        format!("Failed to open link: {err}"),
+                        cx,
+                    );
+                    cx.notify();
+                }
+            },
+        );
+    }
+
     /// Opens the selected PR (or the repository's PR list) on GitHub, reusing
     /// the browser launch every other forge link goes through.
     pub(super) fn open_pull_request_on_github(&mut self, cx: &mut gpui::Context<Self>) -> bool {
@@ -456,20 +573,7 @@ impl GitCometView {
             (_, Some(number)) => format!("https://github.com/{}/pull/{number}", target.slug),
             (_, None) => format!("https://github.com/{}/pulls", target.slug),
         };
-        platform_open::spawn_launch(
-            cx,
-            move || platform_open::open_url_blocking(&url),
-            |this, result, cx| {
-                if let Err(err) = result {
-                    this.push_toast(
-                        components::ToastKind::Error,
-                        format!("Failed to open link: {err}"),
-                        cx,
-                    );
-                    cx.notify();
-                }
-            },
-        );
+        self.open_in_browser(url, cx);
         true
     }
 

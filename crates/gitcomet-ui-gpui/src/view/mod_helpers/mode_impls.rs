@@ -152,9 +152,11 @@ pub(crate) enum PopoverKind {
         number: u64,
         kind: crate::github::ReviewKind,
     },
-    /// Open a GitHub pull request for the checked-out branch through gh.
+    /// Open a GitHub pull request through gh, from `branch` or the
+    /// checked-out one.
     CreatePullRequest {
         repo_id: RepoId,
+        branch: Option<String>,
     },
     /// Merge a GitHub pull request through gh.
     MergePullRequest {

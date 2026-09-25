@@ -79,6 +79,8 @@ Single keys for everyday Git work, lazygit-style. Each one runs the same action 
 | Delete the branch | `Shift+D` twice | Sidebar | The first press asks for the second. Local branches other than the checked-out one. An unmerged branch then asks before force-deleting. |
 | Merge it into the current branch | `Shift+M` twice | Sidebar | The first press asks for the second. |
 | Rebase the current branch onto it | `Shift+R` | Sidebar | Confirms first. |
+| Open a pull request on GitHub | `o` | Sidebar | lazygit's key: GitHub's new pull request page for the branch, in the browser, against the default branch. The branch must already be on GitHub. |
+| Set up a pull request from the branch | `Shift+O` | Sidebar | The New pull request dialog for that branch (base, title, body, draft). `Ctrl+Enter` creates it through gh; `Alt+O` opens GitHub's page with the chosen base instead. |
 | Cherry-pick the commit | `Shift+C` | History | Confirms first. Not the HEAD commit. |
 | Revert the commit | `t` | History | Confirms first. |
 | Reset to the commit | `g` | History | A mixed reset, after confirming. Soft and hard resets are in the commit's menu (`m`). |
@@ -95,7 +97,7 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Next / previous pull request | `j` / `k` | Sidebar. Selecting one shows it in Details. |
 | Next / previous changed file | `j` / `k` | Details, while it shows a pull request. Moves the diff along once one is open. |
 | Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. Pull requests over 100 files or 20,000 changed lines are left to GitHub. |
-| New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, and `Ctrl+Enter` (`Cmd+Enter`) creates. |
+| New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, `Alt+O` opens GitHub's page for it instead, and `Ctrl+Enter` (`Cmd+Enter`) creates. From another branch: `Shift+O` on it in the Branches tab. |
 | Review | `r` | `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
 | Check out locally | `Space` | Sidebar or Details. Runs `gh pr checkout`, which fetches the branch into a local branch of the same name and checks it out. A pull request from a fork (or one whose details haven't loaded) gets its own `pr/<number>` branch instead, so a same-named local branch is never fast-forwarded to someone else's commits. git refuses over conflicting uncommitted changes. |
 | Merge on GitHub | `Shift+M` | Confirms first. `Alt+M` / `Alt+S` / `Alt+R` pick merge commit, squash or rebase; `Alt+D` also deletes the branch on GitHub (not offered for forks); `Enter` merges. GitHub refuses if the branch moved since its details loaded, so only the commits you saw land. With a required merge queue, GitHub queues it instead. Local branches are left alone. |

@@ -1857,7 +1857,7 @@ impl PopoverHost {
         let repo_id = match self.popover {
             Some(
                 PopoverKind::PullRequestReview { repo_id, .. }
-                | PopoverKind::CreatePullRequest { repo_id }
+                | PopoverKind::CreatePullRequest { repo_id, .. }
                 | PopoverKind::MergePullRequest { repo_id, .. },
             ) => repo_id,
             _ => return None,
@@ -1915,19 +1915,55 @@ impl PopoverHost {
                     .read_with(cx, |input, _| !input.text().trim().is_empty()))
     }
 
-    pub(super) fn can_submit_create_pull_request(&self, cx: &mut gpui::Context<Self>) -> bool {
-        let Some(PopoverKind::CreatePullRequest { repo_id }) = self.popover else {
-            return false;
+    /// The open create dialog's head, when it can head a pull request.
+    fn create_pull_request_head(&self) -> Option<(RepoId, String)> {
+        let Some(PopoverKind::CreatePullRequest { repo_id, branch }) = &self.popover else {
+            return None;
         };
+        let repo = self.state.repos.iter().find(|repo| repo.id == *repo_id)?;
+        crate::view::pull_requests::pull_request_head(repo, branch.as_deref())
+            .ok()
+            .map(|head| (*repo_id, head))
+    }
+
+    /// Alt+O in the create dialog: GitHub's own page for the same pull
+    /// request, with the base typed so far.
+    pub(super) fn open_pull_request_compare_from_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some((repo_id, head)) = self.create_pull_request_head() else {
+            return;
+        };
+        let slug = self
+            .state
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .and_then(|repo| repo.remotes.ready())
+            .and_then(|remotes| crate::view::permalink::github_remote(remotes))
+            .map(|(_, slug)| slug);
+        let Some(slug) = slug else {
+            return;
+        };
+        let base = self
+            .pull_request_base_input
+            .read_with(cx, |input, _| input.text().trim().to_string());
+        let url = crate::view::permalink::github_compare_url(
+            &slug,
+            Some(base.as_str()).filter(|base| !base.is_empty()),
+            &head,
+        );
+        let _ = self
+            .root_view
+            .update(cx, |root, cx| root.open_in_browser(url, cx));
+        self.close_popover_and_restore_focus(window, cx);
+    }
+
+    pub(super) fn can_submit_create_pull_request(&self, cx: &mut gpui::Context<Self>) -> bool {
         !self.pull_request_submitting(cx)
-            && self
-                .state
-                .repos
-                .iter()
-                .find(|repo| repo.id == repo_id)
-                .is_some_and(|repo| {
-                    super::create_pull_request_prompt::pull_request_head(repo).is_ok()
-                })
+            && self.create_pull_request_head().is_some()
             && self
                 .pull_request_title_input
                 .read_with(cx, |input, _| !input.text().trim().is_empty())
@@ -1965,17 +2001,10 @@ impl PopoverHost {
                 }
                 true
             }
-            Some(PopoverKind::CreatePullRequest { repo_id }) => {
+            Some(PopoverKind::CreatePullRequest { repo_id, .. }) => {
                 cx.notify();
                 if self.can_submit_create_pull_request(cx) {
-                    let head = self
-                        .state
-                        .repos
-                        .iter()
-                        .find(|repo| repo.id == repo_id)
-                        .and_then(|repo| {
-                            super::create_pull_request_prompt::pull_request_head(repo).ok()
-                        });
+                    let head = self.create_pull_request_head().map(|(_, head)| head);
                     if let Some(head) = head {
                         let read =
                             |input: &Entity<components::TextInput>,

@@ -292,7 +292,10 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
     assert!(popover_open(
         cx,
         &view,
-        &PopoverKind::CreatePullRequest { repo_id: REPO }
+        &PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: None,
+        }
     ));
     press(cx, "escape");
     assert_eq!(focused(cx, &view), Some(Sidebar));
@@ -540,4 +543,33 @@ fn enter_from_details_opens_the_diff_and_escape_comes_back(cx: &mut gpui::TestAp
     wait_until(cx, "focus back on Details", |cx| {
         diff_path(cx, &view).is_none() && focused(cx, &view) == Some(Details)
     });
+}
+
+#[gpui::test]
+fn shift_o_on_a_branch_sets_up_a_pull_request_from_it(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+        name: "origin".into(),
+        url: Some("https://github.com/owner/repo.git".into()),
+    }]));
+    repo.remotes_rev = 1;
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    let _ = select_feature_branch(cx, &view);
+    assert_key_opens(
+        cx,
+        &view,
+        "shift-o",
+        PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: Some("feature".into()),
+        },
+        Sidebar,
+    );
+    // `o` goes straight to GitHub, which needs the branch there; this one was
+    // never pushed, so it only says so.
+    press(cx, "o");
+    assert!(!popover_is_open(cx, &view));
+    assert_eq!(focused(cx, &view), Some(Sidebar));
 }

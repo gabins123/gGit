@@ -168,7 +168,7 @@ fn repo_for_popover<'a>(state: &'a AppState, popover: &PopoverKind) -> Option<&'
         PopoverKind::CommitPrompt { repo_id }
         | PopoverKind::PullRequestReview { repo_id, .. }
         | PopoverKind::MergePullRequest { repo_id, .. }
-        | PopoverKind::CreatePullRequest { repo_id }
+        | PopoverKind::CreatePullRequest { repo_id, .. }
         | PopoverKind::StashPickerPrompt { repo_id, .. }
         | PopoverKind::UpstreamPicker { repo_id, .. }
         | PopoverKind::CreateBranchFromRefPrompt { repo_id, .. }
@@ -950,9 +950,10 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
             number.hash(hasher);
             (*kind as u8).hash(hasher);
         }
-        PopoverKind::CreatePullRequest { repo_id } => {
+        PopoverKind::CreatePullRequest { repo_id, branch } => {
             121u8.hash(hasher);
             repo_id.hash(hasher);
+            branch.hash(hasher);
         }
         PopoverKind::MergePullRequest {
             repo_id,

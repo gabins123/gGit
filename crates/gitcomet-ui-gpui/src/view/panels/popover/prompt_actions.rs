@@ -115,8 +115,8 @@ impl PopoverHost {
                 number,
                 kind,
             } => pull_request_review_prompt::panel(self, repo_id, number, kind, cx),
-            PopoverKind::CreatePullRequest { repo_id } => {
-                create_pull_request_prompt::panel(self, repo_id, cx)
+            PopoverKind::CreatePullRequest { repo_id, branch } => {
+                create_pull_request_prompt::panel(self, repo_id, branch, cx)
             }
             PopoverKind::MergePullRequest { number, method, .. } => {
                 merge_pull_request_prompt::panel(self, number, method, cx)

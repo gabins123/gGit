@@ -71,6 +71,7 @@ impl FocusPanel {
                 ("j/k", "branch"),
                 ("space", "checkout"),
                 ("n", "new"),
+                ("o", "PR"),
                 ("m", "menu"),
             ],
             Self::History => &[
@@ -107,6 +108,8 @@ impl FocusPanel {
                 ("D", "Delete the branch"),
                 ("M", "Merge it into the current branch"),
                 ("R", "Rebase the current branch onto it"),
+                ("o", "Open a pull request for it on GitHub"),
+                ("O", "New pull request from it: base, title, body"),
                 ("m", "The branch's menu"),
                 ("[ / ]", "Branches / Files / Pull requests tab"),
             ],
@@ -755,6 +758,27 @@ impl GitCometView {
                 repo_id,
                 onto: reference,
             }),
+            // lazygit's pull request keys: `o` opens GitHub's page for it,
+            // `O` sets it up here first (base, title, body; or GitHub after all).
+            ("o", _) => {
+                self.open_pull_request_compare(&target, cx);
+                return;
+            }
+            ("O", BranchMenuTarget::Local { name }) => {
+                if self.github_target().is_none() {
+                    self.push_toast(
+                        components::ToastKind::Warning,
+                        "Pull requests need a github.com remote.".to_string(),
+                        cx,
+                    );
+                    return;
+                }
+                self.clear_pull_request_submit_error();
+                Some(PopoverKind::CreatePullRequest {
+                    repo_id,
+                    branch: Some(name.clone()),
+                })
+            }
             _ => None,
         };
         if let Some(kind) = kind {
@@ -864,7 +888,9 @@ impl GitCometView {
                     );
                 }
             }
-            (Some(FocusPanel::Sidebar), "space" | "n" | "D" | "M" | "R") if branches => {
+            (Some(FocusPanel::Sidebar), "space" | "n" | "D" | "M" | "R" | "o" | "O")
+                if branches =>
+            {
                 self.branch_action(repo_id, &key, armed, window, cx)
             }
             (Some(FocusPanel::History), "C" | "t" | "g" | "T") => {
@@ -957,7 +983,10 @@ impl GitCometView {
                     );
                 } else {
                     self.open_pull_request_prompt(
-                        PopoverKind::CreatePullRequest { repo_id },
+                        PopoverKind::CreatePullRequest {
+                            repo_id,
+                            branch: None,
+                        },
                         window,
                         cx,
                     );
