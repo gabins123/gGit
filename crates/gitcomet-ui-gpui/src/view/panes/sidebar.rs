@@ -3402,6 +3402,21 @@ impl SidebarPaneView {
         use crate::github::ReviewDecision;
 
         let secondary = theme.colors.foreground.secondary;
+        let drafts = self
+            .root_view
+            .upgrade()
+            .and_then(|root| {
+                root.read(cx)
+                    .active_pull_requests()
+                    .map(|prs| prs.drafts.clone())
+            })
+            .unwrap_or_default();
+        let ranks: Vec<u8> = list
+            .iter()
+            .map(|pr| super::super::pull_requests::inbox_rank(pr, &drafts))
+            .collect();
+        // Section titles only once something is waiting on you.
+        let sectioned = ranks.iter().any(|rank| *rank < 2);
         let header = div()
             .flex()
             .items_center()
@@ -3412,7 +3427,11 @@ impl SidebarPaneView {
                 div()
                     .text_size(theme.ui_text(12.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("Open · {}", list.len())),
+                    .child(if sectioned {
+                        format!("Pull requests · {}", list.len())
+                    } else {
+                        format!("Open · {}", list.len())
+                    }),
             )
             .child(div().flex_1())
             .child(
@@ -3422,9 +3441,15 @@ impl SidebarPaneView {
                     .child("n new · R refresh"),
             );
 
-        let rows = list.iter().map(|pr| {
+        let row = |pr: &crate::github::PullRequestSummary| {
             let number = pr.number;
             let mut badges: Vec<(String, gpui::Rgba)> = Vec::new();
+            if let Some(pending) = drafts.get(&number) {
+                badges.push((
+                    format!("{pending} drafted"),
+                    theme.colors.status.warning.foreground,
+                ));
+            }
             if pr.is_draft {
                 badges.push(("Draft".to_string(), secondary));
             }
@@ -3505,7 +3530,32 @@ impl SidebarPaneView {
                             div().flex_none().text_color(color).child(label)
                         })),
                 )
-        });
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (ix, pr) in list.iter().enumerate() {
+            let rank = ranks[ix];
+            if sectioned && (ix == 0 || ranks[ix - 1] != rank) {
+                let title = match rank {
+                    0 => "Waiting for your review",
+                    1 => "Your reviews in progress",
+                    _ => "Open",
+                };
+                let count = ranks.iter().filter(|other| **other == rank).count();
+                rows.push(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(theme.ui_text(11.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(secondary)
+                        .child(format!("{title} · {count}"))
+                        .into_any_element(),
+                );
+            }
+            rows.push(row(pr));
+        }
 
         div()
             .flex()

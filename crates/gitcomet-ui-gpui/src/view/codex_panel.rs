@@ -48,6 +48,9 @@ pub(super) enum CodexDestination {
     /// The review dialog for this repository's pull request, if it is still
     /// open and empty.
     ReviewDraft(RepoId, u64),
+    /// Review mode's suggestions on lines, for this pull request, while the
+    /// review is still on the head it had (`suggestion_generation`).
+    ReviewSuggestions(RepoId, u64, u64),
 }
 
 enum RunState {
@@ -92,6 +95,12 @@ enum Material {
     PullRequest {
         slug: String,
         number: u64,
+    },
+    /// The reviewed range of a pull request, from its local commits: the
+    /// exact lines review mode shows.
+    CommitRange {
+        base: String,
+        head: String,
     },
     RepoOverview,
 }
@@ -205,6 +214,20 @@ fn gather(workdir: &std::path::Path, material: Material) -> Result<String, Strin
         }
         Material::PullRequest { slug, number } => {
             crate::github::diff(workdir, &slug, number).map_err(|err| err.to_string())
+        }
+        Material::CommitRange { base, head } => {
+            if !is_object_id(&base) || !is_object_id(&head) {
+                return Err("The reviewed commits aren't known yet.".to_string());
+            }
+            git_output(
+                workdir,
+                &[
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    &format!("{base}..{head}"),
+                ],
+            )
         }
         Material::RepoOverview => {
             // The log first: a long file list is what gets cut.
@@ -391,7 +414,8 @@ impl GitCometView {
                 // The dialog's own pull request, else the selected one.
                 let prs = self.active_pull_requests();
                 let number = match destination {
-                    CodexDestination::ReviewDraft(_, number) => Some(number),
+                    CodexDestination::ReviewDraft(_, number)
+                    | CodexDestination::ReviewSuggestions(_, number, _) => Some(number),
                     CodexDestination::Panel => prs.and_then(|prs| prs.selected),
                 };
                 let too_large = prs
@@ -399,8 +423,27 @@ impl GitCometView {
                     .is_some_and(|detail| {
                         Some(detail.number) == number && detail.too_large_for_app()
                     });
+                // Review mode reads the reviewed head's own diff, so Codex's
+                // line numbers are the ones on screen.
+                let reviewed = match destination {
+                    CodexDestination::ReviewSuggestions(..) => Some((
+                        prs.and_then(|prs| prs.diff_base.ready().cloned()),
+                        self.active_review()
+                            .map(|review| review.draft.head_oid.clone()),
+                    )),
+                    _ => None,
+                };
                 match (number, self.github_target()) {
                     _ if too_large => Err("This pull request is too large to review here."),
+                    _ if matches!(reviewed, Some((None, _) | (_, None))) => {
+                        Err("Open a file of the review first, so its commits are here.")
+                    }
+                    (Some(_), Some(_)) if reviewed.is_some() => {
+                        let Some((Some(base), Some(head))) = reviewed else {
+                            unreachable!("checked just above");
+                        };
+                        Ok(Material::CommitRange { base, head })
+                    }
                     (Some(number), Some(target)) => Ok(Material::PullRequest {
                         slug: target.slug,
                         number,
@@ -431,7 +474,12 @@ impl GitCometView {
             return;
         }
 
-        let instructions = instructions(action, &question);
+        let instructions = match destination {
+            CodexDestination::ReviewSuggestions(..) => {
+                super::review::SUGGESTION_INSTRUCTIONS.to_string()
+            }
+            _ => instructions(action, &question),
+        };
         let title = match action {
             CodexAction::Ask => format!("Ask: {question}"),
             _ => action.title().to_string(),
@@ -516,10 +564,16 @@ impl GitCometView {
                         input.update(cx, |input, cx| input.set_text(answer.clone(), cx));
                     }
                 }
-                if let CodexDestination::ReviewDraft(draft_repo, number) = destination {
-                    self.popover_host.update(cx, |host, cx| {
-                        host.fill_pull_request_review_draft(draft_repo, number, answer, cx)
-                    });
+                match destination {
+                    CodexDestination::ReviewDraft(draft_repo, number) => {
+                        self.popover_host.update(cx, |host, cx| {
+                            host.fill_pull_request_review_draft(draft_repo, number, answer, cx)
+                        });
+                    }
+                    CodexDestination::ReviewSuggestions(review_repo, number, generation) => {
+                        self.add_review_suggestions(review_repo, number, generation, &answer, cx);
+                    }
+                    CodexDestination::Panel => {}
                 }
             }
             Err(CodexError::Cancelled) => run.state = RunState::Failed(CodexError::Cancelled),
@@ -745,7 +799,19 @@ impl GitCometView {
         }
         if let Some(&(action, ..)) = CodexAction::MENU.iter().find(|(_, k, _)| *k == key) {
             self.codex_menu_open = false;
-            self.start_codex(action, CodexDestination::Panel, window, cx);
+            // In review mode, reviewing the pull request means suggestions on
+            // its lines rather than a text review.
+            let destination = match (action, self.active_review()) {
+                (CodexAction::ReviewPullRequest, Some(review)) => {
+                    CodexDestination::ReviewSuggestions(
+                        review.repo_id,
+                        review.number,
+                        review.suggestion_generation,
+                    )
+                }
+                _ => CodexDestination::Panel,
+            };
+            self.start_codex(action, destination, window, cx);
         }
         // The menu is modal: other plain keys go nowhere.
         true

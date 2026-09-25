@@ -181,6 +181,8 @@ pub(crate) struct PullRequestSummary {
     pub(crate) is_draft: bool,
     pub(crate) review: Option<ReviewDecision>,
     pub(crate) checks: ChecksSummary,
+    /// Your review is requested on it.
+    pub(crate) review_requested: bool,
 }
 
 impl From<RawSummary> for PullRequestSummary {
@@ -194,6 +196,7 @@ impl From<RawSummary> for PullRequestSummary {
             is_draft: raw.is_draft,
             review: ReviewDecision::parse(&raw.review_decision),
             checks: ChecksSummary::from_entries(&raw.status_check_rollup),
+            review_requested: false,
         }
     }
 }
@@ -752,7 +755,11 @@ fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, PrError
         .map_err(|err| PrError::Failed(format!("unexpected gh output: {err}")))
 }
 
-pub(crate) fn list_open(workdir: &Path, repo: &str) -> Result<Vec<PullRequestSummary>, PrError> {
+/// The open pull requests, and whether gh could say which wait on your review.
+pub(crate) fn list_open(
+    workdir: &Path,
+    repo: &str,
+) -> Result<(Vec<PullRequestSummary>, bool), PrError> {
     let mut command = gh(workdir);
     command.args([
         "pr",
@@ -763,7 +770,31 @@ pub(crate) fn list_open(workdir: &Path, repo: &str) -> Result<Vec<PullRequestSum
         "--json=number,title,author,headRefName,baseRefName,isDraft,reviewDecision,statusCheckRollup",
     ]);
     let raw: Vec<RawSummary> = parse_json(&run(command, None)?)?;
-    Ok(raw.into_iter().map(Into::into).collect())
+    let mut list: Vec<PullRequestSummary> = raw.into_iter().map(Into::into).collect();
+    // Which ones wait on you, including any past the list's limit. Only a
+    // marker: if gh can't answer, the list still shows (and says so).
+    let mut requested = gh(workdir);
+    requested.args([
+        "pr",
+        "list",
+        &repo_flag(repo),
+        "--state=open",
+        "--search=review-requested:@me",
+        &format!("--limit={LIST_LIMIT}"),
+        "--json=number,title,author,headRefName,baseRefName,isDraft,reviewDecision,statusCheckRollup",
+    ]);
+    let requested = run(requested, None).and_then(|out| parse_json::<Vec<RawSummary>>(&out));
+    let known = requested.is_ok();
+    for raw in requested.unwrap_or_default() {
+        match list.iter_mut().find(|pr| pr.number == raw.number) {
+            Some(pr) => pr.review_requested = true,
+            None => list.push(PullRequestSummary {
+                review_requested: true,
+                ..raw.into()
+            }),
+        }
+    }
+    Ok((list, known))
 }
 
 pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullRequestDetail, PrError> {

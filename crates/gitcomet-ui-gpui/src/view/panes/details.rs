@@ -2438,7 +2438,7 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (comments, selected, head_moved, thread) = {
+        let (comments, selected, head_moved, thread, suggested) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
@@ -2450,6 +2450,10 @@ impl DetailsPaneView {
                 root.review_threads_at_cursor(cx)
                     .into_iter()
                     .cloned()
+                    .collect::<Vec<_>>(),
+                root.review_suggestions_at_cursor(cx)
+                    .into_iter()
+                    .map(|(_, suggestion)| suggestion.body.clone())
                     .collect::<Vec<_>>(),
             )
         };
@@ -2574,6 +2578,41 @@ impl DetailsPaneView {
                     .child("Saved on this computer. Nothing is on GitHub until you submit: the comments go up as one review, replies right after it.")
                     .child("enter go to line · e edit · d d delete · S submit"),
             )
+            .when(!suggested.is_empty(), |panel| {
+                // Codex's text, shown plain; it only becomes yours with `a`.
+                panel.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(theme.colors.stroke.default)
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(theme.ui_text(12.5))
+                                        .child("Codex suggestion on this line"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme.ui_text(11.5))
+                                        .text_color(secondary)
+                                        .child("in the diff: a add to my review · x drop"),
+                                ),
+                        )
+                        .children(
+                            suggested
+                                .into_iter()
+                                .map(|body| div().text_size(theme.ui_text(12.5)).child(body)),
+                        ),
+                )
+            })
             .when(!thread.is_empty(), |panel| {
                 let heading = if thread.len() == 1 {
                     "Thread on this line".to_string()

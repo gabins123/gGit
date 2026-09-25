@@ -16,6 +16,17 @@ const REVIEW_OUTSIDE_HUNK: &str =
     "GitHub only takes comments on changed lines and the 3 lines around them.";
 const REVIEW_ACROSS_GAP: &str = "A comment's lines have to be one unbroken run of the diff.";
 
+/// What a gutter mark stands for, in the order one wins over another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::view) enum ReviewMark {
+    /// A pending comment of yours.
+    Pending,
+    /// A thread already on GitHub.
+    Thread,
+    /// A Codex suggestion waiting to be adopted or dropped.
+    Suggestion,
+}
+
 /// A diff row a review comment can sit on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::view) struct ReviewRow {
@@ -316,12 +327,17 @@ impl MainPaneView {
         true
     }
 
-    /// The review mark on this row, read per painted row: its side, and
-    /// whether it is a pending comment of yours (else a thread already on
-    /// GitHub). A pending comment wins over a thread on the same line.
-    pub(in crate::view) fn review_mark(&self, visible_ix: usize) -> Option<(ReviewSide, bool)> {
+    /// The review mark on this row, read per painted row: its side and what
+    /// it stands for. A pending comment wins over a thread, a thread over a
+    /// Codex suggestion.
+    pub(in crate::view) fn review_mark(
+        &self,
+        visible_ix: usize,
+    ) -> Option<(ReviewSide, ReviewMark)> {
         if !self.review_active
-            || (self.review_marks.is_empty() && self.review_thread_marks.is_empty())
+            || (self.review_marks.is_empty()
+                && self.review_thread_marks.is_empty()
+                && self.review_suggestion_marks.is_empty())
         {
             return None;
         }
@@ -330,21 +346,29 @@ impl MainPaneView {
             row.new_line.map(|line| (ReviewSide::Right, line)),
             row.old_line.map(|line| (ReviewSide::Left, line)),
         ];
-        keys.iter()
-            .flatten()
-            .find(|key| self.review_marks.contains(key))
-            .map(|key| (key.0, true))
-            .or_else(|| {
-                keys.iter()
-                    .flatten()
-                    .find(|key| self.review_thread_marks.contains(key))
-                    .map(|key| (key.0, false))
-            })
+        [
+            (&self.review_marks, ReviewMark::Pending),
+            (&self.review_thread_marks, ReviewMark::Thread),
+            (&self.review_suggestion_marks, ReviewMark::Suggestion),
+        ]
+        .into_iter()
+        .find_map(|(marks, kind)| {
+            keys.iter()
+                .flatten()
+                .find(|key| marks.contains(key))
+                .map(|key| (key.0, kind))
+        })
     }
 
     #[cfg(test)]
     pub(in crate::view) fn review_mark_side(&self, visible_ix: usize) -> Option<ReviewSide> {
         self.review_mark(visible_ix).map(|(side, _)| side)
+    }
+
+    /// Whether GitHub would take a comment on the line under the cursor.
+    pub(in crate::view) fn review_cursor_commentable(&self) -> bool {
+        self.review_head()
+            .is_some_and(|head| self.review_row_commentable(head))
     }
 
     /// The row under the cursor.

@@ -16,6 +16,7 @@ mod helpers;
 mod interactive_rebase;
 mod preview;
 mod review_cursor;
+pub(in crate::view) use review_cursor::ReviewMark;
 pub(in crate::view) mod submodule_summary;
 
 #[cfg(feature = "benchmarks")]

@@ -15,7 +15,9 @@ use super::diff_text::{
 use super::*;
 use crate::github::ReviewSide;
 use crate::view::panes::main::diff_search::{DiffSearchMatcher, DiffSearchOptions};
-use crate::view::panes::main::{DiffChangeSide, DiffHorizontalScrollColumn, FocusedChangeBlockRow};
+use crate::view::panes::main::{
+    DiffChangeSide, DiffHorizontalScrollColumn, FocusedChangeBlockRow, ReviewMark,
+};
 use gitcomet_core::domain::{DiffArea, DiffLineKind};
 use gpui::{
     App, Bounds, CursorStyle, DispatchPhase, HighlightStyle, Hitbox, HitboxBehavior, Pixels,
@@ -1229,7 +1231,7 @@ fn paint_review_mark(
     window: &mut Window,
     row_bounds: Bounds<Pixels>,
     left: Pixels,
-    pending: bool,
+    mark: ReviewMark,
     theme: AppTheme,
     ui_scale_percent: u32,
 ) {
@@ -1241,11 +1243,11 @@ fn paint_review_mark(
         fill(
             Bounds::new(point(left, top), size(width, height)),
             // Amber for your pending comments, the accent for threads already
-            // on GitHub.
-            if pending {
-                theme.colors.status.warning.foreground
-            } else {
-                theme.colors.accent.foreground
+            // on GitHub, grey for Codex suggestions.
+            match mark {
+                ReviewMark::Pending => theme.colors.status.warning.foreground,
+                ReviewMark::Thread => theme.colors.accent.foreground,
+                ReviewMark::Suggestion => theme.colors.foreground.secondary,
             },
         )
         .corner_radii(width * 0.5),
@@ -2433,12 +2435,12 @@ pub(super) fn inline_diff_line_row_canvas(
                 );
             }
 
-            if let Some((_, pending)) = view.read(cx).review_mark(visible_ix) {
+            if let Some((_, mark)) = view.read(cx).review_mark(visible_ix) {
                 paint_review_mark(
                     window,
                     prepaint.bounds,
                     prepaint.bounds.left() + prepaint.annot_w,
-                    pending,
+                    mark,
                     theme,
                     ui_scale_percent,
                 );
@@ -2760,7 +2762,7 @@ pub(super) fn split_diff_line_row_canvas(
                 }
             }
 
-            if let Some((side, pending)) = view.read(cx).review_mark(visible_ix) {
+            if let Some((side, mark)) = view.read(cx).review_mark(visible_ix) {
                 let column = match side {
                     ReviewSide::Left => prepaint.left_col,
                     ReviewSide::Right => prepaint.right_col,
@@ -2769,7 +2771,7 @@ pub(super) fn split_diff_line_row_canvas(
                     window,
                     prepaint.bounds,
                     column.left(),
-                    pending,
+                    mark,
                     theme,
                     ui_scale_percent,
                 );
@@ -3075,14 +3077,14 @@ pub(super) fn patch_split_column_row_canvas(
                 record_focused_change_block_for_tests(visible_ix, region, row, outline);
             }
 
-            if let Some((side, pending)) = view.read(cx).review_mark(visible_ix)
+            if let Some((side, mark)) = view.read(cx).review_mark(visible_ix)
                 && (side == ReviewSide::Left) == (region == DiffTextRegion::SplitLeft)
             {
                 paint_review_mark(
                     window,
                     prepaint.bounds,
                     prepaint.bounds.left() + prepaint.annot_w,
-                    pending,
+                    mark,
                     theme,
                     ui_scale_percent,
                 );

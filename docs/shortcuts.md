@@ -99,6 +99,7 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. Pull requests over 100 files or 20,000 changed lines are left to GitHub. |
 | New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, `Alt+O` opens GitHub's page for it instead, and `Ctrl+Enter` (`Cmd+Enter`) creates. From another branch: `Shift+O` on it in the Branches tab. |
 | Review | `r` | Opens review mode for the pull request (below), picking up a pending review of it where it was left. |
+| Your review queue | | The list leads with the pull requests waiting for your review, then the ones with a review of yours pending on this computer (with its count), then the rest; `j` / `k` follow that order. |
 | Quick review | `Shift+S` | Just a verdict and a summary, no line comments. `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
 | Check out locally | `Space` | Sidebar or Details. Runs `gh pr checkout`, which fetches the branch into a local branch of the same name and checks it out. A pull request from a fork (or one whose details haven't loaded) gets its own `pr/<number>` branch instead, so a same-named local branch is never fast-forwarded to someone else's commits. git refuses over conflicting uncommitted changes. |
 | Merge on GitHub | `Shift+M` | Confirms first. `Alt+M` / `Alt+S` / `Alt+R` pick merge commit, squash or rebase; `Alt+D` also deletes the branch on GitHub (not offered for forks); `Enter` merges. GitHub refuses if the branch moved since its details loaded, so only the commits you saw land. With a required merge queue, GitHub queues it instead. Local branches are left alone. |
@@ -118,6 +119,7 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Suggest a change | `Alt+S` | Comment box | Puts the selected lines in a GitHub suggestion block, after what's typed, to edit into the fix. GitHub then offers to commit it. Not on removed lines. |
 | Next / previous thread | `t` / `Shift+T` | Diff | Threads already on GitHub, marked in blue (your pending comments are amber). Details shows the thread under the cursor. |
 | Reply | `r` | Diff | To the thread on the line under the cursor. The reply waits with the rest of the review and posts right after it. |
+| Codex suggestions | `i` then `p` | Any panel | In review mode, Codex reviews the pull request's patch as suggested line comments, marked in grey; `t` steps to them too and Details shows the one under the cursor. Nothing is posted: `a` adopts it as your pending comment (edit or delete it like any other), `x` drops it. |
 | Next / previous change | `}` / `{` | Diff | |
 | Next / previous file | `]` / `[` | Any panel | `j` / `k` in the Sidebar too. |
 | Mark the file viewed | `Space` | Diff, Sidebar | Then goes to the next file not yet viewed. `Space` again unmarks it. |

@@ -170,6 +170,25 @@ line six"
             assert_eq!(pane.review_mark_side(7), Some(ReviewSide::Right));
             assert_eq!(pane.review_mark_side(5), Some(ReviewSide::Left));
             assert_eq!(pane.review_mark_side(6), None);
+            // One line, all three kinds: yours, then a thread, then Codex.
+            use crate::view::panes::main::ReviewMark;
+            pane.review_thread_marks.insert((ReviewSide::Right, 7));
+            pane.review_suggestion_marks.insert((ReviewSide::Right, 7));
+            assert_eq!(
+                pane.review_mark(7),
+                Some((ReviewSide::Right, ReviewMark::Pending))
+            );
+            pane.review_marks.remove(&(ReviewSide::Right, 7));
+            assert_eq!(
+                pane.review_mark(7),
+                Some((ReviewSide::Right, ReviewMark::Thread))
+            );
+            pane.review_thread_marks.clear();
+            assert_eq!(
+                pane.review_mark(7),
+                Some((ReviewSide::Right, ReviewMark::Suggestion))
+            );
+
             pane.review_active = false;
             assert_eq!(pane.review_mark_side(7), None);
         });

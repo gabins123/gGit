@@ -26,18 +26,16 @@ pub(super) struct ReviewDraft {
 impl ReviewDraft {
     fn file(repo: &str, number: u64) -> Option<std::path::PathBuf> {
         let dir = gitcomet_state::session::review_drafts_dir()?;
-        // `owner/name` becomes `owner~name`: one flat file per pull request.
-        let name: String = repo
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                    c
-                } else {
-                    '~'
-                }
-            })
-            .collect();
-        Some(dir.join(format!("{name}~{number}.json")))
+        Some(dir.join(format!("{}{number}.json", draft_file_prefix(repo))))
+    }
+
+    /// Reads a draft file without touching it: for counting, where an
+    /// unreadable file is simply not counted (opening it reports it).
+    fn peek(file: &std::path::Path, repo: &str, number: u64) -> Option<Self> {
+        let text = std::fs::read_to_string(file).ok()?;
+        serde_json::from_str::<Self>(&text)
+            .ok()
+            .filter(|draft| draft.repo == repo && draft.number == number)
     }
 
     /// The saved draft, if any. A file that can't be read back is set aside
@@ -120,6 +118,12 @@ pub(super) struct ReviewMode {
     /// Review threads already on GitHub, loaded when review mode opens.
     pub(super) threads: Vec<ReviewThread>,
     threads_loading: bool,
+    /// Codex's suggested comments, waiting to be adopted (`a`) or dropped
+    /// (`x`). Never posted as they are.
+    pub(super) suggestions: Vec<ReviewComment>,
+    /// Bumped whenever the reviewed head changes: a Codex run started before
+    /// then answers about other lines, and its answer is dropped.
+    pub(super) suggestion_generation: u64,
     written_seq: std::sync::Arc<std::sync::Mutex<u64>>,
 }
 
@@ -262,6 +266,8 @@ impl GitCometView {
             written_seq: Default::default(),
             threads: Vec::new(),
             threads_loading: !cfg!(test),
+            suggestions: Vec::new(),
+            suggestion_generation: 0,
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
@@ -295,6 +301,8 @@ impl GitCometView {
         if let Some(review) = self.review.as_mut() {
             review.draft.head_oid = head;
             review.head_moved |= had_comments;
+            review.suggestions.clear();
+            review.suggestion_generation += 1;
         }
         self.save_review(cx);
         if had_comments {
@@ -485,6 +493,26 @@ impl GitCometView {
         review.write_seq += 1;
         let seq = review.write_seq;
         let written = review.written_seq.clone();
+        let (repo_id, number, pending) =
+            (review.repo_id, review.number, review.draft.comments.len());
+        self.set_pending_count(repo_id, number, pending);
+        if contents.is_none() {
+            // Removing is quick, and done before anything can rescan the
+            // folder; the lock keeps an older write from recreating it.
+            let mut last = written
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *last = seq;
+            if let Err(err) = write_draft(&file, None) {
+                drop(last);
+                self.push_toast(
+                    components::ToastKind::Error,
+                    format!("Couldn't save the pending review: {err}"),
+                    cx,
+                );
+            }
+            return;
+        }
         let task = cx.background_spawn(async move {
             // Held across the write: writes land one at a time, newest wins.
             let mut last = written
@@ -568,6 +596,116 @@ impl GitCometView {
         threads_on_row(&review.threads, path, row.old_line, row.new_line)
     }
 
+    /// Codex's suggestions on the line under the cursor, with their indices.
+    pub(super) fn review_suggestions_at_cursor(&self, cx: &App) -> Vec<(usize, &ReviewComment)> {
+        let Some(review) = self.active_review() else {
+            return Vec::new();
+        };
+        let (Some(path), true) = (review.current_path(), self.review_diff_shown()) else {
+            return Vec::new();
+        };
+        let Some(row) = self.main_pane.read(cx).review_cursor_row() else {
+            return Vec::new();
+        };
+        review
+            .suggestions
+            .iter()
+            .enumerate()
+            .filter(|(_, suggestion)| {
+                suggestion.anchor.path == path
+                    && match suggestion.anchor.side {
+                        ReviewSide::Left => row.old_line == Some(suggestion.anchor.line),
+                        ReviewSide::Right => row.new_line == Some(suggestion.anchor.line),
+                    }
+            })
+            .collect()
+    }
+
+    /// `a`/`x` on a suggestion's line: adopt it as a pending comment of yours
+    /// (to edit or delete like any other), or drop it.
+    fn review_take_suggestion(&mut self, adopt: bool, cx: &mut gpui::Context<Self>) {
+        let Some(ix) = self
+            .review_suggestions_at_cursor(cx)
+            .first()
+            .map(|(ix, _)| *ix)
+        else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "No Codex suggestion on this line; t goes to the next one.".to_string(),
+                cx,
+            );
+            return;
+        };
+        if adopt && !self.main_pane.read(cx).review_cursor_commentable() {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "GitHub only takes comments on changed lines and the 3 lines around them; x drops this suggestion.".to_string(),
+                cx,
+            );
+            return;
+        }
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let suggestion = review.suggestions.remove(ix);
+        if adopt {
+            review.draft.comments.push(suggestion);
+            review.selected_comment = Some(review.draft.comments.len() - 1);
+            self.save_review(cx);
+        }
+        self.sync_review_marks(cx);
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// Codex's answer to "suggest line comments": the ones on this pull
+    /// request's files join the review as suggestions, unless the review
+    /// moved to another head since the run started.
+    pub(super) fn add_review_suggestions(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        generation: u64,
+        answer: &str,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self
+            .review
+            .as_mut()
+            .filter(|review| review.repo_id == repo_id && review.number == number)
+        else {
+            return;
+        };
+        if review.suggestion_generation != generation {
+            self.push_toast(
+                components::ToastKind::Warning,
+                format!("#{number} changed while Codex was reading it; i p asks again."),
+                cx,
+            );
+            return;
+        }
+        let Some(suggestions) = parse_review_suggestions(answer, &review.files) else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "Couldn't read line comments in Codex's answer; it's in the Codex panel."
+                    .to_string(),
+                cx,
+            );
+            return;
+        };
+        let count = suggestions.len();
+        review.suggestions = suggestions;
+        self.sync_review_marks(cx);
+        self.notify_pull_request_panes(cx);
+        let message = match count {
+            0 => "Codex had no line comments to suggest.".to_string(),
+            n => format!(
+                "Codex suggested {n} line comment{}. t steps to them; a adds one to your review, x drops it.",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        self.push_toast(components::ToastKind::Success, message, cx);
+    }
+
     /// Details shows the thread under the cursor; the cursor lives in the
     /// diff, so a move repaints Details once the diff has moved it.
     fn notify_review_details_after_move(&self, cx: &mut gpui::Context<Self>) {
@@ -588,12 +726,19 @@ impl GitCometView {
             .iter()
             .filter(|thread| thread.path == path)
             .filter_map(|thread| Some((thread.side, thread.line?)))
+            .chain(
+                review
+                    .suggestions
+                    .iter()
+                    .filter(|suggestion| suggestion.anchor.path == path)
+                    .map(|suggestion| (suggestion.anchor.side, suggestion.anchor.line)),
+            )
             .collect();
         if targets.is_empty() {
             let message = if review.threads_loading {
                 "Still loading the threads."
             } else {
-                "No threads on this file's lines."
+                "No threads or suggestions on this file's lines."
             };
             self.push_toast(components::ToastKind::Warning, message.to_string(), cx);
             return;
@@ -691,9 +836,25 @@ impl GitCometView {
                 )
             })
             .unwrap_or_default();
+        let suggestions: rustc_hash::FxHashSet<(ReviewSide, u32)> = self
+            .review
+            .as_ref()
+            .and_then(|review| {
+                let path = review.current_path()?;
+                Some(
+                    review
+                        .suggestions
+                        .iter()
+                        .filter(|suggestion| suggestion.anchor.path == path)
+                        .map(|suggestion| (suggestion.anchor.side, suggestion.anchor.line))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
         self.main_pane.update(cx, |pane, cx| {
             pane.review_marks = marks;
             pane.review_thread_marks = threads;
+            pane.review_suggestion_marks = suggestions;
             cx.notify();
         });
     }
@@ -1014,6 +1175,8 @@ impl GitCometView {
                 }
             }
             (Some(FocusPanel::Diff), "c", false) => self.review_comment_at_cursor(window, cx),
+            (Some(FocusPanel::Diff), "a", false) => self.review_take_suggestion(true, cx),
+            (Some(FocusPanel::Diff), "x", false) => self.review_take_suggestion(false, cx),
             (Some(FocusPanel::Diff | FocusPanel::Sidebar), "space", false) => {
                 self.review_toggle_viewed(cx)
             }
@@ -1140,6 +1303,125 @@ pub(super) fn review_needed(
         || !body.trim().is_empty()
 }
 
+/// `owner/name` as the start of its draft files' names, `owner~name~`: one
+/// flat file per pull request.
+fn draft_file_prefix(repo: &str) -> String {
+    let name: String = repo
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '~'
+            }
+        })
+        .collect();
+    format!("{name}~")
+}
+
+/// Pending comment counts of the reviews saved on this computer for `repo`,
+/// by pull request number. Only files that read back with comments count.
+pub(super) fn pending_review_counts(repo: &str) -> rustc_hash::FxHashMap<u64, usize> {
+    gitcomet_state::session::review_drafts_dir()
+        .map(|dir| pending_review_counts_in(&dir, repo))
+        .unwrap_or_default()
+}
+
+fn pending_review_counts_in(
+    dir: &std::path::Path,
+    repo: &str,
+) -> rustc_hash::FxHashMap<u64, usize> {
+    let mut counts = rustc_hash::FxHashMap::default();
+    let prefix = draft_file_prefix(repo);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return counts;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(number) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .and_then(|number| number.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if let Some(draft) = ReviewDraft::peek(&entry.path(), repo, number)
+            && !draft.comments.is_empty()
+        {
+            counts.insert(number, draft.comments.len());
+        }
+    }
+    counts
+}
+
+/// What Codex is asked for when it suggests line comments in review mode.
+pub(super) const SUGGESTION_INSTRUCTIONS: &str = "Review this pull request's patch and suggest line comments. Reply with only a JSON array, no prose and no code fences. Each item is one comment: {\"path\": the file path as in the patch, without its a/ or b/ prefix, \"line\": a line number, \"side\": \"RIGHT\" for an added or unchanged line (its number in the new file) or \"LEFT\" for a removed line (its number in the old file), \"body\": the comment, specific and constructive}. Only comment on lines inside the patch's hunks. At most 15 comments, the important issues first; an empty array if nothing is worth saying.";
+
+/// Codex's suggested comments, read from its answer: the first JSON array in
+/// it that parses, item by item (a malformed item is skipped, not the lot),
+/// kept to this pull request's files and to at most 30. `None` when there's no
+/// array to read at all. The text stays plain and is never posted as is.
+pub(super) fn parse_review_suggestions(
+    answer: &str,
+    files: &[String],
+) -> Option<Vec<ReviewComment>> {
+    #[derive(serde::Deserialize)]
+    struct Suggested {
+        path: String,
+        line: u32,
+        #[serde(default)]
+        side: Option<String>,
+        body: String,
+    }
+    let items = answer.match_indices('[').find_map(|(start, _)| {
+        serde_json::Deserializer::from_str(&answer[start..])
+            .into_iter::<Vec<serde_json::Value>>()
+            .next()?
+            .ok()
+    })?;
+    // A path as the patch spells it (`b/src/x.rs`) is the PR's `src/x.rs`.
+    let known = |path: &str| -> Option<String> {
+        if files.iter().any(|file| file == path) {
+            return Some(path.to_string());
+        }
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .filter(|rest| files.iter().any(|file| file == rest))
+            .map(str::to_string)
+    };
+    Some(
+        items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value::<Suggested>(item).ok())
+            .filter(|item| item.line > 0 && !item.body.trim().is_empty())
+            .filter_map(|item| {
+                let path = known(&item.path)?;
+                let side = if item
+                    .side
+                    .as_deref()
+                    .is_some_and(|side| side.eq_ignore_ascii_case("LEFT"))
+                {
+                    ReviewSide::Left
+                } else {
+                    ReviewSide::Right
+                };
+                Some(ReviewComment {
+                    anchor: ReviewAnchor {
+                        path,
+                        side,
+                        line: item.line,
+                        start: None,
+                    },
+                    body: item.body.trim().chars().take(2_000).collect(),
+                    reply_to: None,
+                })
+            })
+            .take(30)
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,6 +1447,84 @@ mod tests {
                 "{kind:?} {body:?} {lines} {replies}"
             );
         }
+    }
+
+    #[test]
+    fn codex_suggestions_keep_to_the_pull_requests_files() {
+        let files = ["src/a.rs".to_string()];
+        let answer = r#"Here you go:
+[{"path": "src/a.rs", "line": 4, "side": "RIGHT", "body": "Check the edge."},
+ {"path": "src/a.rs", "line": 2, "side": "LEFT", "body": "Why remove this?"},
+ {"path": "elsewhere.rs", "line": 1, "body": "not in the PR"},
+ {"path": "src/a.rs", "line": 0, "body": "no line"},
+ {"path": "src/a.rs", "line": 5, "body": "   "}]"#;
+        let suggestions = parse_review_suggestions(answer, &files).expect("an array");
+        let got: Vec<_> = suggestions
+            .iter()
+            .map(|s| (s.anchor.side, s.anchor.line, s.body.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (ReviewSide::Right, 4, "Check the edge."),
+                (ReviewSide::Left, 2, "Why remove this?"),
+            ]
+        );
+        // A bad item is skipped, a prefixed path and a lowercase side are read,
+        // and a `[` in the prose before the array doesn't hide it.
+        let messy = r#"Notes [draft]: here
+[{"path": "b/src/a.rs", "line": 7, "side": "left", "body": "Old line."},
+ {"path": "src/a.rs", "line": "8", "body": "string line"}] done ]"#;
+        let messy = parse_review_suggestions(messy, &files).expect("an array");
+        assert_eq!(messy.len(), 1);
+        assert_eq!(
+            (
+                messy[0].anchor.path.as_str(),
+                messy[0].anchor.side,
+                messy[0].anchor.line
+            ),
+            ("src/a.rs", ReviewSide::Left, 7)
+        );
+        assert!(parse_review_suggestions("no json here", &files).is_none());
+        assert!(parse_review_suggestions("[not json]", &files).is_none());
+        assert_eq!(parse_review_suggestions("[]", &files), Some(Vec::new()));
+    }
+
+    #[test]
+    fn saved_reviews_are_counted_per_pull_request_of_this_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, repo: &str, number: u64, comments: usize| {
+            let draft = ReviewDraft {
+                repo: repo.into(),
+                number,
+                head_oid: "a".repeat(40),
+                comments: (0..comments)
+                    .map(|n| ReviewComment {
+                        anchor: ReviewAnchor {
+                            path: "a.rs".into(),
+                            side: ReviewSide::Right,
+                            line: n as u32 + 1,
+                            start: None,
+                        },
+                        body: "?".into(),
+                        reply_to: None,
+                    })
+                    .collect(),
+                viewed: Default::default(),
+            };
+            std::fs::write(dir.path().join(name), serde_json::to_vec(&draft).unwrap()).unwrap();
+        };
+        write("o~r~7.json", "o/r", 7, 2);
+        write("o~r~8.json", "o/r", 8, 0);
+        write("o~r~c~9.json", "o/r~c", 9, 1);
+        write("o~r~10.json", "someone/else", 10, 1);
+        std::fs::write(dir.path().join("o~r~11.json"), "not json").unwrap();
+        std::fs::write(dir.path().join("o~r~12.json.unreadable"), "{}").unwrap();
+        let counts = pending_review_counts_in(dir.path(), "o/r");
+        assert_eq!(counts.len(), 1, "{counts:?}");
+        assert_eq!(counts.get(&7), Some(&2));
+        // Counting never moves an unreadable file aside.
+        assert!(dir.path().join("o~r~11.json").exists());
     }
 
     #[test]

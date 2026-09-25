@@ -46,6 +46,9 @@ pub(super) struct RepoPullRequests {
     pub(super) submit_error: Option<String>,
     /// The pull request `gh pr checkout` is working on.
     checking_out: Option<u64>,
+    /// Pending comments of the reviews saved on this computer, by pull
+    /// request, as of the list's last load.
+    pub(super) drafts: FxHashMap<u64, usize>,
     list_seq: u64,
     detail_seq: u64,
     diff_seq: u64,
@@ -110,6 +113,45 @@ pub(super) fn remote_branch_head(repo: &RepoState, remote: &str, branch: &str) -
     match owner {
         Some(owner) => format!("{owner}:{branch}"),
         None => branch.to_string(),
+    }
+}
+
+/// Where a pull request sits in the list: waiting on your review first, then
+/// reviews you have pending, then the rest.
+pub(super) fn inbox_rank(pr: &PullRequestSummary, drafts: &FxHashMap<u64, usize>) -> u8 {
+    if pr.review_requested {
+        0
+    } else if drafts.contains_key(&pr.number) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Orders the list by `inbox_rank`, keeping GitHub's order within each part,
+/// so `j`/`k` walk it the way it reads.
+fn inbox_order(list: &mut [PullRequestSummary], drafts: &FxHashMap<u64, usize>) {
+    list.sort_by_key(|pr| inbox_rank(pr, drafts));
+}
+
+impl GitCometView {
+    /// A pending review's comment count as it is now, for the list's section
+    /// and badge; the list re-sorts so its sections still read in order.
+    pub(super) fn set_pending_count(&mut self, repo_id: RepoId, number: u64, count: usize) {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let changed = if count == 0 {
+            entry.drafts.remove(&number).is_some()
+        } else {
+            entry.drafts.insert(number, count) != Some(count)
+        };
+        if !changed {
+            return;
+        }
+        let drafts = entry.drafts.clone();
+        if let PrLoad::Ready(list) = &mut entry.list {
+            let list: &mut Vec<PullRequestSummary> = Arc::make_mut(list);
+            inbox_order(list, &drafts);
+        }
     }
 }
 
@@ -248,8 +290,13 @@ impl GitCometView {
         if entry.list.ready().is_none() {
             entry.list = PrLoad::Loading;
         }
-        let task =
-            cx.background_spawn(async move { github::list_open(&target.workdir, &target.slug) });
+        let task = cx.background_spawn(async move {
+            let drafts = super::review::pending_review_counts(&target.slug);
+            github::list_open(&target.workdir, &target.slug).map(|(mut list, requested_known)| {
+                inbox_order(&mut list, &drafts);
+                (list, drafts, requested_known)
+            })
+        });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
@@ -258,7 +305,20 @@ impl GitCometView {
                     return;
                 }
                 entry.list = match result {
-                    Ok(list) => PrLoad::Ready(Arc::new(list)),
+                    Ok((mut list, drafts, requested_known)) => {
+                        // gh couldn't say who is waiting this time: keep what
+                        // it said last, so rows don't jump sections.
+                        if !requested_known && let Some(previous) = entry.list.ready() {
+                            for pr in &mut list {
+                                pr.review_requested = previous
+                                    .iter()
+                                    .any(|old| old.number == pr.number && old.review_requested);
+                            }
+                            inbox_order(&mut list, &drafts);
+                        }
+                        entry.drafts = drafts;
+                        PrLoad::Ready(Arc::new(list))
+                    }
                     Err(err) => PrLoad::Failed(err),
                 };
                 this.notify_pull_request_panes(cx);
@@ -1024,5 +1084,31 @@ impl GitCometView {
         if let Some(repo_id) = self.active_repo_id() {
             self.pull_requests.repo_mut(repo_id).submit_error = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_list_leads_with_reviews_waiting_on_you_then_yours_in_progress() {
+        let pr = |number, review_requested| PullRequestSummary {
+            number,
+            title: String::new(),
+            author: String::new(),
+            head: String::new(),
+            base: String::new(),
+            is_draft: false,
+            review: None,
+            checks: Default::default(),
+            review_requested,
+        };
+        let mut list = vec![pr(1, false), pr(2, false), pr(3, true), pr(4, false)];
+        let drafts = FxHashMap::from_iter([(4, 2usize)]);
+        inbox_order(&mut list, &drafts);
+        // GitHub's order holds within each part.
+        let numbers: Vec<u64> = list.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, [3, 4, 1, 2]);
     }
 }

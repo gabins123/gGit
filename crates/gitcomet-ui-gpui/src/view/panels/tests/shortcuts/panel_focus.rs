@@ -265,6 +265,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
                     is_draft: false,
                     review: None,
                     checks: Default::default(),
+                    review_requested: false,
                 }],
                 Some(7),
             );
