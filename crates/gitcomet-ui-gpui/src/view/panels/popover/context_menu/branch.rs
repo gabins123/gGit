@@ -1,6 +1,28 @@
 use super::*;
 use gitcomet_core::domain::Upstream;
 
+/// What local Git actions (merge, rebase, branch from) run against: a local
+/// branch by name, a remote branch by its exact loaded tip. This is
+/// independent of the remote-tracking ref's destination, which a custom fetch
+/// refspec can rename.
+pub(in crate::view) fn branch_action_reference(
+    repo: Option<&RepoState>,
+    target: &BranchMenuTarget,
+) -> String {
+    match target {
+        BranchMenuTarget::Local { name } => name.clone(),
+        BranchMenuTarget::Remote { remote, branch } => repo
+            .and_then(|repo| repo.remote_branches.ready())
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .find(|candidate| candidate.remote == *remote && candidate.name == *branch)
+            })
+            .map(|candidate| candidate.target.as_ref().to_string())
+            .unwrap_or_else(|| target.display_name()),
+    }
+}
+
 pub(super) fn model(
     this: &PopoverHost,
     repo_id: RepoId,
@@ -73,16 +95,7 @@ pub(super) fn model(
                 .map(|candidate| candidate.target.clone())
         }),
     };
-    // Local Git actions operate on the exact loaded tip. This is independent
-    // of the remote-tracking ref's destination, which can be renamed by a
-    // custom fetch refspec.
-    let action_reference = match section {
-        BranchSection::Local => name.clone(),
-        BranchSection::Remote => branch_commit_id
-            .as_ref()
-            .map(|id| id.as_ref().to_string())
-            .unwrap_or_else(|| name.clone()),
-    };
+    let action_reference = branch_action_reference(repo, target);
 
     items.push(ContextMenuItem::Entry {
         label: "Checkout".into(),

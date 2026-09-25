@@ -6,7 +6,10 @@
 //! focus: text inputs, the terminal, menus, popovers, pickers, dialogs and the
 //! conflict resolver keep their keys.
 
+use super::branch_sidebar::BranchMenuTarget;
+use super::panels::{branch_action_reference, can_amend};
 use super::*;
+use gitcomet_core::domain::DiffArea;
 use gitcomet_state::model::SidebarMode;
 
 /// The panels plain keys address, left to right.
@@ -64,10 +67,32 @@ impl FocusPanel {
     /// The few keys the status bar suggests while this panel has focus.
     pub(super) fn status_hints(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Sidebar => &[("j/k", "branch"), ("enter", "history"), ("[ ]", "tab")],
-            Self::History => &[("j/k", "commit"), ("enter", "files")],
-            Self::Diff => &[("j/k", "change"), ("F1/F4", "file"), ("esc", "back")],
-            Self::Details => &[("j/k", "file"), ("enter", "diff")],
+            Self::Sidebar => &[
+                ("j/k", "branch"),
+                ("space", "checkout"),
+                ("n", "new"),
+                ("m", "menu"),
+            ],
+            Self::History => &[
+                ("j/k", "commit"),
+                ("enter", "files"),
+                ("C", "pick"),
+                ("t", "revert"),
+                ("m", "menu"),
+            ],
+            Self::Diff => &[
+                ("j/k", "change"),
+                ("space", "stage"),
+                ("F1/F4", "file"),
+                ("esc", "back"),
+            ],
+            Self::Details => &[
+                ("j/k", "file"),
+                ("space", "stage"),
+                ("a", "all"),
+                ("d", "discard"),
+                ("c", "commit"),
+            ],
         }
     }
 
@@ -77,28 +102,50 @@ impl FocusPanel {
             Self::Sidebar => &[
                 ("j / k", "Next / previous branch, revealed in History"),
                 ("enter", "Go to History"),
-                ("[ / ]", "Branches / Files tab"),
+                ("space", "Check out the branch"),
+                ("n", "New branch from it"),
+                ("D", "Delete the branch"),
+                ("M", "Merge it into the current branch"),
+                ("R", "Rebase the current branch onto it"),
+                ("m", "The branch's menu"),
+                ("[ / ]", "Branches / Files / Pull requests tab"),
             ],
             Self::History => &[
                 ("j / k", "Next / previous commit"),
                 ("enter", "Go to the commit's files in Details"),
+                ("C", "Cherry-pick the commit"),
+                ("t", "Revert it"),
+                ("g", "Reset to it (mixed; soft or hard in the menu)"),
+                ("T", "Tag it"),
+                ("m", "The commit's menu"),
             ],
             Self::Diff => &[
                 ("j / k", "Next / previous change"),
+                ("space", "Stage / unstage the file, then the next"),
                 ("F1 / F4", "Previous / next file"),
+                ("d", "Discard the file's changes"),
+                ("m", "The file's menu"),
                 ("esc", "Close the diff and go back"),
             ],
             Self::Details => &[
                 ("j / k", "Next / previous file, opening its diff"),
                 ("enter", "Go to the file's diff"),
+                ("space", "Stage / unstage the open file, then the next"),
+                ("a", "Stage everything, or unstage it all"),
+                ("d", "Discard the open file's changes"),
+                ("m", "The open file's menu"),
             ],
         }
     }
 }
 
 /// Status bar hints shown after the focused panel's own.
-pub(super) const PANEL_STATUS_HINTS: &[(&str, &str)] =
-    &[("1-4", "panels"), ("i", "codex"), ("?", "keys")];
+pub(super) const PANEL_STATUS_HINTS: &[(&str, &str)] = &[
+    ("1-4", "panels"),
+    ("p/P", "pull/push"),
+    ("i", "codex"),
+    ("?", "keys"),
+];
 
 /// Keys that work the same in every panel, as the `?` list shows them.
 const PANEL_KEYS_HELP: &[(&str, &str)] = &[
@@ -107,6 +154,11 @@ const PANEL_KEYS_HELP: &[(&str, &str)] = &[
         "Sidebar, History, Diff, Details; opens a collapsed one",
     ),
     ("h / l", "Previous / next panel"),
+    ("c", "Write the commit message"),
+    ("A", "Toggle amending the last commit"),
+    ("p / P", "Pull / push"),
+    ("f", "Fetch all remotes"),
+    ("s", "Stash the changes"),
     ("0", "Codex panel"),
     ("i", "Codex actions"),
     ("?", "This list"),
@@ -244,6 +296,7 @@ impl GitCometView {
             // The user moved on before a pending diff arrived.
             self.focus_diff_when_open = false;
         }
+        self.focus_commit_requested = None;
         match panel {
             FocusPanel::Sidebar => {
                 if self.sidebar_collapsed {
@@ -380,6 +433,9 @@ impl GitCometView {
 
     /// The hint bar's keys for `panel`, which differ on the Pull requests tab.
     pub(super) fn key_hints(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
+            return &[("[ ]", "tab")];
+        }
         if self.state.sidebar_mode == SidebarMode::PullRequests {
             match panel {
                 FocusPanel::Sidebar => {
@@ -407,6 +463,9 @@ impl GitCometView {
     }
 
     fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
+            return &[("[ / ]", "Branches / Files / Pull requests tab")];
+        }
         if self.state.sidebar_mode == SidebarMode::PullRequests {
             match panel {
                 FocusPanel::Sidebar => {
@@ -434,8 +493,22 @@ impl GitCometView {
         panel.help()
     }
 
-    /// Opens a pull request dialog that hands focus back to the panel it was
-    /// opened from when it closes.
+    /// Opens a dialog or menu from a key; dismissing it hands focus back to
+    /// the panel it was opened from.
+    fn open_popover_from_key(
+        &mut self,
+        kind: PopoverKind,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let request = PopoverRequest::from(kind);
+        let request = match window.focused(cx) {
+            Some(focus) => request.returning_focus_to(focus),
+            None => request,
+        };
+        self.open_popover_centered(request, window, cx);
+    }
+
     pub(super) fn open_pull_request_prompt(
         &mut self,
         kind: PopoverKind,
@@ -443,12 +516,357 @@ impl GitCometView {
         cx: &mut gpui::Context<Self>,
     ) {
         self.clear_pull_request_submit_error();
-        let request = PopoverRequest::from(kind);
-        let request = match window.focused(cx) {
-            Some(focus) => request.returning_focus_to(focus),
-            None => request,
+        self.open_popover_from_key(kind, window, cx);
+    }
+
+    /// Focus whose element went away (a dialog or menu that closed, a row that
+    /// vanished) goes back to the panel the keyboard was last in, so panel keys
+    /// keep working without a click. An explicit blur is left alone, and so is
+    /// focus that just moved: an element focused ahead of its first render (a
+    /// diff or file editor still loading) is on its way, not gone.
+    pub(super) fn restore_panel_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let focused = window.focused(cx);
+        if focused.is_none()
+            || focused != self.focus_prev_render
+            || !renders_full_chrome(self.view_mode)
+            || self.active_repo_id().is_none()
+            || self.command_palette_open
+            || self.reveal_commit_open
+            || self.is_overlay_open(cx)
+        {
+            return;
+        }
+        let panel = self
+            .last_focused_panel
+            .filter(|panel| self.panel_available(*panel))
+            .unwrap_or_else(|| self.default_panel());
+        self.focus_panel(panel, window, cx);
+    }
+
+    /// Puts the keyboard in the commit message. A commit selected in History
+    /// has Details showing it instead, so that selection is dropped first and
+    /// the box is focused once it is back on screen.
+    fn focus_commit_message(
+        &mut self,
+        repo_id: RepoId,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.details_collapsed {
+            self.set_details_collapsed(false, cx);
+        }
+        self.focus_diff_when_open = false;
+        if self
+            .active_repo()
+            .is_some_and(|repo| repo.history_state.selected_commit.is_some())
+        {
+            self.store.dispatch(Msg::ClearCommitSelection { repo_id });
+        }
+        self.focus_commit_requested = Some(std::time::Instant::now());
+        cx.notify();
+        window.refresh();
+    }
+
+    /// The commit message input, once Details shows the working tree again.
+    pub(super) fn commit_message_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        let showing_status = !self.details_collapsed
+            && self
+                .active_repo()
+                .is_some_and(|repo| repo.history_state.selected_commit.is_none());
+        showing_status.then(|| {
+            self.details_pane
+                .read(cx)
+                .commit_message_input
+                .read(cx)
+                .focus_handle()
+        })
+    }
+
+    fn stage_or_unstage_all(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let unstaged = self
+            .active_repo()
+            .and_then(|repo| repo.worktree_status_entries())
+            .is_some_and(|entries| !entries.is_empty());
+        let command = if unstaged { "stage-all" } else { "unstage-all" };
+        self.execute_command(command, Some(window), cx);
+    }
+
+    /// Whether the file menu would offer "Discard changes" for this file.
+    fn can_discard(&self, area: DiffArea, path: &std::path::Path) -> bool {
+        use gitcomet_core::domain::FileStatusKind::{Added, Conflicted};
+        let Some(repo) = self.active_repo() else {
+            return false;
         };
-        self.open_popover_centered(request, window, cx);
+        let unstaged = repo.status_entry_for_path(DiffArea::Unstaged, path);
+        let staged = repo.status_entry_for_path(DiffArea::Staged, path);
+        if [unstaged, staged]
+            .iter()
+            .flatten()
+            .any(|entry| entry.kind == Conflicted)
+        {
+            return false;
+        }
+        match area {
+            DiffArea::Unstaged => true,
+            DiffArea::Staged => {
+                unstaged.is_some() || staged.is_some_and(|entry| entry.kind == Added)
+            }
+        }
+    }
+
+    /// The working-tree file the open diff shows.
+    fn open_worktree_file(&self) -> Option<(DiffArea, std::path::PathBuf)> {
+        match self.active_repo()?.diff_state.diff_target.as_ref()? {
+            DiffTarget::WorkingTree { path, area } => Some((*area, path.clone())),
+            _ => None,
+        }
+    }
+
+    fn selected_branch_target(&self, repo_id: RepoId, cx: &App) -> Option<BranchMenuTarget> {
+        self.sidebar_pane
+            .read(cx)
+            .selected_branch()
+            .filter(|selected| selected.repo_id == repo_id)
+            .map(|selected| selected.target.clone())
+    }
+
+    /// `m`: the context menu of whatever the panel has selected.
+    fn open_selection_menu(
+        &mut self,
+        panel: FocusPanel,
+        repo_id: RepoId,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let kind = match panel {
+            FocusPanel::Sidebar if self.state.sidebar_mode == SidebarMode::Branches => self
+                .selected_branch_target(repo_id, cx)
+                .map(|target| PopoverKind::BranchMenu { repo_id, target }),
+            FocusPanel::Sidebar => None,
+            FocusPanel::History => self
+                .active_repo()
+                .and_then(|repo| repo.history_state.selected_commit.clone())
+                .map(|commit_id| PopoverKind::CommitMenu { repo_id, commit_id }),
+            FocusPanel::Details | FocusPanel::Diff => {
+                self.open_worktree_file()
+                    .map(|(area, path)| PopoverKind::StatusFileMenu {
+                        repo_id,
+                        area,
+                        path,
+                    })
+            }
+        };
+        if let Some(kind) = kind {
+            self.open_popover_from_key(kind, window, cx);
+        }
+    }
+
+    /// Branch keys, mirroring the branch menu's entries and their guards.
+    fn branch_action(
+        &mut self,
+        repo_id: RepoId,
+        key: &str,
+        armed: Option<(String, BranchMenuTarget)>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.selected_branch_target(repo_id, cx) else {
+            if key == "n" {
+                self.execute_command("create-branch", Some(window), cx);
+            }
+            return;
+        };
+        let repo = self.active_repo();
+        let reference = branch_action_reference(repo, &target);
+        let busy = repo.is_some_and(|repo| repo.history_rewrite_busy());
+        let is_current = match (&target, repo.map(|repo| &repo.head_branch)) {
+            (BranchMenuTarget::Local { name }, Some(Loadable::Ready(head))) => name == head,
+            _ => false,
+        };
+        // D and M act on a second press: one stray keystroke never deletes or
+        // merges.
+        let deletable = matches!(target, BranchMenuTarget::Local { .. }) && !is_current;
+        if (key == "D" && deletable) || (key == "M" && !is_current) {
+            let press = (key.to_string(), target.clone());
+            if armed.as_ref() != Some(&press) {
+                let what = if key == "D" { "delete" } else { "merge" };
+                self.push_toast(
+                    components::ToastKind::Warning,
+                    format!(
+                        "Press Shift+{key} again to {what} {}.",
+                        target.display_name()
+                    ),
+                    cx,
+                );
+                self.armed_branch_key = Some(press);
+                return;
+            }
+        }
+        let kind = match (key, &target) {
+            ("space", BranchMenuTarget::Local { name }) => {
+                if !is_current {
+                    self.store.dispatch(Msg::CheckoutBranch {
+                        repo_id,
+                        name: name.clone(),
+                    });
+                }
+                return;
+            }
+            ("space", BranchMenuTarget::Remote { .. }) => {
+                target.remote_parts().map(|(remote, branch)| {
+                    PopoverKind::CheckoutRemoteBranchPrompt {
+                        repo_id,
+                        remote: remote.to_string(),
+                        branch: branch.to_string(),
+                    }
+                })
+            }
+            ("n", _) => Some(PopoverKind::CreateBranchFromRefPrompt {
+                repo_id,
+                target: reference,
+                source_selectable: false,
+                name_prefix: String::new(),
+            }),
+            ("D", BranchMenuTarget::Local { name }) if !is_current => {
+                // Git refuses an unmerged branch; the force-delete dialog that
+                // follows then opens centered, as it does from the palette.
+                self.pending_force_delete_branch_centered = true;
+                self.store.dispatch(Msg::DeleteBranch {
+                    repo_id,
+                    name: name.clone(),
+                });
+                return;
+            }
+            ("M", _) if !is_current => {
+                self.store.dispatch(Msg::MergeRef { repo_id, reference });
+                return;
+            }
+            ("R", _) if !is_current && !busy => Some(PopoverKind::RebaseOntoConfirm {
+                repo_id,
+                onto: reference,
+            }),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            self.open_popover_from_key(kind, window, cx);
+        }
+    }
+
+    /// Commit keys, mirroring the commit menu's entries and their guards.
+    fn commit_action(
+        &mut self,
+        repo_id: RepoId,
+        key: &str,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo) = self.active_repo() else {
+            return;
+        };
+        let Some(commit_id) = repo.history_state.selected_commit.clone() else {
+            return;
+        };
+        let busy = repo.history_rewrite_busy();
+        let is_head = repo.head_commit_id().is_some_and(|head| head == commit_id);
+        let sha = commit_id.as_ref().to_string();
+        let kind = match key {
+            "C" if !busy && !is_head => PopoverKind::CherryPickCommitConfirm { repo_id, commit_id },
+            "t" if !busy => PopoverKind::RevertCommitConfirm { repo_id, commit_id },
+            "g" => PopoverKind::ResetPrompt {
+                repo_id,
+                target: sha,
+                mode: ResetMode::Mixed,
+            },
+            "T" => PopoverKind::CreateTagPrompt {
+                repo_id,
+                target: sha,
+            },
+            _ => return,
+        };
+        self.open_popover_from_key(kind, window, cx);
+    }
+
+    /// lazygit-style action keys. `None` leaves the key to panel navigation
+    /// and, past that, to the diff's own keys, which is where `space` stages
+    /// the open file from Details as well as from the diff.
+    fn handle_action_key(
+        &mut self,
+        current: Option<FocusPanel>,
+        key: &str,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<bool> {
+        // Any other key disarms a pending Shift+D / Shift+M.
+        let armed = self.armed_branch_key.take();
+        let repo_id = self.active_repo_id()?;
+        // The conflict resolver's a–d picks (shifted or not) work from Details
+        // too.
+        if matches!(key, "a" | "b" | "c" | "d")
+            && self.main_pane.read(cx).is_conflict_resolver_active()
+        {
+            return None;
+        }
+        let key = if shift {
+            key.to_ascii_uppercase()
+        } else {
+            key.to_string()
+        };
+        // Details shows a pull request instead of the working tree...
+        let status_shown = !self.pull_request_details_active();
+        // ...or the commit selected in History.
+        let worktree_shown = status_shown
+            && self
+                .active_repo()
+                .is_some_and(|repo| repo.history_state.selected_commit.is_none());
+        let branches = self.state.sidebar_mode == SidebarMode::Branches;
+        match (current, key.as_str()) {
+            (_, "p") => self.execute_command("pull", Some(window), cx),
+            (_, "P") => self.execute_command("push", Some(window), cx),
+            (_, "f") => self.execute_command("fetch-all", Some(window), cx),
+            (_, "s") => self.open_popover_from_key(PopoverKind::StashPrompt, window, cx),
+            (_, "c") if status_shown => self.focus_commit_message(repo_id, window, cx),
+            (_, "A") if status_shown => {
+                // Like the menu: turning amend off is always allowed.
+                let enabled = self.details_pane.read(cx).commit_amend_enabled;
+                if enabled || can_amend(self.active_repo()) {
+                    self.set_commit_amend_enabled(!enabled, cx);
+                }
+                self.focus_commit_message(repo_id, window, cx);
+            }
+            (Some(panel), "m") => self.open_selection_menu(panel, repo_id, window, cx),
+            (Some(FocusPanel::Details), "a") if worktree_shown => {
+                self.stage_or_unstage_all(window, cx)
+            }
+            (Some(FocusPanel::Details | FocusPanel::Diff), "d") if worktree_shown => {
+                if let Some((area, path)) = self
+                    .open_worktree_file()
+                    .filter(|(area, path)| self.can_discard(*area, path))
+                {
+                    self.open_popover_from_key(
+                        PopoverKind::DiscardChangesConfirm {
+                            repo_id,
+                            area,
+                            path: Some(path),
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }
+            (Some(FocusPanel::Sidebar), "space" | "n" | "D" | "M" | "R") if branches => {
+                self.branch_action(repo_id, &key, armed, window, cx)
+            }
+            (Some(FocusPanel::History), "C" | "t" | "g" | "T") => {
+                self.commit_action(repo_id, &key, window, cx)
+            }
+            _ => return None,
+        }
+        Some(true)
     }
 
     /// The Pull requests tab's keys. `None` leaves the key to the general
@@ -611,6 +1029,9 @@ impl GitCometView {
             .focused_panel(window, cx)
             .filter(|panel| *panel == FocusPanel::Diff || self.panel_available(*panel));
         if let Some(handled) = self.handle_pull_request_key(current, key, mods.shift, window, cx) {
+            return handled;
+        }
+        if let Some(handled) = self.handle_action_key(current, key, mods.shift, window, cx) {
             return handled;
         }
         if mods.shift {

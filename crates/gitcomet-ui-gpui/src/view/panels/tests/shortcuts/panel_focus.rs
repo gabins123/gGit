@@ -282,3 +282,210 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
     press(cx, "escape");
     assert_eq!(focused(cx, &view), Some(Sidebar));
 }
+
+fn selected_commit(cx: &mut gpui::VisualTestContext, view: &View) -> Option<CommitId> {
+    sync_store_snapshot(cx, view);
+    cx.update(|_window, app| {
+        view.read(app)
+            .active_repo()
+            .and_then(|repo| repo.history_state.selected_commit.clone())
+    })
+}
+
+/// Opens `kind` with `keys`, closes it with escape, and checks focus is back
+/// on `panel`.
+fn assert_key_opens(
+    cx: &mut gpui::VisualTestContext,
+    view: &View,
+    keys: &str,
+    kind: PopoverKind,
+    panel: FocusPanel,
+) {
+    press(cx, keys);
+    assert!(popover_open(cx, view, &kind), "{keys} opens {kind:?}");
+    press(cx, "escape");
+    assert!(
+        !popover_is_open(cx, view),
+        "escape closes what {keys} opened"
+    );
+    assert_eq!(focused(cx, view), Some(panel), "focus after {keys}");
+}
+
+#[gpui::test]
+fn commit_keys_open_their_dialogs_and_hand_focus_back(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    press(cx, "2 j");
+    wait_until(cx, "a commit to be selected", |cx| {
+        selected_commit(cx, &view).is_some()
+    });
+    let commit_id = selected_commit(cx, &view).expect("selected");
+    let sha = commit_id.as_ref().to_string();
+    for (keys, kind) in [
+        (
+            "t",
+            PopoverKind::RevertCommitConfirm {
+                repo_id: REPO,
+                commit_id: commit_id.clone(),
+            },
+        ),
+        (
+            "g",
+            PopoverKind::ResetPrompt {
+                repo_id: REPO,
+                target: sha.clone(),
+                mode: gitcomet_core::services::ResetMode::Mixed,
+            },
+        ),
+        (
+            "shift-t",
+            PopoverKind::CreateTagPrompt {
+                repo_id: REPO,
+                target: sha.clone(),
+            },
+        ),
+        (
+            "m",
+            PopoverKind::CommitMenu {
+                repo_id: REPO,
+                commit_id: commit_id.clone(),
+            },
+        ),
+    ] {
+        assert_key_opens(cx, &view, keys, kind, History);
+    }
+    // The only commit is HEAD, which can't be cherry-picked onto itself.
+    press(cx, "shift-c");
+    assert!(!popover_is_open(cx, &view));
+    assert_eq!(focused(cx, &view), Some(History));
+}
+
+/// Focuses the Sidebar on `feature`, which (unlike the checked-out `main`)
+/// can be rebased onto, merged or deleted.
+fn select_feature_branch(
+    cx: &mut gpui::VisualTestContext,
+    view: &View,
+) -> crate::view::branch_sidebar::BranchMenuTarget {
+    press(cx, "1 j");
+    let feature = crate::view::branch_sidebar::BranchMenuTarget::Local {
+        name: "feature".into(),
+    };
+    if selected_branch(cx, view).as_ref() != Some(&feature) {
+        press(cx, "j");
+    }
+    assert_eq!(selected_branch(cx, view), Some(feature.clone()));
+    feature
+}
+
+#[gpui::test]
+fn branch_keys_open_their_dialogs_and_hand_focus_back(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let feature = select_feature_branch(cx, &view);
+    for (keys, kind) in [
+        (
+            "n",
+            PopoverKind::CreateBranchFromRefPrompt {
+                repo_id: REPO,
+                target: "feature".into(),
+                source_selectable: false,
+                name_prefix: String::new(),
+            },
+        ),
+        (
+            "shift-r",
+            PopoverKind::RebaseOntoConfirm {
+                repo_id: REPO,
+                onto: "feature".into(),
+            },
+        ),
+        (
+            "m",
+            PopoverKind::BranchMenu {
+                repo_id: REPO,
+                target: feature.clone(),
+            },
+        ),
+    ] {
+        assert_key_opens(cx, &view, keys, kind, Sidebar);
+    }
+}
+
+#[gpui::test]
+fn details_keys_act_on_the_open_file_and_c_goes_to_the_commit_message(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    press(cx, "4 j");
+    wait_until(cx, "the first file to open", |cx| {
+        diff_path(cx, &view).as_deref() == Some(Path::new("a.rs"))
+    });
+    for (keys, kind) in [
+        (
+            "d",
+            PopoverKind::DiscardChangesConfirm {
+                repo_id: REPO,
+                area: DiffArea::Unstaged,
+                path: Some("a.rs".into()),
+            },
+        ),
+        (
+            "m",
+            PopoverKind::StatusFileMenu {
+                repo_id: REPO,
+                area: DiffArea::Unstaged,
+                path: "a.rs".into(),
+            },
+        ),
+        ("s", PopoverKind::StashPrompt),
+    ] {
+        assert_key_opens(cx, &view, keys, kind, Details);
+    }
+
+    press(cx, "c");
+    let input = cx.update(|_window, app| {
+        view.read(app)
+            .details_pane
+            .read(app)
+            .commit_message_input
+            .clone()
+    });
+    assert!(cx.update(|window, app| input.read(app).focus_handle().is_focused(window)));
+    // Typing now goes to the message, not to panel keys.
+    press(cx, "j k");
+    assert_eq!(
+        cx.update(|_window, app| input.read(app).text().to_string()),
+        "jk"
+    );
+}
+
+#[gpui::test]
+fn deleting_a_branch_takes_a_second_press(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let feature = select_feature_branch(cx, &view);
+    let armed = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).armed_branch_key.clone())
+    };
+    press(cx, "shift-d");
+    assert_eq!(armed(cx), Some(("D".to_string(), feature)));
+    // Any other key stands it down.
+    press(cx, "k");
+    assert_eq!(armed(cx), None);
+}
+
+#[gpui::test]
+fn enter_from_details_opens_the_diff_and_escape_comes_back(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    // No diff is open yet: focus moves to it before it first renders.
+    press(cx, "4 enter");
+    wait_until(cx, "the diff to open with focus", |cx| {
+        diff_path(cx, &view).is_some() && focused(cx, &view) == Some(Diff)
+    });
+    press(cx, "escape");
+    wait_until(cx, "focus back on Details", |cx| {
+        diff_path(cx, &view).is_none() && focused(cx, &view) == Some(Details)
+    });
+}

@@ -1094,6 +1094,18 @@ pub struct GitCometView {
     pub(super) codex_menu_open: bool,
     /// The panel `esc` returns to from the Codex panel.
     pub(super) codex_return_panel: super::panel_focus::FocusPanel,
+    /// The panel that last held focus, where focus returns when the element
+    /// holding it goes away.
+    pub(super) last_focused_panel: Option<super::panel_focus::FocusPanel>,
+    /// When `c` asked for the commit message, to focus it as soon as Details
+    /// shows it.
+    pub(super) focus_commit_requested: Option<std::time::Instant>,
+    /// Focus as the last two renders saw it; see `restore_panel_focus`.
+    pub(super) focus_this_render: Option<FocusHandle>,
+    pub(super) focus_prev_render: Option<FocusHandle>,
+    /// A first Shift+D / Shift+M on this branch, waiting for the second.
+    pub(super) armed_branch_key: Option<(String, super::branch_sidebar::BranchMenuTarget)>,
+    pub(super) _focus_lost_subscription: gpui::Subscription,
     pub(super) sidebar_width_design: f32,
     pub(super) details_width_design: f32,
     pub(super) sidebar_width: Pixels,

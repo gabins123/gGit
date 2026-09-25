@@ -57,6 +57,35 @@ These keys only work while a panel itself has focus (or nothing does). They are 
 | Previous / next sidebar tab | `[` / `]` | Branches, Files and Pull requests. |
 | List the focused panel's keys | `?` | Modal; `Escape` or `?` closes it. The status bar also shows the focused panel's main keys. |
 
+When a dialog or menu opened from these keys closes, focus returns to the panel it was opened from. Focus whose element disappears (a dialog confirmed, a row removed) likewise returns to the last focused panel.
+
+### Git actions
+
+Single keys for everyday Git work, lazygit-style. Each one runs the same action (and the same confirmation dialog) as the matching context-menu entry or button. `m` opens the selection's full context menu, driven with the arrow keys and `Enter` (the commit menu's entries also have letter keys), so every row action is reachable without the mouse.
+
+| Action | Key | Where | Notes |
+| --- | --- | --- | --- |
+| Write the commit message | `c` | Any panel | Opens Details and focuses the message box. A commit selected in History is deselected first so the box shows. |
+| Toggle amending the last commit | `Shift+A` | Any panel | Then focuses the message box. Unavailable during a merge or rebase, or before the first commit. |
+| Pull / push | `p` / `Shift+P` | Any panel | The main Pull and Push buttons: the default pull mode, and a set-upstream dialog for a branch without one. |
+| Fetch all remotes | `f` | Any panel | |
+| Stash the changes | `s` | Any panel | Opens the stash dialog. Apply, pop and drop are in the command palette. |
+| Stage / unstage the open file, then the next | `Space` | Details, Diff | The diff's existing `Space`, reachable from Details too. |
+| Stage everything, or unstage it all | `a` | Details | Stages all changes; with nothing left to stage, unstages everything. |
+| Discard the open file's changes | `d` | Details, Diff | Always confirms. Not for conflicted files. |
+| The selection's context menu | `m` | Any panel | Sidebar: the branch. History: the commit. Details and Diff: the open file. |
+| Check out the branch | `Space` | Sidebar | A remote branch asks for the local branch name. |
+| New branch from the selected one | `n` | Sidebar | With no branch selected, from the current one. |
+| Delete the branch | `Shift+D` twice | Sidebar | The first press asks for the second. Local branches other than the checked-out one. An unmerged branch then asks before force-deleting. |
+| Merge it into the current branch | `Shift+M` twice | Sidebar | The first press asks for the second. |
+| Rebase the current branch onto it | `Shift+R` | Sidebar | Confirms first. |
+| Cherry-pick the commit | `Shift+C` | History | Confirms first. Not the HEAD commit. |
+| Revert the commit | `t` | History | Confirms first. |
+| Reset to the commit | `g` | History | A mixed reset, after confirming. Soft and hard resets are in the commit's menu (`m`). |
+| Tag the commit | `Shift+T` | History | |
+
+On the Pull requests tab, its own keys (`n`, `r`, `o`, `Shift+R`) take precedence. While the conflict resolver is open, `a`–`d` (with or without `Shift`) stay its picks.
+
 ### Pull requests tab
 
 GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`), which owns sign-in; GitComet never sees a token. The tab lists the open pull requests of the repository's github.com remote: `upstream` first (a fork's parent, where gh sends pull requests too), then `origin`. A branch pushed to a fork opens its pull request as `owner:branch`.

@@ -1689,8 +1689,11 @@ impl PopoverHost {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        let focus = self
+            .focus_return
+            .take()
+            .unwrap_or_else(|| self.main_pane.read(cx).diff_panel_focus_handle.clone());
         self.close_popover(cx);
-        let focus = self.main_pane.read(cx).diff_panel_focus_handle.clone();
         window.focus(&focus, cx);
         cx.notify();
     }

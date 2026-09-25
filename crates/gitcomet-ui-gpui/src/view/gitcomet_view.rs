@@ -1325,6 +1325,9 @@ impl GitCometView {
             )
         });
 
+        let focus_lost_subscription = cx.on_focus_lost(window, |this, window, cx| {
+            this.restore_panel_focus(window, cx)
+        });
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
             let now = Instant::now();
             if !window.is_window_active() {
@@ -1614,6 +1617,12 @@ impl GitCometView {
             codex: None,
             codex_menu_open: false,
             codex_return_panel: super::panel_focus::FocusPanel::History,
+            last_focused_panel: None,
+            focus_commit_requested: None,
+            focus_this_render: None,
+            focus_prev_render: None,
+            armed_branch_key: None,
+            _focus_lost_subscription: focus_lost_subscription,
             sidebar_width_design: initial_sidebar_width_design,
             details_width_design: initial_details_width_design,
             sidebar_width: initial_sidebar_width,

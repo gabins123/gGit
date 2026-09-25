@@ -1052,6 +1052,21 @@ impl GitCometView {
                 });
             }
             self.diff_open_last_render = diff_open;
+            self.focus_prev_render =
+                std::mem::replace(&mut self.focus_this_render, window.focused(cx));
+            if let Some(panel) = focused_panel.filter(|panel| self.panel_available(*panel)) {
+                self.last_focused_panel = Some(panel);
+            }
+            if let Some(requested) = self.focus_commit_requested {
+                // ponytail: a fixed grace period for the deselect snapshot to
+                // land; a request that outlives it is dropped, never replayed.
+                if requested.elapsed() > std::time::Duration::from_secs(2) {
+                    self.focus_commit_requested = None;
+                } else if let Some(handle) = self.commit_message_focus_handle(cx) {
+                    self.focus_commit_requested = None;
+                    window.defer(cx, move |window, cx| window.focus(&handle, cx));
+                }
+            }
             if self.focus_diff_when_open && diff_open {
                 self.focus_diff_when_open = false;
                 let view = cx.entity();
