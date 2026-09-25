@@ -275,6 +275,34 @@ impl MainPaneView {
             return false;
         }
 
+        // Review mode: the root view's panel keys own the review keys and call
+        // back into the cursor methods; Esc only shrinks the range, never
+        // closing the diff. F-keys and chords keep their normal meaning.
+        if self.review_active
+            && !mods.control
+            && !mods.alt
+            && !mods.platform
+            && !mods.function
+            && !self
+                .diff_raw_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+            && !self
+                .diff_search_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+        {
+            if key == "escape" {
+                self.review_collapse_selection(cx);
+                return true;
+            }
+            if key.chars().count() == 1 || matches!(key, "space" | "up" | "down" | "enter") {
+                return false;
+            }
+        }
+
         // kdiff3 manual diff help: Escape abandons pending alignment marks
         // before reaching the resolver's other escape behaviors, so a
         // mis-marked line does not cost the user their selection or view.

@@ -407,6 +407,8 @@ impl MainPaneView {
             diff_selection_anchor: None,
             diff_selection_range: None,
             diff_focused_change_block: None,
+            review_active: false,
+            review_marks: Default::default(),
             diff_text_selecting: false,
             diff_text_selection_owner: Default::default(),
             diff_text_anchor: None,

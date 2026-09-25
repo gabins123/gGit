@@ -167,7 +167,7 @@ impl PullRequestsState {
 /// The repository gh talks to for the active tab.
 #[derive(Clone)]
 pub(super) struct GitHubTarget {
-    repo_id: RepoId,
+    pub(super) repo_id: RepoId,
     workdir: std::path::PathBuf,
     remote: String,
     pub(super) slug: String,
@@ -179,7 +179,7 @@ impl GitCometView {
         self.github_target_for(self.active_repo_id()?)
     }
 
-    fn github_target_for(&self, repo_id: RepoId) -> Option<GitHubTarget> {
+    pub(super) fn github_target_for(&self, repo_id: RepoId) -> Option<GitHubTarget> {
         let repo = self.state.repos.iter().find(|repo| repo.id == repo_id)?;
         let Loadable::Ready(remotes) = &repo.remotes else {
             return None;
@@ -208,7 +208,7 @@ impl GitCometView {
     /// The sidebar and details panes are cached views, so a change to pull
     /// request state has to reach them explicitly; so does an open dialog
     /// that shows it.
-    fn notify_pull_request_panes(&mut self, cx: &mut gpui::Context<Self>) {
+    pub(super) fn notify_pull_request_panes(&mut self, cx: &mut gpui::Context<Self>) {
         self.sidebar_pane.update(cx, |_, cx| cx.notify());
         self.details_pane.update(cx, |_, cx| cx.notify());
         // Deferred: this also runs inside the host's own submit handler.
@@ -597,8 +597,30 @@ impl GitCometView {
         entry.submitting = true;
         entry.submit_error = None;
         let slug = target.slug.clone();
+        // A review in progress goes up with its line comments, pinned to the
+        // commit they were written against.
+        let pending = self
+            .review_of(repo_id, number)
+            .map(|review| (review.draft.head_oid.clone(), review.draft.comments.clone()));
+        let in_review = pending.is_some();
+        let submitted: Vec<crate::github::ReviewComment> = pending
+            .as_ref()
+            .map(|(_, comments)| comments.clone())
+            .unwrap_or_default();
+        let comment_count = submitted.len();
         let task = cx.background_spawn(async move {
-            github::review(&target.workdir, &target.slug, number, kind, &body)
+            match pending {
+                Some((head_oid, comments)) if !comments.is_empty() => github::create_review(
+                    &target.workdir,
+                    &target.slug,
+                    number,
+                    &head_oid,
+                    kind,
+                    &body,
+                    &comments,
+                ),
+                _ => github::review(&target.workdir, &target.slug, number, kind, &body),
+            }
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
@@ -613,9 +635,17 @@ impl GitCometView {
                             ReviewKind::Approve => "Approved",
                             ReviewKind::RequestChanges => "Requested changes on",
                         };
+                        let with = match comment_count {
+                            0 => String::new(),
+                            1 => " · 1 comment".to_string(),
+                            n => format!(" · {n} comments"),
+                        };
+                        if in_review {
+                            this.finish_review(repo_id, number, &submitted, cx);
+                        }
                         this.push_toast_with_link(
                             components::ToastKind::Success,
-                            format!("{verb} #{number}"),
+                            format!("{verb} #{number}{with}"),
                             format!("https://github.com/{slug}/pull/{number}"),
                             "View on GitHub".to_string(),
                             cx,
@@ -887,6 +917,20 @@ impl GitCometView {
         let entry = self.pull_requests.repo_mut(repo_id);
         entry.list = PrLoad::Ready(Arc::new(list));
         entry.selected = selected;
+    }
+
+    /// The selected pull request's details, and its commits as already local
+    /// at `merge_base`, so tests never run gh or git.
+    #[cfg(test)]
+    pub(super) fn seed_pull_request_detail_for_test(
+        &mut self,
+        repo_id: RepoId,
+        detail: PullRequestDetail,
+        merge_base: String,
+    ) {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.detail = PrLoad::Ready(Arc::new(detail));
+        entry.diff_base = PrLoad::Ready(merge_base);
     }
 
     /// Clears a stale gh refusal when a review or create dialog opens.

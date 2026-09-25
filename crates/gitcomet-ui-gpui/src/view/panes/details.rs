@@ -2429,6 +2429,146 @@ impl DetailsPaneView {
 }
 
 impl DetailsPaneView {
+    /// Review mode's Your review panel: the pending comments, and what
+    /// submitting will do.
+    fn review_panel_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let secondary = theme.colors.foreground.secondary;
+        let warning = theme.colors.status.warning.foreground;
+        let Some(root) = self.root_view.upgrade() else {
+            return div().into_any_element();
+        };
+        let (comments, selected, head_moved) = {
+            let root = root.read(cx);
+            let Some(review) = root.active_review() else {
+                return div().into_any_element();
+            };
+            (
+                review.draft.comments.clone(),
+                review.selected_comment,
+                review.head_moved,
+            )
+        };
+        let count = comments.len();
+        let rows = comments.into_iter().enumerate().map(|(ix, comment)| {
+            let file = comment
+                .anchor
+                .path
+                .rsplit_once('/')
+                .map_or(comment.anchor.path.as_str(), |(_, name)| name)
+                .to_string();
+            let first_line = comment.body.lines().next().unwrap_or_default().to_string();
+            div()
+                .id(SharedString::from(format!("review_comment_{ix}")))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .mx_1()
+                .px_2()
+                .py_1()
+                .rounded(px(theme.radii.control))
+                .control_interaction(
+                    controls::InteractionStyle::new(theme),
+                    controls::InteractionState::default().selected(
+                        selected == Some(ix),
+                        theme.colors.interaction.selected_background,
+                    ),
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        let root = this.root_view.clone();
+                        // The root repaints this pane; it can't while we're mid-update.
+                        window.defer(cx, move |window, cx| {
+                            let _ = root
+                                .update(cx, |root, cx| root.review_jump_to_comment(ix, window, cx));
+                        });
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_size(theme.ui_text(11.5))
+                        .text_color(secondary)
+                        .child(div().truncate().child(file))
+                        .child(div().flex_none().child(comment.anchor.lines_label())),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(theme.ui_text(12.5))
+                        .child(first_line),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Your review"))
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(11.5))
+                            .text_color(warning)
+                            .child(format!("{count} pending")),
+                    ),
+            )
+            .when(head_moved, |panel| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(warning)
+                        .child("The pull request has new commits since your pending comments were written. Check their lines before submitting."),
+                )
+            })
+            .child(
+                div()
+                    .id("review_comment_rows")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .when(count == 0, |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(theme.ui_text(12.5))
+                                .text_color(secondary)
+                                .child("No comments yet. In the diff, c comments on the line under the cursor; shift+j/k selects more lines."),
+                        )
+                    })
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(secondary)
+                    .child("Saved on this computer. Nothing is on GitHub until you submit; the comments go up together as one review.")
+                    .child("enter go to line · e edit · d d delete · S submit"),
+            )
+            .into_any_element()
+    }
+
     /// `J`/`K`: scrolls the pull request view most of a page.
     pub(in crate::view) fn scroll_pull_request_details(
         &mut self,
@@ -2705,11 +2845,20 @@ impl DetailsPaneView {
 
 impl Render for DetailsPaneView {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let pull_request = self
+        let (reviewing, pull_request) = self
             .root_view
             .upgrade()
-            .is_some_and(|root| root.read(cx).pull_request_details_active());
-        let content = if pull_request {
+            .map(|root| {
+                let root = root.read(cx);
+                (
+                    root.active_review().is_some(),
+                    root.pull_request_details_active(),
+                )
+            })
+            .unwrap_or_default();
+        let content = if reviewing {
+            self.review_panel_view(cx)
+        } else if pull_request {
             self.pull_request_details_view(cx)
         } else {
             self.commit_details_view(cx)

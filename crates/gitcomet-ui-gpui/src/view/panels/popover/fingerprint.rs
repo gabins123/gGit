@@ -168,6 +168,7 @@ fn repo_for_popover<'a>(state: &'a AppState, popover: &PopoverKind) -> Option<&'
         PopoverKind::CommitPrompt { repo_id }
         | PopoverKind::PullRequestReview { repo_id, .. }
         | PopoverKind::MergePullRequest { repo_id, .. }
+        | PopoverKind::ReviewComment { repo_id, .. }
         | PopoverKind::CreatePullRequest { repo_id, .. }
         | PopoverKind::StashPickerPrompt { repo_id, .. }
         | PopoverKind::UpstreamPicker { repo_id, .. }
@@ -485,6 +486,7 @@ fn hash_repo_for_popover<H: Hasher>(repo: &RepoState, popover: &PopoverKind, has
         | PopoverKind::CommitPrompt { .. }
         // Its gh state lives in the root view, which notifies the host itself.
         | PopoverKind::PullRequestReview { .. }
+        | PopoverKind::ReviewComment { .. }
         | PopoverKind::MergePullRequest { .. } => {}
     }
 }
@@ -954,6 +956,18 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
             121u8.hash(hasher);
             repo_id.hash(hasher);
             branch.hash(hasher);
+        }
+        PopoverKind::ReviewComment {
+            repo_id,
+            number,
+            anchor,
+            edit,
+        } => {
+            123u8.hash(hasher);
+            repo_id.hash(hasher);
+            number.hash(hasher);
+            anchor.hash(hasher);
+            edit.hash(hasher);
         }
         PopoverKind::MergePullRequest {
             repo_id,

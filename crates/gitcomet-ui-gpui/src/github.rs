@@ -444,6 +444,108 @@ impl ReviewKind {
             Self::RequestChanges => "--request-changes",
         }
     }
+
+    /// The review's `event`, as the REST API names it.
+    fn event(self) -> &'static str {
+        match self {
+            Self::Comment => "COMMENT",
+            Self::Approve => "APPROVE",
+            Self::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+}
+
+/// Which side of the diff a review comment sits on, as GitHub names it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, Deserialize)]
+pub(crate) enum ReviewSide {
+    /// The base: a removed line, by its old number.
+    #[serde(rename = "LEFT")]
+    Left,
+    /// The head: an added or unchanged line, by its new number.
+    #[serde(rename = "RIGHT")]
+    Right,
+}
+
+/// The line, or lines, a review comment is on. `start` is set for a range,
+/// which ends at `line`.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, Deserialize)]
+pub(crate) struct ReviewAnchor {
+    pub(crate) path: String,
+    pub(crate) side: ReviewSide,
+    pub(crate) line: u32,
+    #[serde(default)]
+    pub(crate) start: Option<(ReviewSide, u32)>,
+}
+
+impl ReviewAnchor {
+    /// "line 12" or "lines 10–12", for the user.
+    pub(crate) fn lines_label(&self) -> String {
+        match self.start {
+            Some((side, start)) if (side, start) != (self.side, self.line) => {
+                format!("lines {start}–{}", self.line)
+            }
+            _ => format!("line {}", self.line),
+        }
+    }
+}
+
+/// One pending line comment of a review.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, Deserialize)]
+pub(crate) struct ReviewComment {
+    pub(crate) anchor: ReviewAnchor,
+    pub(crate) body: String,
+}
+
+/// A whole review for GitHub's create-review call: verdict, summary and line
+/// comments, pinned to the commit that was reviewed.
+fn review_payload(
+    commit_id: &str,
+    kind: ReviewKind,
+    body: &str,
+    comments: &[ReviewComment],
+) -> serde_json::Value {
+    let comments: Vec<serde_json::Value> = comments
+        .iter()
+        .map(|comment| {
+            let mut value = serde_json::json!({
+                "path": comment.anchor.path,
+                "side": comment.anchor.side,
+                "line": comment.anchor.line,
+                "body": comment.body,
+            });
+            // An old and a new line can share a number: a range is about sides too.
+            if let Some((side, line)) = comment
+                .anchor
+                .start
+                .filter(|start| *start != (comment.anchor.side, comment.anchor.line))
+            {
+                value["start_side"] = serde_json::json!(side);
+                value["start_line"] = serde_json::json!(line);
+            }
+            value
+        })
+        .collect();
+    let mut payload = serde_json::json!({
+        "commit_id": commit_id,
+        "event": kind.event(),
+        "comments": comments,
+    });
+    if !body.trim().is_empty() {
+        payload["body"] = serde_json::json!(body);
+    }
+    payload
+}
+
+/// `owner/name` as GitHub allows them: nothing that could turn the API path
+/// into something else.
+fn is_repo_slug(repo: &str) -> bool {
+    let valid = |part: &str| {
+        !matches!(part, "" | "." | "..")
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    matches!(repo.split_once('/'), Some((owner, name)) if valid(owner) && valid(name))
 }
 
 /// How a pull request lands on its base.
@@ -682,6 +784,85 @@ pub(crate) fn merge(
         )));
     }
     run(merge_command(workdir, repo, number, request), None).map(|_| ())
+}
+
+/// Posts a review and all its line comments in one call, pinned to
+/// `commit_id` (the head that was reviewed). Nothing here runs without the
+/// submit dialog's explicit confirm.
+pub(crate) fn create_review(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+    commit_id: &str,
+    kind: ReviewKind,
+    body: &str,
+    comments: &[ReviewComment],
+) -> Result<(), PrError> {
+    if !is_object_id(commit_id) {
+        return Err(PrError::Failed(format!(
+            "#{number}'s reviewed commit isn't known"
+        )));
+    }
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
+    let payload = review_payload(commit_id, kind, body, comments).to_string();
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "--hostname=github.com",
+        &format!("repos/{repo}/pulls/{number}/reviews"),
+        "--method=POST",
+        "--input=-",
+    ]);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => PrError::GhMissing,
+        _ => PrError::Failed(err.to_string()),
+    })?;
+    if let Some(mut pipe) = child.stdin.take() {
+        // A write error surfaces as the child's own failure below.
+        let _ = pipe.write_all(payload.as_bytes());
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| PrError::Failed(err.to_string()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // gh prints the API's explanation (which line GitHub refused, and why)
+    // as JSON on stdout; stderr only has the status line.
+    let detail = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()
+        .map(|value| {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(message) = value["message"].as_str() {
+                parts.push(message.to_string());
+            }
+            if let Some(errors) = value["errors"].as_array() {
+                parts.extend(errors.iter().filter_map(|error| {
+                    error
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| error["message"].as_str().map(str::to_string))
+                }));
+            }
+            parts.join(": ")
+        })
+        .filter(|detail| !detail.is_empty());
+    match (
+        classify_failure(String::from_utf8_lossy(&output.stderr).trim()),
+        detail,
+    ) {
+        (PrError::GhSignedOut, _) => Err(PrError::GhSignedOut),
+        (_, Some(detail)) => Err(PrError::Failed(detail)),
+        (err, None) => Err(err),
+    }
 }
 
 /// Opens a pull request and returns its URL. Never pushes: `--head` names a
@@ -951,6 +1132,66 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn review_payload_carries_ranges_and_skips_an_empty_summary() {
+        let comments = [
+            ReviewComment {
+                anchor: ReviewAnchor {
+                    path: "src/a.rs".into(),
+                    side: ReviewSide::Right,
+                    line: 12,
+                    start: Some((ReviewSide::Right, 10)),
+                },
+                body: "range".into(),
+            },
+            ReviewComment {
+                anchor: ReviewAnchor {
+                    path: "src/b.rs".into(),
+                    side: ReviewSide::Left,
+                    line: 3,
+                    start: Some((ReviewSide::Left, 3)),
+                },
+                body: "one removed line".into(),
+            },
+        ];
+        let payload = review_payload(&"a".repeat(40), ReviewKind::RequestChanges, "  ", &comments);
+        assert_eq!(payload["event"], "REQUEST_CHANGES");
+        assert!(payload.get("body").is_none());
+        assert_eq!(
+            payload["comments"][0],
+            serde_json::json!({
+                "path": "src/a.rs", "side": "RIGHT", "line": 12, "body": "range",
+                "start_side": "RIGHT", "start_line": 10,
+            })
+        );
+        // A one-line "range" is a plain line comment.
+        assert!(payload["comments"][1].get("start_line").is_none());
+        assert_eq!(payload["comments"][1]["side"], "LEFT");
+        let modified_line = [ReviewComment {
+            anchor: ReviewAnchor {
+                path: "src/c.rs".into(),
+                side: ReviewSide::Right,
+                line: 6,
+                start: Some((ReviewSide::Left, 6)),
+            },
+            body: "old and new line 6".into(),
+        }];
+        let payload = review_payload(&"a".repeat(40), ReviewKind::Comment, "", &modified_line);
+        assert_eq!(payload["comments"][0]["start_side"], "LEFT");
+        assert_eq!(payload["comments"][0]["start_line"], 6);
+    }
+
+    #[test]
+    fn only_plain_owner_and_name_reach_the_api_path() {
+        assert!(is_repo_slug("gabins123/gGit"));
+        assert!(is_repo_slug("o/r.js"));
+        assert!(!is_repo_slug("o/r/../../user"));
+        assert!(!is_repo_slug("o/--method=DELETE"));
+        assert!(!is_repo_slug("../r"));
+        assert!(is_repo_slug("org/.github"));
+        assert!(!is_repo_slug("o"));
     }
 
     #[test]

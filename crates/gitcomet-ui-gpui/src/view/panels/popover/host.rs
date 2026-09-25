@@ -396,6 +396,9 @@ impl PopoverHost {
         let pull_request_review_scroll = ScrollHandle::new();
         let pull_request_review_input =
             multiline_input("Leave a comment", &pull_request_review_scroll, window, cx);
+        let review_comment_scroll = ScrollHandle::new();
+        let review_comment_input =
+            multiline_input("Leave a comment", &review_comment_scroll, window, cx);
         let pull_request_body_scroll = ScrollHandle::new();
         let pull_request_body_input = multiline_input(
             "Describe the change (Markdown)",
@@ -695,13 +698,18 @@ impl PopoverHost {
             },
         ));
         // The submit buttons enable on text, so typing has to repaint them.
-        for input in [&pull_request_review_input, &pull_request_title_input] {
+        for input in [
+            &pull_request_review_input,
+            &pull_request_title_input,
+            &review_comment_input,
+        ] {
             prompt_input_subscriptions.push(cx.observe(input, |this, _input, cx| {
                 if matches!(
                     this.popover,
                     Some(
                         PopoverKind::PullRequestReview { .. }
                             | PopoverKind::CreatePullRequest { .. }
+                            | PopoverKind::ReviewComment { .. }
                     )
                 ) {
                     cx.notify();
@@ -1024,6 +1032,9 @@ impl PopoverHost {
             create_tag_focus,
             pull_request_review_input,
             pull_request_review_scroll,
+            review_comment_input,
+            review_comment_scroll,
+            review_comment_unsaved: None,
             pull_request_title_input,
             pull_request_base_input,
             pull_request_body_input,
@@ -1068,6 +1079,7 @@ impl PopoverHost {
             &self.create_tag_input,
             &self.create_tag_message_input,
             &self.pull_request_review_input,
+            &self.review_comment_input,
             &self.pull_request_title_input,
             &self.pull_request_base_input,
             &self.pull_request_body_input,
@@ -1510,6 +1522,7 @@ impl PopoverHost {
                 | Some(PopoverKind::CloneRepo)
                 | Some(PopoverKind::CreateTagPrompt { .. })
                 | Some(PopoverKind::PullRequestReview { .. })
+                | Some(PopoverKind::ReviewComment { .. })
                 | Some(PopoverKind::CreatePullRequest { .. })
                 | Some(PopoverKind::SquashPrompt { .. })
                 | Some(PopoverKind::PushSetUpstreamPrompt { .. })
@@ -1641,6 +1654,17 @@ impl PopoverHost {
             }) => self.dismiss_inline_popover(window, cx),
             Some(PopoverKind::PullRequestReview { .. })
             | Some(PopoverKind::CreatePullRequest { .. }) => {
+                self.close_popover_and_restore_focus(window, cx)
+            }
+            Some(PopoverKind::ReviewComment { anchor, edit, .. }) => {
+                // A new comment's text waits for the same lines; an edit is
+                // just abandoned, the pending comment is unchanged.
+                let text = self
+                    .review_comment_input
+                    .read_with(cx, |input, _| input.text().to_string());
+                if edit.is_none() && !text.trim().is_empty() {
+                    self.review_comment_unsaved = Some((anchor.clone(), text));
+                }
                 self.close_popover_and_restore_focus(window, cx)
             }
             Some(PopoverKind::CloneRepo)
@@ -1843,6 +1867,71 @@ impl PopoverHost {
         cx.notify();
     }
 
+    /// Opens an edit with the pending comment's text; the root sets it once
+    /// the dialog is open, since the dialog can't read the root while it opens.
+    pub(in crate::view) fn prefill_review_comment(
+        &mut self,
+        text: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if matches!(self.popover, Some(PopoverKind::ReviewComment { .. })) {
+            self.review_comment_input
+                .update(cx, |input, cx| input.set_text(text, cx));
+            cx.notify();
+        }
+    }
+
+    /// ctrl+enter in the comment box: the comment joins the pending review.
+    pub(super) fn submit_review_comment(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(PopoverKind::ReviewComment {
+            repo_id,
+            number,
+            anchor,
+            edit,
+        }) = self.popover.clone()
+        else {
+            return false;
+        };
+        let body = self
+            .review_comment_input
+            .read_with(cx, |input, _| input.text().to_string());
+        if body.trim().is_empty() {
+            return true;
+        }
+        let landed = self
+            .root_view
+            .update(cx, |root, cx| {
+                root.add_review_comment(repo_id, number, anchor, body, edit, cx)
+            })
+            .unwrap_or(false);
+        if landed {
+            self.review_comment_unsaved = None;
+            self.close_popover_and_restore_focus(window, cx);
+        }
+        true
+    }
+
+    /// How many line comments the review of `number` would post with it.
+    pub(super) fn pending_review_counts(
+        &self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<(usize, usize, bool)> {
+        let root = self.root_view.upgrade()?;
+        let root = root.read(cx);
+        let review = root.review_of(repo_id, number)?;
+        Some((
+            review.draft.comments.len(),
+            review.files_commented(),
+            review.head_moved,
+        ))
+    }
+
     pub(in crate::view) fn open_popover_kind(&self) -> Option<&PopoverKind> {
         self.popover.as_ref()
     }
@@ -1905,11 +1994,23 @@ impl PopoverHost {
     }
 
     pub(super) fn can_submit_pull_request_review(&self, cx: &mut gpui::Context<Self>) -> bool {
-        let Some(PopoverKind::PullRequestReview { kind, .. }) = self.popover else {
+        let Some(PopoverKind::PullRequestReview {
+            repo_id,
+            number,
+            kind,
+        }) = self.popover
+        else {
             return false;
         };
+        // A Comment review can be just its line comments; GitHub's own form
+        // posts those without a summary.
+        let line_comments = kind == crate::github::ReviewKind::Comment
+            && self
+                .pending_review_counts(repo_id, number, cx)
+                .is_some_and(|(comments, _, _)| comments > 0);
         !self.pull_request_submitting(cx)
             && (!kind.needs_body()
+                || line_comments
                 || self
                     .pull_request_review_input
                     .read_with(cx, |input, _| !input.text().trim().is_empty()))
@@ -3175,6 +3276,23 @@ impl PopoverHost {
                     self.sync_squash_prompt_prefill(cx);
                     let focus = self
                         .squash_message_input
+                        .read_with(cx, |i, _| i.focus_handle());
+                    window.focus(&focus, cx);
+                }
+                PopoverKind::ReviewComment { anchor, edit, .. } => {
+                    let restored = match (edit, &self.review_comment_unsaved) {
+                        (None, Some((unsaved_at, text))) if unsaved_at == anchor => text.clone(),
+                        _ => String::new(),
+                    };
+                    let theme = self.theme;
+                    self.review_comment_input.update(cx, |input, cx| {
+                        input.clear_transient_key_presses();
+                        input.set_theme(theme, cx);
+                        input.set_text(restored, cx);
+                        cx.notify();
+                    });
+                    let focus = self
+                        .review_comment_input
                         .read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
                 }

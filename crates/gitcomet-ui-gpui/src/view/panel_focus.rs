@@ -436,6 +436,33 @@ impl GitCometView {
 
     /// The hint bar's keys for `panel`, which differ on the Pull requests tab.
     pub(super) fn key_hints(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if self.active_review().is_some() {
+            return match panel {
+                FocusPanel::Sidebar => &[
+                    ("j/k", "file"),
+                    ("space", "viewed"),
+                    ("enter", "diff"),
+                    ("S", "submit"),
+                    ("q", "leave"),
+                ],
+                FocusPanel::Diff | FocusPanel::History => &[
+                    ("j/k", "line"),
+                    ("shift+j/k", "select"),
+                    ("c", "comment"),
+                    ("}/{", "change"),
+                    ("]/[", "file"),
+                    ("space", "viewed"),
+                    ("S", "submit"),
+                ],
+                FocusPanel::Details => &[
+                    ("j/k", "comment"),
+                    ("enter", "go to"),
+                    ("e", "edit"),
+                    ("d d", "delete"),
+                    ("S", "submit"),
+                ],
+            };
+        }
         if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
             return &[("[ ]", "tab")];
         }
@@ -467,6 +494,36 @@ impl GitCometView {
     }
 
     fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if self.active_review().is_some() {
+            return match panel {
+                FocusPanel::Sidebar => &[
+                    ("j / k", "Next / previous file"),
+                    ("space", "Mark viewed, then the next unviewed file"),
+                    ("enter", "Go to the diff"),
+                    ("S", "Submit the review"),
+                    ("q", "Leave review mode; pending comments stay"),
+                ],
+                FocusPanel::Diff | FocusPanel::History => &[
+                    ("j / k", "Line cursor down / up"),
+                    ("shift+j / k", "Select lines from the cursor"),
+                    ("c", "Comment on the line or selection"),
+                    ("} / {", "Next / previous change"),
+                    ("] / [", "Next / previous file"),
+                    ("space", "Mark viewed, then the next unviewed file"),
+                    ("esc", "Drop the selection"),
+                    ("S", "Submit the review"),
+                    ("q", "Leave review mode; pending comments stay"),
+                ],
+                FocusPanel::Details => &[
+                    ("j / k", "Next / previous pending comment"),
+                    ("enter", "Go to its line"),
+                    ("e", "Edit it"),
+                    ("d d", "Delete it"),
+                    ("S", "Submit the review"),
+                    ("q", "Leave review mode; pending comments stay"),
+                ],
+            };
+        }
         if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
             return &[("[ / ]", "Branches / Files / Pull requests tab")];
         }
@@ -478,7 +535,8 @@ impl GitCometView {
                         ("enter", "Open its diff"),
                         ("space", "Check it out locally"),
                         ("n", "New pull request"),
-                        ("r", "Review the selected pull request"),
+                        ("r", "Review it: line comments, one submit"),
+                        ("S", "Quick review: just a verdict and summary"),
                         ("M", "Merge it on GitHub"),
                         ("o", "Open on GitHub"),
                         ("R", "Refresh the list"),
@@ -504,7 +562,7 @@ impl GitCometView {
 
     /// Opens a dialog or menu from a key; dismissing it hands focus back to
     /// the panel it was opened from.
-    fn open_popover_from_key(
+    pub(super) fn open_popover_from_key(
         &mut self,
         kind: PopoverKind,
         window: &mut Window,
@@ -923,6 +981,20 @@ impl GitCometView {
         let in_details = current == Some(FocusPanel::Details) && self.pull_request_details_active();
         if shift {
             return match key.to_ascii_lowercase().as_str() {
+                // Submit a review with no line comments: the quick verdict.
+                "s" => {
+                    let number = selected?;
+                    self.open_pull_request_prompt(
+                        PopoverKind::PullRequestReview {
+                            repo_id,
+                            number,
+                            kind: crate::github::ReviewKind::Comment,
+                        },
+                        window,
+                        cx,
+                    );
+                    Some(true)
+                }
                 "m" => {
                     let number = selected?;
                     self.open_pull_request_prompt(
@@ -994,16 +1066,8 @@ impl GitCometView {
                 Some(true)
             }
             (_, "r") => {
-                let number = selected?;
-                self.open_pull_request_prompt(
-                    PopoverKind::PullRequestReview {
-                        repo_id,
-                        number,
-                        kind: crate::github::ReviewKind::Comment,
-                    },
-                    window,
-                    cx,
-                );
+                selected?;
+                self.start_review(cx);
                 Some(true)
             }
             (_, "o") => Some(self.open_pull_request_on_github(cx)),
@@ -1090,6 +1154,9 @@ impl GitCometView {
         let current = self
             .focused_panel(window, cx)
             .filter(|panel| *panel == FocusPanel::Diff || self.panel_available(*panel));
+        if let Some(handled) = self.handle_review_key(current, key, mods.shift, window, cx) {
+            return handled;
+        }
         if let Some(handled) = self.handle_pull_request_key(current, key, mods.shift, window, cx) {
             return handled;
         }

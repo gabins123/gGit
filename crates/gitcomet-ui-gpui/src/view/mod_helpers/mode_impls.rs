@@ -158,6 +158,14 @@ pub(crate) enum PopoverKind {
         repo_id: RepoId,
         branch: Option<String>,
     },
+    /// A line comment for the review in progress; `edit` is the pending
+    /// comment it replaces.
+    ReviewComment {
+        repo_id: RepoId,
+        number: u64,
+        anchor: crate::github::ReviewAnchor,
+        edit: Option<usize>,
+    },
     /// Merge a GitHub pull request through gh.
     MergePullRequest {
         repo_id: RepoId,

@@ -13,6 +13,7 @@ use super::diff_text::{
     whitespace_visible_styled_text,
 };
 use super::*;
+use crate::github::ReviewSide;
 use crate::view::panes::main::diff_search::{DiffSearchMatcher, DiffSearchOptions};
 use crate::view::panes::main::{DiffChangeSide, DiffHorizontalScrollColumn, FocusedChangeBlockRow};
 use gitcomet_core::domain::{DiffArea, DiffLineKind};
@@ -41,6 +42,7 @@ const DIFF_GUTTER_BASE_WIDTH_PX: f32 = 38.0;
 const DIFF_ROW_HORIZONTAL_PADDING_PX: f32 = 8.0;
 const DIFF_ROW_TEXT_TRAILING_PADDING_PX: f32 = 16.0;
 const DIFF_CHANGE_BAR_WIDTH_PX: f32 = 3.0;
+const REVIEW_MARK_WIDTH_PX: f32 = 6.0;
 /// Outline around the change block F2/F3 landed on.
 const FOCUSED_CHANGE_BLOCK_OUTLINE_WIDTH_PX: f32 = 1.0;
 const DIFF_ROW_BACKGROUND_OVERDRAW_PX: f32 = 1.0;
@@ -1219,6 +1221,28 @@ fn semantic_diff_row_bg(theme: AppTheme, bg: gpui::Rgba) -> Option<gpui::Rgba> {
 
 fn focused_row_outline_color(theme: AppTheme, bg: gpui::Rgba) -> gpui::Rgba {
     with_alpha(bg, if theme.is_dark { 0.72 } else { 0.56 })
+}
+
+/// A pending review comment on this row: an amber pill at the gutter's left
+/// edge, clear of the F2/F3 change bar, so it reads as a note, not a change.
+fn paint_review_mark(
+    window: &mut Window,
+    row_bounds: Bounds<Pixels>,
+    left: Pixels,
+    theme: AppTheme,
+    ui_scale_percent: u32,
+) {
+    let width = diff_scaled_px(REVIEW_MARK_WIDTH_PX, ui_scale_percent);
+    let height = (row_bounds.size.height * 0.6).max(width);
+    let top = row_bounds.top() + (row_bounds.size.height - height) * 0.5;
+    let left = left + diff_scaled_px(DIFF_CHANGE_BAR_WIDTH_PX + 1.0, ui_scale_percent);
+    window.paint_quad(
+        fill(
+            Bounds::new(point(left, top), size(width, height)),
+            theme.colors.status.warning.foreground,
+        )
+        .corner_radii(width * 0.5),
+    );
 }
 
 /// Marks a row of the change block F2/F3 landed on: the accent bar the
@@ -2402,6 +2426,16 @@ pub(super) fn inline_diff_line_row_canvas(
                 );
             }
 
+            if view.read(cx).review_mark_side(visible_ix).is_some() {
+                paint_review_mark(
+                    window,
+                    prepaint.bounds,
+                    prepaint.bounds.left() + prepaint.annot_w,
+                    theme,
+                    ui_scale_percent,
+                );
+            }
+
             if show_line_numbers {
                 paint_gutter_text_right_aligned(
                     &old,
@@ -2718,6 +2752,20 @@ pub(super) fn split_diff_line_row_canvas(
                 }
             }
 
+            if let Some(side) = view.read(cx).review_mark_side(visible_ix) {
+                let column = match side {
+                    ReviewSide::Left => prepaint.left_col,
+                    ReviewSide::Right => prepaint.right_col,
+                };
+                paint_review_mark(
+                    window,
+                    prepaint.bounds,
+                    column.left(),
+                    theme,
+                    ui_scale_percent,
+                );
+            }
+
             if show_line_numbers {
                 let gutter_total = gutter_cell_total_width(
                     prepaint.pad,
@@ -3016,6 +3064,18 @@ pub(super) fn patch_split_column_row_canvas(
                 );
                 #[cfg(test)]
                 record_focused_change_block_for_tests(visible_ix, region, row, outline);
+            }
+
+            if let Some(side) = view.read(cx).review_mark_side(visible_ix)
+                && (side == ReviewSide::Left) == (region == DiffTextRegion::SplitLeft)
+            {
+                paint_review_mark(
+                    window,
+                    prepaint.bounds,
+                    prepaint.bounds.left() + prepaint.annot_w,
+                    theme,
+                    ui_scale_percent,
+                );
             }
 
             if show_line_numbers {

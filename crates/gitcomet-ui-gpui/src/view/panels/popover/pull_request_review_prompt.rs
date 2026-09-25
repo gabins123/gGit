@@ -32,6 +32,7 @@ pub(super) fn panel(
     let body_empty = this
         .pull_request_review_input
         .read_with(cx, |input, _| input.text().trim().is_empty());
+    let pending = this.pending_review_counts(repo_id, number, cx);
 
     let kind_row =
         div()
@@ -88,7 +89,14 @@ pub(super) fn panel(
                 cx.stop_propagation();
             }),
         )
-        .child(popover_title(theme, format!("Review #{number}")))
+        .child(popover_title(
+            theme,
+            if pending.is_some() {
+                format!("Submit review #{number}")
+            } else {
+                format!("Review #{number}")
+            },
+        ))
         .child(super::popover_rule(theme))
         .child(
             kind_row.child(div().flex_1()).child(
@@ -115,7 +123,30 @@ pub(super) fn panel(
                 .render(theme, this.pull_request_review_input.clone()),
             ),
         )
-        .when(kind.needs_body() && body_empty, |panel| {
+        .when_some(pending.filter(|(comments, _, _)| *comments > 0), |panel, (comments, files, head_moved)| {
+            panel.child(
+                div()
+                    .px_2()
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(theme.colors.foreground.secondary)
+                    .child(format!(
+                        "With it: {comments} line comment{} on {files} file{}.{}",
+                        if comments == 1 { "" } else { "s" },
+                        if files == 1 { "" } else { "s" },
+                        if head_moved {
+                            " The pull request has new commits since they were written; check their lines."
+                        } else {
+                            ""
+                        }
+                    )),
+            )
+        })
+        .when(
+            kind.needs_body()
+                && body_empty
+                && !(kind == ReviewKind::Comment
+                    && pending.is_some_and(|(comments, _, _)| comments > 0)),
+            |panel| {
             panel.child(
                 div()
                     .px_2()
