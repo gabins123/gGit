@@ -1606,6 +1606,14 @@ impl GitCometView {
             sidebar_collapsed_popover_anim_seq: 0,
             sidebar_collapsed_before_merge_view: None,
             details_collapsed: false,
+            diff_return_panel: super::panel_focus::FocusPanel::History,
+            diff_open_last_render: false,
+            keys_help_panel: None,
+            pull_requests: Default::default(),
+            focus_diff_when_open: false,
+            codex: None,
+            codex_menu_open: false,
+            codex_return_panel: super::panel_focus::FocusPanel::History,
             sidebar_width_design: initial_sidebar_width_design,
             details_width_design: initial_details_width_design,
             sidebar_width: initial_sidebar_width,
@@ -2717,18 +2725,7 @@ impl GitCometView {
         F: FnOnce(&mut MainPaneView, &mut Window, &mut gpui::Context<MainPaneView>) -> bool
             + 'static,
     {
-        let main_pane = self.main_pane.clone();
-        let window_handle = self.window_handle;
-        cx.defer(move |cx| {
-            let _ = window_handle.update(cx, |_, window, cx| {
-                main_pane.update(cx, |pane, cx| {
-                    if action(pane, window, cx) {
-                        cx.notify();
-                        window.refresh();
-                    }
-                });
-            });
-        });
+        self.defer_pane_action(self.main_pane.clone(), cx, action);
     }
 
     pub(super) fn defer_text_input_adjacent_diff_file_navigation(

@@ -88,6 +88,9 @@ pub(in super::super) struct DetailsPaneView {
         std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
     pub(in super::super) status_section_resize: Option<StatusSectionResizeState>,
     status_section_focus_handles: [FocusHandle; 4],
+    /// Keyboard focus for the pane as a whole (`4`, `h`/`l`), for the commit
+    /// views that have no status section to focus.
+    pub(in super::super) panel_focus_handle: FocusHandle,
 
     pub(in super::super) untracked_scroll: UniformListScrollHandle,
     pub(in super::super) unstaged_scroll: UniformListScrollHandle,
@@ -294,6 +297,8 @@ impl DetailsPaneView {
     fn notify_fingerprint(state: &AppState) -> u64 {
         let mut hasher = FxHasher::default();
         state.active_repo.hash(&mut hasher);
+        // The Pull requests tab swaps what this pane shows.
+        (state.sidebar_mode == gitcomet_state::model::SidebarMode::PullRequests).hash(&mut hasher);
 
         if let Some(repo_id) = state.active_repo
             && let Some(repo) = state.repos.iter().find(|r| r.id == repo_id)
@@ -506,6 +511,7 @@ impl DetailsPaneView {
             range_filter_bounds_ref: Default::default(),
             status_section_resize: None,
             status_section_focus_handles: std::array::from_fn(|_| cx.focus_handle()),
+            panel_focus_handle: cx.focus_handle().tab_index(0).tab_stop(false),
             untracked_scroll: UniformListScrollHandle::default(),
             unstaged_scroll: UniformListScrollHandle::default(),
             staged_scroll: UniformListScrollHandle::default(),
@@ -2392,6 +2398,16 @@ impl DetailsPaneView {
             )
     }
 
+    /// Whether keyboard focus is on the pane itself or one of its status
+    /// sections, rather than an input inside it such as the commit message.
+    pub(in super::super) fn owns_panel_focus(&self, window: &Window) -> bool {
+        self.panel_focus_handle.is_focused(window)
+            || self
+                .status_section_focus_handles
+                .iter()
+                .any(|handle| handle.is_focused(window))
+    }
+
     pub(in super::super) fn focus_diff_panel(
         &mut self,
         window: &mut Window,
@@ -2404,11 +2420,197 @@ impl DetailsPaneView {
     }
 }
 
+impl DetailsPaneView {
+    /// The selected pull request: its state, branches, checks and files.
+    fn pull_request_details_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
+        use super::super::pull_requests::PrLoad;
+
+        let theme = self.theme;
+        let secondary = theme.colors.foreground.secondary;
+        let Some(root) = self.root_view.upgrade() else {
+            return div().into_any_element();
+        };
+        let (detail, number, selected_file, fetching) = {
+            let root = root.read(cx);
+            let Some(prs) = root.active_pull_requests() else {
+                return div().into_any_element();
+            };
+            (
+                prs.detail.clone(),
+                prs.selected.unwrap_or_default(),
+                prs.selected_file,
+                matches!(prs.diff_base, PrLoad::Loading),
+            )
+        };
+        let detail = match detail {
+            PrLoad::Idle | PrLoad::Loading => {
+                return components::empty_state_message(theme, format!("Loading #{number}…"))
+                    .into_any_element();
+            }
+            PrLoad::Failed(err) => {
+                return components::empty_state(
+                    theme,
+                    format!("Couldn't load #{number}"),
+                    err.to_string(),
+                )
+                .into_any_element();
+            }
+            PrLoad::Ready(detail) => detail,
+        };
+
+        let line = |text: String| {
+            div()
+                .px_3()
+                .text_size(theme.ui_text(12.0))
+                .text_color(secondary)
+                .child(text)
+        };
+        let state = if detail.is_draft {
+            "Draft".to_string()
+        } else {
+            match detail.state.as_str() {
+                "MERGED" => "Merged".to_string(),
+                "CLOSED" => "Closed".to_string(),
+                _ => "Open".to_string(),
+            }
+        };
+        let review = detail
+            .review
+            .map_or("No review yet", |review| review.label());
+        let mergeable = match detail.mergeable {
+            Some(true) => "No conflicts",
+            Some(false) => "Has conflicts",
+            None => "Checking for conflicts",
+        };
+        let checks = detail.checks;
+        let checks_line = if checks.total() == 0 {
+            "No checks".to_string()
+        } else {
+            format!(
+                "Checks: {} passing, {} failing, {} pending",
+                checks.passing, checks.failing, checks.pending
+            )
+        };
+
+        let files = detail.files.iter().enumerate().map(|(ix, file)| {
+            div()
+                .id(SharedString::from(format!("pull_request_file_{ix}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .mx_1()
+                .px_2()
+                .py(px(3.0))
+                .rounded(px(theme.radii.control))
+                .cursor(CursorStyle::PointingHand)
+                .when(selected_file == Some(ix), |row| {
+                    row.bg(theme.colors.interaction.selected_background)
+                })
+                .hover(move |style| style.bg(theme.colors.interaction.hover_background))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    window.focus(&this.panel_focus_handle, cx);
+                    // The root repaints this pane; it can't while we're mid-update.
+                    let root = this.root_view.clone();
+                    cx.defer(move |cx| {
+                        let _ =
+                            root.update(cx, |root, cx| root.open_pull_request_diff(Some(ix), cx));
+                    });
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(theme.ui_text(12.0))
+                        .child(file.path.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(theme.ui_text(11.0))
+                        .text_color(theme.colors.status.success.foreground)
+                        .child(format!("+{}", file.additions)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(theme.ui_text(11.0))
+                        .text_color(theme.colors.status.danger.foreground)
+                        .child(format!("−{}", file.deletions)),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .gap_1()
+            .py_2()
+            .child(
+                div()
+                    .px_3()
+                    .text_size(theme.ui_text(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} #{}", detail.title, detail.number)),
+            )
+            .child(line(format!("{state} · {review} · {mergeable}")))
+            .child(line(format!(
+                "{} wants to merge {} into {}",
+                detail.author, detail.head, detail.base
+            )))
+            .child(line(checks_line))
+            .when(detail.too_large_for_app(), |panel| {
+                panel.child(line(format!(
+                    "Too large to review here ({} files, +{} −{}). o opens it on GitHub.",
+                    detail.changed_files, detail.additions, detail.deletions
+                )))
+            })
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .text_size(theme.ui_text(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!(
+                        "Changed files ({})  +{} −{}",
+                        detail.changed_files, detail.additions, detail.deletions
+                    )),
+            )
+            .child(
+                div()
+                    .id("pull_request_files")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(files),
+            )
+            .child(line(if fetching {
+                "Fetching the pull request's commits…".to_string()
+            } else {
+                "enter opens the diff · r review · o GitHub".to_string()
+            }))
+            .into_any_element()
+    }
+}
+
 impl Render for DetailsPaneView {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let pull_request = self
+            .root_view
+            .upgrade()
+            .is_some_and(|root| root.read(cx).pull_request_details_active());
+        let content = if pull_request {
+            self.pull_request_details_view(cx)
+        } else {
+            self.commit_details_view(cx)
+        };
         div()
             .size_full()
-            .child(self.commit_details_view(cx))
+            .track_focus(&self.panel_focus_handle)
+            .child(content)
             .child(StatusSectionResizeTracker { view: cx.entity() })
     }
 }

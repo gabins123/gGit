@@ -110,6 +110,14 @@ impl PopoverHost {
             PopoverKind::CreateTagPrompt { repo_id, target } => {
                 create_tag_prompt::panel(self, repo_id, target, cx)
             }
+            PopoverKind::PullRequestReview {
+                repo_id,
+                number,
+                kind,
+            } => pull_request_review_prompt::panel(self, repo_id, number, kind, cx),
+            PopoverKind::CreatePullRequest { repo_id } => {
+                create_pull_request_prompt::panel(self, repo_id, cx)
+            }
             PopoverKind::Repo { repo_id, kind } => match kind {
                 RepoPopoverKind::Remote(remote_kind) => match remote_kind {
                     RemotePopoverKind::AddPrompt => remote_add_prompt::panel(self, repo_id, cx),

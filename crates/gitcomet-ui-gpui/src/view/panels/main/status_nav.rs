@@ -432,6 +432,114 @@ impl MainPaneView {
         self.try_select_adjacent_diff_file_inner(repo_id, direction, true, window, cx)
     }
 
+    pub(in crate::view) fn diff_is_open_for_navigation(&self) -> bool {
+        self.active_repo()
+            .is_some_and(|repo| repo.diff_state.diff_target.is_some())
+    }
+
+    /// Opens the first file Details lists when nothing is selected yet, so
+    /// keyboard navigation has somewhere to start. Covers the single-commit and
+    /// working-tree lists; the other Details views return `false`.
+    pub(in crate::view) fn try_select_first_diff_file(
+        &mut self,
+        repo_id: RepoId,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let state = Arc::clone(&self.state);
+        let Some(repo) = state.repos.iter().find(|repo| repo.id == repo_id) else {
+            return false;
+        };
+        let history = &repo.history_state;
+        if repo.diff_state.diff_target.is_some()
+            || history.worktree_selection.is_some()
+            || history.range_selection.is_some()
+            || history.multi_selection.is_multi()
+        {
+            return false;
+        }
+
+        if let Some(commit_id) = history.selected_commit.clone() {
+            let Loadable::Ready(details) = &history.commit_details else {
+                return false;
+            };
+            if details.id != commit_id {
+                return false;
+            }
+            let order = self
+                .root_view
+                .update(cx, |root, cx| {
+                    root.details_pane
+                        .read(cx)
+                        .active_commit_file_source_indices(repo_id)
+                })
+                .ok()
+                .flatten();
+            let first = match order.as_deref() {
+                Some(order) => order.first().copied(),
+                None => (!details.files.is_empty()).then_some(0),
+            };
+            let Some(file) = first.and_then(|ix| details.files.get(ix)) else {
+                return false;
+            };
+            self.store.dispatch(Msg::SelectDiff {
+                repo_id,
+                target: DiffTarget::Commit {
+                    commit_id,
+                    path: Some(file.path.clone()),
+                },
+            });
+            self.scroll_commit_details_file_to_ix(0, cx);
+            return true;
+        }
+
+        // Sections in the order Details draws them.
+        let sections: &[StatusSection] = match self.active_change_tracking_view(cx) {
+            ChangeTrackingView::Combined => {
+                &[StatusSection::CombinedUnstaged, StatusSection::Staged]
+            }
+            ChangeTrackingView::SplitUntracked => &[
+                StatusSection::Untracked,
+                StatusSection::Unstaged,
+                StatusSection::Staged,
+            ],
+        };
+        for &section in sections {
+            let order = self
+                .root_view
+                .update(cx, |root, cx| {
+                    root.details_pane
+                        .read(cx)
+                        .active_status_section_order(repo_id, section)
+                })
+                .ok()
+                .flatten();
+            let entries = match order {
+                Some(order) => StatusSectionEntries::from_repo_with_order(repo, section, order),
+                None => StatusSectionEntries::from_repo(repo, section),
+            };
+            let Some(entry) = entries.as_ref().and_then(|entries| entries.iter().next()) else {
+                continue;
+            };
+            let path = entry.path.clone();
+            let area = section.diff_area();
+            let is_conflicted = area == DiffArea::Unstaged
+                && entry.kind == gitcomet_core::domain::FileStatusKind::Conflicted;
+            self.clear_status_multi_selection(repo_id, cx);
+            self.scroll_status_section_to_path(section, &path, cx);
+            if is_conflicted {
+                self.store
+                    .dispatch(Msg::SelectConflictDiff { repo_id, path });
+            } else {
+                self.store.dispatch(Msg::SelectDiff {
+                    repo_id,
+                    target: DiffTarget::WorkingTree { path, area },
+                });
+            }
+            return true;
+        }
+        false
+    }
+
     pub(in crate::view) fn try_select_adjacent_diff_file_preserving_focus(
         &mut self,
         repo_id: RepoId,

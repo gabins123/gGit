@@ -1077,6 +1077,23 @@ pub struct GitCometView {
     pub(super) sidebar_collapsed_popover_anim_seq: u64,
     pub(super) sidebar_collapsed_before_merge_view: Option<bool>,
     pub(super) details_collapsed: bool,
+    /// The panel keyboard focus returns to when the diff it sat on closes.
+    pub(super) diff_return_panel: super::panel_focus::FocusPanel,
+    /// Whether the last render had a diff open, so a diff that closes under
+    /// focus can be told apart from one that has not arrived yet.
+    pub(super) diff_open_last_render: bool,
+    /// The panel whose keys the `?` list shows, while it is open.
+    pub(super) keys_help_panel: Option<super::panel_focus::FocusPanel>,
+    /// GitHub pull requests per repository; see `pull_requests.rs`.
+    pub(super) pull_requests: super::pull_requests::PullRequestsState,
+    /// Focus the diff as soon as a pending one opens: `enter` on a pull
+    /// request asks for it while its commits are still being fetched.
+    pub(super) focus_diff_when_open: bool,
+    /// The Codex panel, created the first time it is used.
+    pub(super) codex: Option<super::codex_panel::CodexPanel>,
+    pub(super) codex_menu_open: bool,
+    /// The panel `esc` returns to from the Codex panel.
+    pub(super) codex_return_panel: super::panel_focus::FocusPanel,
     pub(super) sidebar_width_design: f32,
     pub(super) details_width_design: f32,
     pub(super) sidebar_width: Pixels,

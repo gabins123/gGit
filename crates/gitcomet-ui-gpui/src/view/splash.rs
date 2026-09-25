@@ -1,3 +1,4 @@
+use super::panel_focus::{FocusPanel, panel_focus_ring};
 use super::*;
 use crate::kit::click::PointerClickExt as _;
 use crate::kit::interaction as controls;
@@ -1039,6 +1040,30 @@ impl GitCometView {
         }
 
         if renders_full_chrome(self.view_mode) {
+            let focused_panel = self.focused_panel(window, cx);
+            let diff_open = self.diff_is_open();
+            if self.diff_open_last_render && !diff_open && focused_panel == Some(FocusPanel::Diff) {
+                // The diff closed under focus (esc, `2`, a click elsewhere): hand
+                // focus back to the panel it was entered from.
+                let back = self.diff_return_target();
+                let view = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |this, cx| this.focus_panel(back, window, cx));
+                });
+            }
+            self.diff_open_last_render = diff_open;
+            if self.focus_diff_when_open && diff_open {
+                self.focus_diff_when_open = false;
+                let view = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.focus_panel(FocusPanel::Diff, window, cx)
+                    });
+                });
+            }
+            let main_focused =
+                matches!(focused_panel, Some(FocusPanel::History | FocusPanel::Diff));
+
             // Terminal and/or reflog — see `render_bottom_panel` for which.
             let bottom_panel = self.render_bottom_panel(theme, window, cx);
             let has_bottom_panel = bottom_panel.is_some();
@@ -1101,7 +1126,12 @@ impl GitCometView {
                                 })
                                 .when(self.sidebar_collapsed, |d| {
                                     d.child(self.collapsed_sidebar_rail(theme, cx))
-                                }),
+                                })
+                                .when(
+                                    !self.sidebar_collapsed
+                                        && focused_panel == Some(FocusPanel::Sidebar),
+                                    |d| d.child(panel_focus_ring(theme)),
+                                ),
                         )
                         .child(
                             // Main + details share one card silhouette; the panes stay
@@ -1133,14 +1163,29 @@ impl GitCometView {
                                         .when_some(bottom_panel, |d, bottom_panel| {
                                             d.flex()
                                                 .flex_col()
-                                                .child(div().flex_1().min_h(px(0.0)).child(
-                                                    stable_cached_fill_view(self.main_pane.clone()),
-                                                ))
+                                                .child(
+                                                    div()
+                                                        .relative()
+                                                        .flex_1()
+                                                        .min_h(px(0.0))
+                                                        .child(stable_cached_fill_view(
+                                                            self.main_pane.clone(),
+                                                        ))
+                                                        .when(main_focused, |d| {
+                                                            d.child(panel_focus_ring(theme))
+                                                        }),
+                                                )
                                                 .child(self.terminal_panel_resize_handle(theme, cx))
                                                 .child(bottom_panel)
                                         })
                                         .when(!has_bottom_panel, |d| {
-                                            d.child(stable_cached_fill_view(self.main_pane.clone()))
+                                            d.relative()
+                                                .child(stable_cached_fill_view(
+                                                    self.main_pane.clone(),
+                                                ))
+                                                .when(main_focused, |d| {
+                                                    d.child(panel_focus_ring(theme))
+                                                })
                                         }),
                                 )
                                 .child(
@@ -1162,7 +1207,12 @@ impl GitCometView {
                                             d.child(div().flex_1().min_h(px(0.0)).child(
                                                 stable_cached_fill_view(self.details_pane.clone()),
                                             ))
-                                        }),
+                                        })
+                                        .when(
+                                            !self.details_collapsed
+                                                && focused_panel == Some(FocusPanel::Details),
+                                            |d| d.child(panel_focus_ring(theme)),
+                                        ),
                                 )
                                 .child(
                                     // Keep the full resize hit target without reserving a

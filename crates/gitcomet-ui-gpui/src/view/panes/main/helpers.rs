@@ -3130,7 +3130,7 @@ pub(super) struct RemoteMarkdownImageSummaryCache {
 
 pub(crate) struct MainPaneView {
     pub(in crate::view) store: Arc<AppStore>,
-    pub(super) state: Arc<AppState>,
+    pub(in crate::view) state: Arc<AppState>,
     pub(in crate::view) view_mode: GitCometViewMode,
     pub(in crate::view) focused_mergetool_labels: Option<FocusedMergetoolLabels>,
     pub(in crate::view) focused_mergetool_exit_code: Option<Arc<AtomicI32>>,

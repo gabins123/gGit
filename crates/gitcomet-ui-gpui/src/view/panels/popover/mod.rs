@@ -15,6 +15,7 @@ mod commit_mainline;
 mod commit_prompt;
 pub(in super::super) mod context_menu;
 mod create_branch_from_ref_prompt;
+mod create_pull_request_prompt;
 mod create_tag_prompt;
 mod delete_branches_confirm;
 mod delete_remote_branch_confirm;
@@ -30,6 +31,7 @@ mod merge_commit_confirm;
 mod picker_nav;
 mod picker_row_menu;
 mod pull_reconcile_prompt;
+mod pull_request_review_prompt;
 mod push_set_upstream_prompt;
 mod rebase_onto_confirm;
 mod remote_add_prompt;
@@ -359,6 +361,13 @@ pub(in super::super) struct PopoverHost {
     rebase_onto_submit_focus_handle: FocusHandle,
     clone_repo_focus: DialogFocus,
     create_tag_focus: DialogFocus,
+    pull_request_review_input: Entity<components::TextInput>,
+    pull_request_review_scroll: ScrollHandle,
+    pull_request_title_input: Entity<components::TextInput>,
+    pull_request_base_input: Entity<components::TextInput>,
+    pull_request_body_input: Entity<components::TextInput>,
+    pull_request_body_scroll: ScrollHandle,
+    pull_request_draft: bool,
     remote_add_focus: DialogFocus,
     remote_edit_focus: DialogFocus,
     push_upstream_focus: DialogFocus,
@@ -883,7 +892,9 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         PopoverKind::HookActivity { .. } => Some(DIALOG_900_WIDTH),
         PopoverKind::CreateBranchFromRefPrompt { .. }
         | PopoverKind::RenameBranchPrompt { .. }
-        | PopoverKind::CheckoutRemoteBranchPrompt { .. } => Some(DIALOG_540_WIDTH),
+        | PopoverKind::CheckoutRemoteBranchPrompt { .. }
+        | PopoverKind::PullRequestReview { .. }
+        | PopoverKind::CreatePullRequest { .. } => Some(DIALOG_540_WIDTH),
         PopoverKind::StashDropConfirm { .. }
         | PopoverKind::Repo {
             kind:

@@ -194,6 +194,35 @@ pub(super) fn remote_web_pages(remotes: &[Remote]) -> Vec<RemoteWebPage> {
     pages
 }
 
+/// The github.com remote pull requests belong to. A fork's clone names its
+/// parent `upstream`, and pull requests go to the parent (gh's own default),
+/// so `upstream` comes first, then `origin`, then any other github.com remote.
+/// Returns the remote's name and its `owner/name` slug, the form `gh --repo`
+/// takes.
+pub(super) fn github_remote(remotes: &[Remote]) -> Option<(String, String)> {
+    let rank = |remote: &&Remote| match remote.name.as_str() {
+        "upstream" => 0,
+        "origin" => 1,
+        _ => 2,
+    };
+    let mut ordered: Vec<&Remote> = remotes.iter().collect();
+    ordered.sort_by_key(rank);
+    ordered.into_iter().find_map(|remote| {
+        let slug = github_slug(remote.url.as_deref()?)?;
+        Some((remote.name.clone(), slug))
+    })
+}
+
+/// `owner/name` for a github.com remote URL.
+pub(super) fn github_slug(url: &str) -> Option<String> {
+    let base = parse_remote_url(url)?;
+    if base.kind != ForgeKind::GitHub {
+        return None;
+    }
+    let (_, slug) = base.web_root.split_once("github.com/")?;
+    Some(slug.to_string())
+}
+
 fn parse_remote_url(url: &str) -> Option<ForgeWebBase> {
     let url = url.trim();
     if url.is_empty() {
@@ -859,6 +888,36 @@ mod tests {
         ] {
             assert_eq!(remote_web_url(url), None, "{url}");
         }
+    }
+
+    #[test]
+    fn github_remote_prefers_upstream_then_origin_and_skips_other_forges() {
+        let remotes = [
+            remote("origin", "git@github.com:gabins123/gGit.git"),
+            remote("upstream", "https://github.com/Auto-Explore/GitComet.git"),
+        ];
+        assert_eq!(
+            github_remote(&remotes),
+            Some(("upstream".to_string(), "Auto-Explore/GitComet".to_string()))
+        );
+        assert_eq!(
+            github_remote(&remotes[..1]),
+            Some(("origin".to_string(), "gabins123/gGit".to_string()))
+        );
+
+        let remotes = [
+            remote("origin", "https://gitlab.com/org/repo.git"),
+            remote("mirror", "ssh://git@github.com/org/mirror"),
+        ];
+        assert_eq!(
+            github_remote(&remotes),
+            Some(("mirror".to_string(), "org/mirror".to_string()))
+        );
+
+        assert_eq!(
+            github_remote(&[remote("origin", "https://gitlab.com/org/repo.git")]),
+            None
+        );
     }
 
     #[test]

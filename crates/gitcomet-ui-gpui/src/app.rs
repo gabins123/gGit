@@ -800,8 +800,32 @@ fn install_global_diff_shortcut_fallback(cx: &mut App) {
         // Observers also run after a bound action handled the keystroke (gpui
         // passes that action here); acting again would run F3 twice and skip
         // every other change block.
-        if event.action.is_some()
-            || !is_diff_shortcut_candidate(&event.keystroke)
+        if event.action.is_some() {
+            return;
+        }
+
+        let window_id = window.window_handle().window_id();
+        let normal_entry = gitcomet_window_entries(cx).into_iter().find(|entry| {
+            entry.handle.window_id() == window_id && entry.view_mode == GitCometViewMode::Normal
+        });
+        // Panel keys (`1`–`4`, `h`/`j`/`k`/`l`, …) are handled here rather than
+        // on an element: with nothing focused, or focus on a panel that is not
+        // rendered, gpui dispatches to the window root alone and no element
+        // listener would see them. The view itself decides whether focus allows.
+        if let Some(entry) = normal_entry.as_ref() {
+            let handled = entry
+                .view
+                .update(cx, |view, cx| {
+                    view.handle_panel_key(&event.keystroke, window, cx)
+                })
+                .unwrap_or(false);
+            if handled {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        if !is_diff_shortcut_candidate(&event.keystroke)
             || event.context_stack.iter().any(|context| {
                 context.contains("TextInput")
                     || context.contains("Terminal")
@@ -814,10 +838,7 @@ fn install_global_diff_shortcut_fallback(cx: &mut App) {
             return;
         }
 
-        let window_id = window.window_handle().window_id();
-        let Some(entry) = gitcomet_window_entries(cx).into_iter().find(|entry| {
-            entry.handle.window_id() == window_id && entry.view_mode == GitCometViewMode::Normal
-        }) else {
+        let Some(entry) = normal_entry else {
             return;
         };
 

@@ -37,6 +37,8 @@ pub enum SidebarMode {
     #[default]
     Branches,
     Files,
+    /// GitHub pull requests, loaded through `gh` by the UI.
+    PullRequests,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

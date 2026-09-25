@@ -146,6 +146,16 @@ pub(crate) enum PopoverKind {
         repo_id: RepoId,
         target: String,
     },
+    /// Review a GitHub pull request through gh.
+    PullRequestReview {
+        repo_id: RepoId,
+        number: u64,
+        kind: crate::github::ReviewKind,
+    },
+    /// Open a GitHub pull request for the checked-out branch through gh.
+    CreatePullRequest {
+        repo_id: RepoId,
+    },
     Repo {
         repo_id: RepoId,
         kind: RepoPopoverKind,

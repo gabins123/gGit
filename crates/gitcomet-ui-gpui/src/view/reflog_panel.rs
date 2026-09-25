@@ -111,6 +111,28 @@ impl GitCometView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) -> Option<AnyElement> {
+        let codex = self.render_codex_panel(theme, window, cx);
+        let rest = self.render_terminal_or_reflog_panel(theme, window, cx);
+        match (codex, rest) {
+            (None, rest) => rest,
+            (Some(codex), None) => Some(codex),
+            (Some(codex), Some(rest)) => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(codex)
+                    .child(rest)
+                    .into_any_element(),
+            ),
+        }
+    }
+
+    fn render_terminal_or_reflog_panel(
+        &mut self,
+        theme: AppTheme,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<AnyElement> {
         let repo_id = self.active_repo_id()?;
         let reflog_open = self.reflog_panel_is_open(repo_id, cx);
 

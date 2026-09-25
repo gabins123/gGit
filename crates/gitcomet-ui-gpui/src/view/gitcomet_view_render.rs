@@ -574,6 +574,16 @@ impl Render for GitCometView {
             ));
         }
         root = root.child(UiScaleScrollCapture { view: cx.entity() });
+        // The `?` list is modal and must see keys before any panel does: its esc
+        // closes the list, not the diff underneath. Panel keys themselves run
+        // from the app-level keystroke observer (`app.rs`).
+        root = root.capture_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
+            if this.handle_codex_menu_key(&e.keystroke, window, cx)
+                || this.handle_keys_help_key(&e.keystroke, window, cx)
+            {
+                cx.stop_propagation();
+            }
+        }));
         root = root
             .on_action(cx.listener(|this, _: &OpenActiveViewSearch, window, cx| {
                 let handled = this
@@ -775,12 +785,18 @@ impl Render for GitCometView {
         }
 
         let framed_content = div().relative().size_full().child(body);
+        let keys_help = self
+            .keys_help_panel
+            .map(|panel| self.render_keys_help(panel, cx));
+        let codex_menu = self.codex_menu_open.then(|| self.render_codex_menu(cx));
 
         let frame_overlay = div()
             .absolute()
             .top_0()
             .left_0()
             .size_full()
+            .children(keys_help)
+            .children(codex_menu)
             .child(self.command_palette.clone())
             .child(stable_overlay_view(self.reveal_commit_dialog.clone()))
             .child(stable_overlay_view(self.history_refs_hover_host.clone()))
