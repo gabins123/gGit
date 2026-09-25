@@ -21,6 +21,11 @@ pub(crate) const MAX_IN_APP_CHANGED_LINES: u64 = 20_000;
 /// How far `gh pr list` looks. Open PRs past this are on GitHub.
 const LIST_LIMIT: u32 = 100;
 
+/// The newest conversation entries the Details panel shows, and how much of
+/// each body; the rest is on GitHub.
+const MAX_CONVERSATION: usize = 100;
+const MAX_CONVERSATION_BODY_CHARS: usize = 4_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PrError {
     /// `gh` is not on PATH.
@@ -72,16 +77,55 @@ impl ReviewDecision {
     }
 }
 
-/// One entry of gh's `statusCheckRollup`: a check run (`status` +
-/// `conclusion`) or a commit status (`state`).
+/// One entry of gh's `statusCheckRollup`: a check run (`name`, `status` +
+/// `conclusion`) or a commit status (`context`, `state`).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 struct CheckEntry {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
     #[serde(default)]
     state: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum CheckState {
+    Failing,
+    Pending,
+    Passing,
+}
+
+impl CheckEntry {
+    fn outcome(&self) -> CheckState {
+        match (&self.state, &self.status, &self.conclusion) {
+            (Some(state), _, _) => match state.as_str() {
+                "SUCCESS" => CheckState::Passing,
+                "PENDING" | "EXPECTED" => CheckState::Pending,
+                _ => CheckState::Failing,
+            },
+            (None, Some(status), _) if status != "COMPLETED" => CheckState::Pending,
+            (None, _, Some(conclusion)) => {
+                if matches!(conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+                    CheckState::Passing
+                } else {
+                    CheckState::Failing
+                }
+            }
+            (None, _, None) => CheckState::Pending,
+        }
+    }
+}
+
+/// One check as the Details panel lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CheckRun {
+    pub(crate) name: String,
+    pub(crate) state: CheckState,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -95,23 +139,10 @@ impl ChecksSummary {
     fn from_entries(entries: &[CheckEntry]) -> Self {
         let mut summary = Self::default();
         for entry in entries {
-            let outcome = match (&entry.state, &entry.status, &entry.conclusion) {
-                (Some(state), _, _) => match state.as_str() {
-                    "SUCCESS" => Some(true),
-                    "PENDING" | "EXPECTED" => None,
-                    _ => Some(false),
-                },
-                (None, Some(status), _) if status != "COMPLETED" => None,
-                (None, _, Some(conclusion)) => Some(matches!(
-                    conclusion.as_str(),
-                    "SUCCESS" | "NEUTRAL" | "SKIPPED"
-                )),
-                (None, _, None) => None,
-            };
-            match outcome {
-                Some(true) => summary.passing += 1,
-                Some(false) => summary.failing += 1,
-                None => summary.pending += 1,
+            match entry.outcome() {
+                CheckState::Passing => summary.passing += 1,
+                CheckState::Failing => summary.failing += 1,
+                CheckState::Pending => summary.pending += 1,
             }
         }
         summary
@@ -176,6 +207,97 @@ pub(crate) struct PullRequestFile {
     pub(crate) deletions: u64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawComment {
+    #[serde(default)]
+    author: Author,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    created_at: String,
+    /// Hidden on GitHub (spam, off-topic, outdated): not shown here either.
+    #[serde(default)]
+    is_minimized: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReview {
+    #[serde(default)]
+    author: Author,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    state: String,
+    /// `null` on a review that is still pending.
+    #[serde(default)]
+    submitted_at: Option<String>,
+}
+
+/// A comment or review on the pull request's conversation. The body is
+/// GitHub text from anyone who can comment: shown as plain text, never run
+/// or rendered as markup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConversationEntry {
+    pub(crate) author: String,
+    /// "commented", "approved", "requested changes", …
+    pub(crate) verb: &'static str,
+    /// ISO 8601, as GitHub gives it.
+    pub(crate) at: String,
+    pub(crate) body: String,
+}
+
+/// Comments and reviews oldest first, the newest `MAX_CONVERSATION` of them.
+/// A review that is only inline code comments has no body and adds nothing
+/// here, so it is left out; approvals and change requests always show.
+fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<ConversationEntry> {
+    let comments = comments
+        .into_iter()
+        .filter(|comment| !comment.is_minimized)
+        .map(|comment| {
+            (
+                comment.author,
+                "commented",
+                comment.created_at,
+                comment.body,
+            )
+        });
+    let reviews = reviews.into_iter().filter_map(|review| {
+        let verb = match review.state.as_str() {
+            "APPROVED" => "approved",
+            "CHANGES_REQUESTED" => "requested changes",
+            "DISMISSED" => "reviewed (dismissed)",
+            "PENDING" => return None,
+            _ if review.body.trim().is_empty() => return None,
+            _ => "reviewed",
+        };
+        Some((
+            review.author,
+            verb,
+            review.submitted_at.unwrap_or_default(),
+            review.body,
+        ))
+    });
+    let mut entries: Vec<ConversationEntry> = comments
+        .chain(reviews)
+        .map(|(author, verb, at, body)| ConversationEntry {
+            author: author.login,
+            verb,
+            at,
+            body: body
+                .trim()
+                .chars()
+                .take(MAX_CONVERSATION_BODY_CHARS)
+                .collect(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.at.cmp(&b.at));
+    let skip = entries.len().saturating_sub(MAX_CONVERSATION);
+    entries.drain(..skip);
+    entries
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawDetail {
@@ -193,6 +315,8 @@ struct RawDetail {
     #[serde(default)]
     is_draft: bool,
     #[serde(default)]
+    is_cross_repository: bool,
+    #[serde(default)]
     state: String,
     #[serde(default)]
     review_decision: String,
@@ -208,6 +332,10 @@ struct RawDetail {
     files: Vec<PullRequestFile>,
     #[serde(default)]
     status_check_rollup: Vec<CheckEntry>,
+    #[serde(default)]
+    comments: Vec<RawComment>,
+    #[serde(default)]
+    reviews: Vec<RawReview>,
 }
 
 /// Everything the Details panel shows for one pull request.
@@ -223,6 +351,8 @@ pub(crate) struct PullRequestDetail {
     pub(crate) base: String,
     pub(crate) base_oid: String,
     pub(crate) is_draft: bool,
+    /// From a fork: its branch name means nothing in this repository.
+    pub(crate) is_cross_repository: bool,
     /// gh's `OPEN`, `CLOSED` or `MERGED`.
     pub(crate) state: String,
     pub(crate) review: Option<ReviewDecision>,
@@ -234,6 +364,9 @@ pub(crate) struct PullRequestDetail {
     pub(crate) changed_files: u64,
     pub(crate) files: Vec<PullRequestFile>,
     pub(crate) checks: ChecksSummary,
+    /// Failing first, then pending, then passing.
+    pub(crate) check_runs: Vec<CheckRun>,
+    pub(crate) conversation: Vec<ConversationEntry>,
 }
 
 impl PullRequestDetail {
@@ -257,6 +390,7 @@ impl From<RawDetail> for PullRequestDetail {
             base: raw.base_ref_name,
             base_oid: raw.base_ref_oid,
             is_draft: raw.is_draft,
+            is_cross_repository: raw.is_cross_repository,
             state: raw.state,
             review: ReviewDecision::parse(&raw.review_decision),
             mergeable: match raw.mergeable.as_str() {
@@ -269,6 +403,23 @@ impl From<RawDetail> for PullRequestDetail {
             changed_files: raw.changed_files,
             files: raw.files,
             checks: ChecksSummary::from_entries(&raw.status_check_rollup),
+            check_runs: {
+                let mut runs: Vec<CheckRun> = raw
+                    .status_check_rollup
+                    .iter()
+                    .map(|entry| CheckRun {
+                        name: entry
+                            .name
+                            .clone()
+                            .or_else(|| entry.context.clone())
+                            .unwrap_or_else(|| "check".to_string()),
+                        state: entry.outcome(),
+                    })
+                    .collect();
+                runs.sort_by(|a, b| a.state.cmp(&b.state).then_with(|| a.name.cmp(&b.name)));
+                runs
+            },
+            conversation: conversation(raw.comments, raw.reviews),
         }
     }
 }
@@ -293,6 +444,34 @@ impl ReviewKind {
             Self::RequestChanges => "--request-changes",
         }
     }
+}
+
+/// How a pull request lands on its base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Merge => "--merge",
+            Self::Squash => "--squash",
+            Self::Rebase => "--rebase",
+        }
+    }
+}
+
+/// What the merge dialog confirmed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MergeRequest {
+    pub(crate) method: MergeMethod,
+    pub(crate) delete_branch: bool,
+    /// The head the user was shown. GitHub refuses the merge if the branch has
+    /// moved since, so commits nobody saw never land.
+    pub(crate) head_oid: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,8 +578,9 @@ pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullReques
         &number.to_string(),
         &repo_flag(repo),
         "--json=number,title,body,url,author,headRefName,headRefOid,baseRefName,baseRefOid,\
-         isDraft,state,reviewDecision,mergeable,additions,deletions,changedFiles,files,\
-         statusCheckRollup",
+         isDraft,isCrossRepository,state,reviewDecision,mergeable,additions,deletions,\
+         changedFiles,files,\
+         statusCheckRollup,comments,reviews",
     ]);
     let raw: RawDetail = parse_json(&run(command, None)?)?;
     Ok(raw.into())
@@ -441,6 +621,67 @@ pub(crate) fn review(
         command.arg("--body-file=-");
     }
     run(command, (!body.is_empty()).then_some(body)).map(|_| ())
+}
+
+fn checkout_command(workdir: &Path, repo: &str, number: u64, branch: Option<&str>) -> Command {
+    let mut command = gh(workdir);
+    // The git gh runs must fail rather than wait on a prompt nobody sees.
+    command.env("GIT_TERMINAL_PROMPT", "0").args([
+        "pr",
+        "checkout",
+        &number.to_string(),
+        &repo_flag(repo),
+    ]);
+    if let Some(branch) = branch {
+        command.arg(format!("--branch={branch}"));
+    }
+    command
+}
+
+/// Checks the pull request's head out into a local branch in `workdir`, as
+/// `gh pr checkout` does (fetching a fork's branch too). Local only. `branch`
+/// names that local branch; without it gh reuses the head branch's name.
+pub(crate) fn checkout(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+    branch: Option<&str>,
+) -> Result<(), PrError> {
+    run(checkout_command(workdir, repo, number, branch), None).map(|_| ())
+}
+
+fn merge_command(workdir: &Path, repo: &str, number: u64, request: &MergeRequest) -> Command {
+    let mut command = gh(workdir);
+    command.args([
+        "pr",
+        "merge",
+        &number.to_string(),
+        &repo_flag(repo),
+        request.method.flag(),
+        &format!("--match-head-commit={}", request.head_oid),
+    ]);
+    // With `--repo` gh leaves the local repository alone: only the remote
+    // branch goes.
+    if request.delete_branch {
+        command.arg("--delete-branch");
+    }
+    command
+}
+
+/// Merges on GitHub. Nothing here runs without the merge dialog's explicit
+/// confirm.
+pub(crate) fn merge(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+    request: &MergeRequest,
+) -> Result<(), PrError> {
+    if !is_object_id(&request.head_oid) {
+        return Err(PrError::Failed(format!(
+            "#{number}'s head commit isn't known yet"
+        )));
+    }
+    run(merge_command(workdir, repo, number, request), None).map(|_| ())
 }
 
 /// Opens a pull request and returns its URL. Never pushes: `--head` names a
@@ -597,6 +838,119 @@ mod tests {
         assert_eq!(detail.files[0].path, "src/a.rs");
         // Past both limits: 214 files and 20,001 changed lines.
         assert!(detail.too_large_for_app());
+    }
+
+    #[test]
+    fn detail_json_lists_checks_and_the_conversation() {
+        let json = r#"{
+            "number": 9, "title": "t", "url": "u", "headRefName": "h", "headRefOid": "a",
+            "baseRefName": "b", "baseRefOid": "c",
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"__typename": "StatusContext", "context": "ci/deploy", "state": "PENDING"}
+            ],
+            "comments": [
+                {"author": {"login": "bob"}, "body": "Second", "createdAt": "2026-09-02T00:00:00Z"},
+                {"author": {"login": "spam"}, "body": "buy", "createdAt": "2026-09-03T00:00:00Z", "isMinimized": true}
+            ],
+            "reviews": [
+                {"author": {"login": "me"}, "body": "draft", "state": "PENDING", "submittedAt": null},
+                {"author": {"login": "amy"}, "body": "", "state": "APPROVED", "submittedAt": "2026-09-04T00:00:00Z"},
+                {"author": {"login": "cid"}, "body": "", "state": "COMMENTED", "submittedAt": "2026-09-01T00:00:00Z"},
+                {"author": {"login": "dee"}, "body": "First", "state": "COMMENTED", "submittedAt": "2026-09-01T00:00:00Z"}
+            ]
+        }"#;
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.as_bytes())
+            .expect("valid detail")
+            .into();
+        let checks: Vec<_> = detail
+            .check_runs
+            .iter()
+            .map(|run| (run.name.as_str(), run.state))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                ("build", CheckState::Failing),
+                ("ci/deploy", CheckState::Pending),
+                ("lint", CheckState::Passing),
+            ]
+        );
+        // Oldest first; the hidden comment and the body-less inline review drop out.
+        let conversation: Vec<_> = detail
+            .conversation
+            .iter()
+            .map(|entry| (entry.author.as_str(), entry.verb, entry.body.as_str()))
+            .collect();
+        assert_eq!(
+            conversation,
+            [
+                ("dee", "reviewed", "First"),
+                ("bob", "commented", "Second"),
+                ("amy", "approved", ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn checkout_and_merge_name_the_repository_and_never_prompt() {
+        let args = |command: Command| -> Vec<String> {
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            args(checkout_command(Path::new("."), "o/r", 7, None)),
+            ["pr", "checkout", "7", "--repo=github.com/o/r"]
+        );
+        assert_eq!(
+            args(checkout_command(Path::new("."), "o/r", 7, Some("pr/7"))),
+            [
+                "pr",
+                "checkout",
+                "7",
+                "--repo=github.com/o/r",
+                "--branch=pr/7"
+            ]
+        );
+        let head = "a".repeat(40);
+        let request = |method, delete_branch| MergeRequest {
+            method,
+            delete_branch,
+            head_oid: head.clone(),
+        };
+        assert_eq!(
+            args(merge_command(
+                Path::new("."),
+                "o/r",
+                7,
+                &request(MergeMethod::Squash, true)
+            )),
+            [
+                "pr".to_string(),
+                "merge".into(),
+                "7".into(),
+                "--repo=github.com/o/r".into(),
+                "--squash".into(),
+                format!("--match-head-commit={head}"),
+                "--delete-branch".into(),
+            ]
+        );
+        // An unknown head never reaches gh.
+        assert!(
+            merge(
+                Path::new("."),
+                "o/r",
+                7,
+                &MergeRequest {
+                    head_oid: "--admin".into(),
+                    ..request(MergeMethod::Merge, false)
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::github::{
-    self, NewPullRequest, PrError, PullRequestDetail, PullRequestSummary, ReviewKind,
+    self, MergeRequest, NewPullRequest, PrError, PullRequestDetail, PullRequestSummary, ReviewKind,
 };
 use gitcomet_state::model::SidebarMode;
 
@@ -42,11 +42,47 @@ pub(super) struct RepoPullRequests {
     pub(super) selected_file: Option<usize>,
     /// Set while a review or create is with gh.
     pub(super) submitting: bool,
-    /// gh's refusal of the last review or create, shown in its dialog.
+    /// gh's refusal of the last review, create or merge, shown in its dialog.
     pub(super) submit_error: Option<String>,
+    /// The pull request `gh pr checkout` is working on.
+    checking_out: Option<u64>,
     list_seq: u64,
     detail_seq: u64,
     diff_seq: u64,
+}
+
+/// The dialog a gh submit came from, so its outcome reaches that dialog and
+/// no other.
+#[derive(Clone, Copy)]
+enum PrDialog {
+    Review(u64),
+    Create,
+    Merge(u64),
+}
+
+impl PrDialog {
+    fn matches(self, repo_id: RepoId, kind: &PopoverKind) -> bool {
+        match (self, kind) {
+            (
+                Self::Review(number),
+                PopoverKind::PullRequestReview {
+                    repo_id: open,
+                    number: open_number,
+                    ..
+                },
+            )
+            | (
+                Self::Merge(number),
+                PopoverKind::MergePullRequest {
+                    repo_id: open,
+                    number: open_number,
+                    ..
+                },
+            ) => *open == repo_id && *open_number == number,
+            (Self::Create, PopoverKind::CreatePullRequest { repo_id: open }) => *open == repo_id,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -106,10 +142,14 @@ impl GitCometView {
     }
 
     /// The sidebar and details panes are cached views, so a change to pull
-    /// request state has to reach them explicitly.
+    /// request state has to reach them explicitly; so does an open dialog
+    /// that shows it.
     fn notify_pull_request_panes(&mut self, cx: &mut gpui::Context<Self>) {
         self.sidebar_pane.update(cx, |_, cx| cx.notify());
         self.details_pane.update(cx, |_, cx| cx.notify());
+        // Deferred: this also runs inside the host's own submit handler.
+        let host = self.popover_host.clone();
+        cx.defer(move |cx| host.update(cx, |_, cx| cx.notify()));
         cx.notify();
     }
 
@@ -172,13 +212,36 @@ impl GitCometView {
         let entry = self.pull_requests.repo_mut(repo_id);
         entry.selected_file = None;
         entry.submit_error = None;
-        self.load_pull_request_detail(number, cx);
+        // `j`/`k` can pass many pull requests a second, and each load is
+        // several GitHub requests: gh runs for the one the selection settles on.
+        entry.detail_seq += 1;
+        let seq = entry.detail_seq;
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(200))
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                let settled = this
+                    .pull_requests
+                    .repo(repo_id)
+                    .is_some_and(|prs| prs.detail_seq == seq && prs.selected == Some(number));
+                if settled {
+                    this.load_pull_request_detail(repo_id, number, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Fetches `number`'s details, keeping whatever is on screen until they
     /// land; a review reloads this way so the panel does not flash empty.
-    fn load_pull_request_detail(&mut self, number: u64, cx: &mut gpui::Context<Self>) {
-        let Some(target) = self.github_target() else {
+    fn load_pull_request_detail(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
             return;
         };
         let repo_id = target.repo_id;
@@ -440,7 +503,7 @@ impl GitCometView {
                 entry.submitting = false;
                 match result {
                     Ok(()) => {
-                        this.close_pull_request_prompt(cx);
+                        this.close_pull_request_prompt(repo_id, PrDialog::Review(number), cx);
                         let verb = match kind {
                             ReviewKind::Comment => "Commented on",
                             ReviewKind::Approve => "Approved",
@@ -455,17 +518,181 @@ impl GitCometView {
                         );
                         // Pick up the new review decision, unless the user has
                         // moved on to another pull request meanwhile.
-                        if this.pull_requests.repo_mut(repo_id).selected == Some(number)
-                            && this.active_repo_id() == Some(repo_id)
-                        {
-                            this.load_pull_request_detail(number, cx);
-                        }
-                        this.refresh_pull_requests(cx);
+                        this.reload_pull_request(repo_id, number, cx);
                     }
-                    Err(err) => entry.submit_error = Some(err.to_string()),
+                    Err(err) => this.report_pull_request_error(
+                        repo_id,
+                        PrDialog::Review(number),
+                        format!("Couldn't post the review on #{number}: {err}"),
+                        err.to_string(),
+                        cx,
+                    ),
                 }
                 this.notify_pull_request_panes(cx);
                 this.popover_host.update(cx, |_, cx| cx.notify());
+            });
+        })
+        .detach();
+    }
+
+    /// Merges on GitHub. Runs only from the merge dialog's explicit confirm,
+    /// and only onto the head commit the details showed.
+    pub(super) fn submit_pull_request_merge(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        method: github::MergeMethod,
+        delete_branch: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let repo_id = target.repo_id;
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if entry.submitting {
+            return;
+        }
+        let Some(head_oid) = entry
+            .detail
+            .ready()
+            .filter(|detail| detail.number == number)
+            .map(|detail| detail.head_oid.clone())
+        else {
+            entry.submit_error = Some(format!(
+                "#{number} is still loading; merge once its details show."
+            ));
+            self.notify_pull_request_panes(cx);
+            return;
+        };
+        entry.submitting = true;
+        entry.submit_error = None;
+        let slug = target.slug.clone();
+        let request = MergeRequest {
+            method,
+            delete_branch,
+            head_oid,
+        };
+        let task = cx.background_spawn(async move {
+            github::merge(&target.workdir, &target.slug, number, &request)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.pull_requests.repo_mut(repo_id).submitting = false;
+                match result {
+                    Ok(()) => {
+                        this.close_pull_request_prompt(repo_id, PrDialog::Merge(number), cx);
+                        this.push_toast_with_link(
+                            components::ToastKind::Success,
+                            format!("Merged #{number}"),
+                            format!("https://github.com/{slug}/pull/{number}"),
+                            "View on GitHub".to_string(),
+                            cx,
+                        );
+                    }
+                    // gh also fails when the merge went through but deleting
+                    // the branch didn't, so the state is reloaded either way.
+                    Err(err) => this.report_pull_request_error(
+                        repo_id,
+                        PrDialog::Merge(number),
+                        format!("Merging #{number}: gh reported: {err}"),
+                        format!("gh reported: {err}"),
+                        cx,
+                    ),
+                }
+                this.reload_pull_request(repo_id, number, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// After a review or merge: the list, and the details if the user is
+    /// still on that pull request.
+    fn reload_pull_request(&mut self, repo_id: RepoId, number: u64, cx: &mut gpui::Context<Self>) {
+        if self.active_repo_id() != Some(repo_id) {
+            return;
+        }
+        if self.pull_requests.repo_mut(repo_id).selected == Some(number) {
+            self.load_pull_request_detail(repo_id, number, cx);
+        }
+        self.refresh_pull_requests(cx);
+    }
+
+    /// gh's refusal goes into the dialog it came from, or to a toast once that
+    /// dialog is gone.
+    fn report_pull_request_error(
+        &mut self,
+        repo_id: RepoId,
+        dialog: PrDialog,
+        toast: String,
+        in_dialog: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let open = self
+            .popover_host
+            .read(cx)
+            .open_popover_kind()
+            .is_some_and(|kind| dialog.matches(repo_id, kind));
+        if open {
+            self.pull_requests.repo_mut(repo_id).submit_error = Some(in_dialog);
+        } else {
+            self.push_toast(components::ToastKind::Error, toast, cx);
+        }
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// `space`: checks the selected pull request out into a local branch.
+    /// Local only; git refuses it over conflicting uncommitted changes.
+    pub(super) fn checkout_pull_request(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(target) = self.github_target() else {
+            return;
+        };
+        let repo_id = target.repo_id;
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let Some(number) = entry.selected else {
+            return;
+        };
+        if let Some(busy) = entry.checking_out {
+            self.push_toast(
+                components::ToastKind::Warning,
+                format!("Still checking out #{busy}…"),
+                cx,
+            );
+            return;
+        }
+        // A fork's branch name means nothing here: under it gh would
+        // fast-forward a same-named local branch (say `develop`) to the
+        // contributor's commits. Unless the details show the pull request is
+        // from this repository, it gets a branch of its own.
+        let same_repo = entry
+            .detail
+            .ready()
+            .is_some_and(|detail| detail.number == number && !detail.is_cross_repository);
+        let branch = (!same_repo).then(|| format!("pr/{number}"));
+        entry.checking_out = Some(number);
+        let task = cx.background_spawn(async move {
+            github::checkout(&target.workdir, &target.slug, number, branch.as_deref())
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.pull_requests.repo_mut(repo_id).checking_out = None;
+                match result {
+                    Ok(()) => {
+                        this.push_toast(
+                            components::ToastKind::Success,
+                            format!("Checked out #{number}"),
+                            cx,
+                        );
+                        this.store.dispatch(Msg::ReloadRepo { repo_id });
+                    }
+                    Err(err) => this.push_toast(
+                        components::ToastKind::Error,
+                        format!("Couldn't check out #{number}: {err}"),
+                        cx,
+                    ),
+                }
             });
         })
         .detach();
@@ -498,7 +725,7 @@ impl GitCometView {
                 entry.submitting = false;
                 match result {
                     Ok(url) => {
-                        this.close_pull_request_prompt(cx);
+                        this.close_pull_request_prompt(repo_id, PrDialog::Create, cx);
                         this.push_toast_with_link(
                             components::ToastKind::Success,
                             "Pull request created".to_string(),
@@ -508,24 +735,37 @@ impl GitCometView {
                         );
                         this.refresh_pull_requests(cx);
                     }
-                    Err(err) => entry.submit_error = Some(err.to_string()),
+                    Err(err) => this.report_pull_request_error(
+                        repo_id,
+                        PrDialog::Create,
+                        format!("Couldn't create the pull request: {err}"),
+                        err.to_string(),
+                        cx,
+                    ),
                 }
                 this.notify_pull_request_panes(cx);
-                this.popover_host.update(cx, |_, cx| cx.notify());
             });
         })
         .detach();
     }
 
-    /// Closes the review or create dialog after gh accepted it, handing focus
-    /// back where the dialog came from. Leaves any other dialog alone.
-    fn close_pull_request_prompt(&mut self, cx: &mut gpui::Context<Self>) {
+    /// Closes the dialog a gh submit came from after gh accepted it, handing
+    /// focus back where the dialog came from. Leaves any other dialog alone.
+    fn close_pull_request_prompt(
+        &mut self,
+        repo_id: RepoId,
+        dialog: PrDialog,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let host = self.popover_host.clone();
         let window_handle = self.window_handle;
         cx.defer(move |cx| {
             let _ = window_handle.update(cx, |_, window, cx| {
                 host.update(cx, |host, cx| {
-                    if host.pull_request_prompt_open() {
+                    let open = host
+                        .open_popover_kind()
+                        .is_some_and(|kind| dialog.matches(repo_id, kind));
+                    if open {
                         host.close_popover_and_restore_focus(window, cx);
                     }
                 });

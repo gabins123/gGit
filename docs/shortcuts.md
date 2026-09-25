@@ -97,6 +97,9 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. Pull requests over 100 files or 20,000 changed lines are left to GitHub. |
 | New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, and `Ctrl+Enter` (`Cmd+Enter`) creates. |
 | Review | `r` | `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
+| Check out locally | `Space` | Sidebar or Details. Runs `gh pr checkout`, which fetches the branch into a local branch of the same name and checks it out. A pull request from a fork (or one whose details haven't loaded) gets its own `pr/<number>` branch instead, so a same-named local branch is never fast-forwarded to someone else's commits. git refuses over conflicting uncommitted changes. |
+| Merge on GitHub | `Shift+M` | Confirms first. `Alt+M` / `Alt+S` / `Alt+R` pick merge commit, squash or rebase; `Alt+D` also deletes the branch on GitHub (not offered for forks); `Enter` merges. GitHub refuses if the branch moved since its details loaded, so only the commits you saw land. With a required merge queue, GitHub queues it instead. Local branches are left alone. |
+| Scroll the checks and conversation | `Shift+J` / `Shift+K` | Details. Below the changed files it lists each check (failing first) and the comments and reviews, oldest first, as plain text. Hidden comments are left out. |
 | Open on GitHub | `o` | The selected pull request, or the repository's pull request list. |
 | Refresh | `Shift+R` | The list loads when the tab first shows; there is no polling. |
 

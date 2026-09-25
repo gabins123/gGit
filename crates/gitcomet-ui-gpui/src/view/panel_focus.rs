@@ -442,18 +442,19 @@ impl GitCometView {
                     return &[
                         ("j/k", "PR"),
                         ("enter", "diff"),
-                        ("n", "new"),
+                        ("space", "checkout"),
                         ("r", "review"),
+                        ("M", "merge"),
                         ("o", "GitHub"),
-                        ("R", "refresh"),
                     ];
                 }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
                         ("j/k", "file"),
+                        ("J/K", "scroll"),
                         ("enter", "diff"),
                         ("r", "review"),
-                        ("o", "GitHub"),
+                        ("M", "merge"),
                     ];
                 }
                 _ => {}
@@ -472,8 +473,10 @@ impl GitCometView {
                     return &[
                         ("j / k", "Next / previous pull request"),
                         ("enter", "Open its diff"),
+                        ("space", "Check it out locally"),
                         ("n", "New pull request"),
                         ("r", "Review the selected pull request"),
+                        ("M", "Merge it on GitHub"),
                         ("o", "Open on GitHub"),
                         ("R", "Refresh the list"),
                         ("[ / ]", "Branches / Files / Pull requests tab"),
@@ -482,8 +485,11 @@ impl GitCometView {
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
                         ("j / k", "Next / previous file"),
+                        ("J / K", "Scroll the checks and conversation"),
                         ("enter", "Open the file's diff"),
+                        ("space", "Check it out locally"),
                         ("r", "Review"),
+                        ("M", "Merge it on GitHub"),
                         ("o", "Open on GitHub"),
                     ];
                 }
@@ -887,11 +893,34 @@ impl GitCometView {
             self.refresh_pull_requests(cx);
             return Some(true);
         }
-        if shift {
-            return None;
-        }
         let selected = self.active_pull_requests().and_then(|prs| prs.selected);
         let in_details = current == Some(FocusPanel::Details) && self.pull_request_details_active();
+        if shift {
+            return match key.to_ascii_lowercase().as_str() {
+                "m" => {
+                    let number = selected?;
+                    self.open_pull_request_prompt(
+                        PopoverKind::MergePullRequest {
+                            repo_id,
+                            number,
+                            method: crate::github::MergeMethod::Merge,
+                        },
+                        window,
+                        cx,
+                    );
+                    Some(true)
+                }
+                // lazygit's main-panel scroll: checks and conversation.
+                direction @ ("j" | "k") if in_details => {
+                    let direction = if direction == "j" { 1 } else { -1 };
+                    self.details_pane.update(cx, |pane, cx| {
+                        pane.scroll_pull_request_details(direction, cx)
+                    });
+                    Some(true)
+                }
+                _ => None,
+            };
+        }
         let direction = match key {
             "j" | "down" => 1,
             "k" | "up" => -1,
@@ -904,6 +933,10 @@ impl GitCometView {
             }
             (Some(FocusPanel::Details), _) if direction != 0 && in_details => {
                 self.select_adjacent_pull_request_file(direction, cx);
+                Some(true)
+            }
+            (Some(FocusPanel::Sidebar | FocusPanel::Details), "space") if selected.is_some() => {
+                self.checkout_pull_request(cx);
                 Some(true)
             }
             (Some(from @ (FocusPanel::Sidebar | FocusPanel::Details)), "enter")

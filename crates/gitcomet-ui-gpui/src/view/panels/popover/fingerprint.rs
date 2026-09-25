@@ -167,6 +167,7 @@ fn repo_for_popover<'a>(state: &'a AppState, popover: &PopoverKind) -> Option<&'
         // Popovers that carry an explicit repo id.
         PopoverKind::CommitPrompt { repo_id }
         | PopoverKind::PullRequestReview { repo_id, .. }
+        | PopoverKind::MergePullRequest { repo_id, .. }
         | PopoverKind::CreatePullRequest { repo_id }
         | PopoverKind::StashPickerPrompt { repo_id, .. }
         | PopoverKind::UpstreamPicker { repo_id, .. }
@@ -483,7 +484,8 @@ fn hash_repo_for_popover<H: Hasher>(repo: &RepoState, popover: &PopoverKind, has
         | PopoverKind::ReflogEntryMenu { .. }
         | PopoverKind::CommitPrompt { .. }
         // Its gh state lives in the root view, which notifies the host itself.
-        | PopoverKind::PullRequestReview { .. } => {}
+        | PopoverKind::PullRequestReview { .. }
+        | PopoverKind::MergePullRequest { .. } => {}
     }
 }
 
@@ -951,6 +953,16 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
         PopoverKind::CreatePullRequest { repo_id } => {
             121u8.hash(hasher);
             repo_id.hash(hasher);
+        }
+        PopoverKind::MergePullRequest {
+            repo_id,
+            number,
+            method,
+        } => {
+            122u8.hash(hasher);
+            repo_id.hash(hasher);
+            number.hash(hasher);
+            method.hash(hasher);
         }
         PopoverKind::StashPickerPrompt { repo_id, purpose } => {
             74u8.hash(hasher);

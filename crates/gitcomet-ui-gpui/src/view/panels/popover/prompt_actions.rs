@@ -118,6 +118,9 @@ impl PopoverHost {
             PopoverKind::CreatePullRequest { repo_id } => {
                 create_pull_request_prompt::panel(self, repo_id, cx)
             }
+            PopoverKind::MergePullRequest { number, method, .. } => {
+                merge_pull_request_prompt::panel(self, number, method, cx)
+            }
             PopoverKind::Repo { repo_id, kind } => match kind {
                 RepoPopoverKind::Remote(remote_kind) => match remote_kind {
                     RemotePopoverKind::AddPrompt => remote_add_prompt::panel(self, repo_id, cx),

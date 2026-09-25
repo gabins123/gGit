@@ -1029,6 +1029,8 @@ impl PopoverHost {
             pull_request_body_input,
             pull_request_body_scroll,
             pull_request_draft: false,
+            pull_request_delete_branch: false,
+            pull_request_merge_focus_handle: cx.focus_handle().tab_index(0).tab_stop(true),
             remote_add_focus,
             remote_edit_focus,
             push_upstream_focus,
@@ -1841,11 +1843,58 @@ impl PopoverHost {
         cx.notify();
     }
 
-    pub(in crate::view) fn pull_request_prompt_open(&self) -> bool {
-        matches!(
-            self.popover,
-            Some(PopoverKind::PullRequestReview { .. } | PopoverKind::CreatePullRequest { .. })
-        )
+    pub(in crate::view) fn open_popover_kind(&self) -> Option<&PopoverKind> {
+        self.popover.as_ref()
+    }
+
+    /// The open pull request dialog's repository state, not the active tab's:
+    /// the tab can change under an open dialog.
+    fn open_pull_request_state<R>(
+        &self,
+        cx: &mut gpui::Context<Self>,
+        read: impl FnOnce(&crate::view::pull_requests::RepoPullRequests) -> R,
+    ) -> Option<R> {
+        let repo_id = match self.popover {
+            Some(
+                PopoverKind::PullRequestReview { repo_id, .. }
+                | PopoverKind::CreatePullRequest { repo_id }
+                | PopoverKind::MergePullRequest { repo_id, .. },
+            ) => repo_id,
+            _ => return None,
+        };
+        let root = self.root_view.upgrade()?;
+        root.read(cx).pull_requests.repo(repo_id).map(read)
+    }
+
+    pub(super) fn set_pull_request_merge_method(
+        &mut self,
+        next: crate::github::MergeMethod,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(PopoverKind::MergePullRequest { method, .. }) = self.popover.as_mut()
+            && *method != next
+        {
+            *method = next;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_pull_request_delete_branch(&mut self, cx: &mut gpui::Context<Self>) {
+        if matches!(self.popover, Some(PopoverKind::MergePullRequest { .. })) {
+            self.pull_request_delete_branch = !self.pull_request_delete_branch;
+            cx.notify();
+        }
+    }
+
+    /// The pull request being merged, once its details are in.
+    pub(super) fn pull_request_merge_detail(
+        &self,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<Arc<crate::github::PullRequestDetail>> {
+        self.open_pull_request_state(cx, |prs| prs.detail.ready().cloned())
+            .flatten()
+            .filter(|detail| detail.number == number)
     }
 
     pub(super) fn toggle_pull_request_draft(&mut self, cx: &mut gpui::Context<Self>) {
@@ -1885,22 +1934,13 @@ impl PopoverHost {
     }
 
     pub(super) fn pull_request_submitting(&self, cx: &mut gpui::Context<Self>) -> bool {
-        self.root_view
-            .upgrade()
-            .and_then(|root| {
-                root.read(cx)
-                    .active_pull_requests()
-                    .map(|prs| prs.submitting)
-            })
+        self.open_pull_request_state(cx, |prs| prs.submitting)
             .unwrap_or(false)
     }
 
     pub(super) fn pull_request_submit_error(&self, cx: &mut gpui::Context<Self>) -> Option<String> {
-        self.root_view.upgrade().and_then(|root| {
-            root.read(cx)
-                .active_pull_requests()
-                .and_then(|prs| prs.submit_error.clone())
-        })
+        self.open_pull_request_state(cx, |prs| prs.submit_error.clone())
+            .flatten()
     }
 
     /// `ctrl+enter` or the submit button. Posting is always this explicit step.
@@ -1955,6 +1995,20 @@ impl PopoverHost {
                             .root_view
                             .update(cx, |root, cx| root.submit_new_pull_request(repo_id, pr, cx));
                     }
+                }
+                true
+            }
+            Some(PopoverKind::MergePullRequest {
+                repo_id,
+                number,
+                method,
+            }) => {
+                cx.notify();
+                if !self.pull_request_submitting(cx) {
+                    let delete_branch = self.pull_request_delete_branch;
+                    let _ = self.root_view.update(cx, |root, cx| {
+                        root.submit_pull_request_merge(repo_id, number, method, delete_branch, cx)
+                    });
                 }
                 true
             }
@@ -3377,6 +3431,11 @@ impl PopoverHost {
                     // Focus the primary (Rebase) button so Enter confirms and
                     // Tab/Esc still reach Cancel.
                     window.focus(&self.rebase_onto_submit_focus_handle, cx);
+                }
+                PopoverKind::MergePullRequest { .. } => {
+                    // Enter merges; deleting the branch is always opted into.
+                    self.pull_request_delete_branch = false;
+                    window.focus(&self.pull_request_merge_focus_handle, cx);
                 }
                 // Must sit above the generic confirm-dialog arm below, which
                 // would otherwise swallow it and park focus on the tab group

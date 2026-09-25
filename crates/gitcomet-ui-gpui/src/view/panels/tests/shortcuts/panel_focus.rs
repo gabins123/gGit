@@ -55,6 +55,21 @@ fn press(cx: &mut gpui::VisualTestContext, keys: &str) {
     draw_and_drain_test_window(cx);
 }
 
+/// A full press and release: a focused button clicks on the key-up, which
+/// `simulate_keystrokes` never sends.
+fn tap(cx: &mut gpui::VisualTestContext, key: &str) {
+    cx.simulate_keystrokes(key);
+    cx.update(|window, app| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).expect("valid key"),
+            }),
+            app,
+        );
+    });
+    draw_and_drain_test_window(cx);
+}
+
 fn focused(cx: &mut gpui::VisualTestContext, view: &View) -> Option<FocusPanel> {
     cx.update(|window, app| view.read(app).focused_panel(window, app))
 }
@@ -280,6 +295,43 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
         &PopoverKind::CreatePullRequest { repo_id: REPO }
     ));
     press(cx, "escape");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+
+    // Merging opens a confirm dialog whose method switches on Alt chords;
+    // nothing reaches gh until Enter.
+    let merge = |method| PopoverKind::MergePullRequest {
+        repo_id: REPO,
+        number: 7,
+        method,
+    };
+    press(cx, "shift-m");
+    assert!(popover_open(
+        cx,
+        &view,
+        &merge(crate::github::MergeMethod::Merge)
+    ));
+    press(cx, "alt-s");
+    assert!(popover_open(
+        cx,
+        &view,
+        &merge(crate::github::MergeMethod::Squash)
+    ));
+    let submit_error = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_pull_requests()
+                .and_then(|prs| prs.submit_error.clone())
+        })
+    };
+    // Space is the checkout key, not a second way to merge.
+    tap(cx, "space");
+    assert_eq!(submit_error(cx), None);
+    // Enter merges, but only onto a head the details have shown; they never
+    // loaded here, so it stops before gh.
+    tap(cx, "enter");
+    assert!(submit_error(cx).is_some_and(|error| error.contains("still loading")));
+    press(cx, "escape");
+    assert!(!popover_is_open(cx, &view));
     assert_eq!(focused(cx, &view), Some(Sidebar));
 }
 

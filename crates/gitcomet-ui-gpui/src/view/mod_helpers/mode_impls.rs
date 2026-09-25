@@ -156,6 +156,12 @@ pub(crate) enum PopoverKind {
     CreatePullRequest {
         repo_id: RepoId,
     },
+    /// Merge a GitHub pull request through gh.
+    MergePullRequest {
+        repo_id: RepoId,
+        number: u64,
+        method: crate::github::MergeMethod,
+    },
     Repo {
         repo_id: RepoId,
         kind: RepoPopoverKind,

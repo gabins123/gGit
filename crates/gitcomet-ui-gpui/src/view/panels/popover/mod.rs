@@ -28,6 +28,7 @@ mod force_remove_worktree_confirm;
 mod hook_activity;
 mod merge_abort_confirm;
 mod merge_commit_confirm;
+mod merge_pull_request_prompt;
 mod picker_nav;
 mod picker_row_menu;
 mod pull_reconcile_prompt;
@@ -368,6 +369,8 @@ pub(in super::super) struct PopoverHost {
     pull_request_body_input: Entity<components::TextInput>,
     pull_request_body_scroll: ScrollHandle,
     pull_request_draft: bool,
+    pull_request_delete_branch: bool,
+    pull_request_merge_focus_handle: FocusHandle,
     remote_add_focus: DialogFocus,
     remote_edit_focus: DialogFocus,
     push_upstream_focus: DialogFocus,
@@ -548,6 +551,7 @@ fn popover_is_confirm_dialog(kind: &PopoverKind) -> bool {
     matches!(
         kind,
         PopoverKind::StashDropConfirm { .. }
+            | PopoverKind::MergePullRequest { .. }
             | PopoverKind::ForcePushConfirm { .. }
             | PopoverKind::CherryPickCommitConfirm { .. }
             | PopoverKind::RevertCommitConfirm { .. }
@@ -894,6 +898,7 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::RenameBranchPrompt { .. }
         | PopoverKind::CheckoutRemoteBranchPrompt { .. }
         | PopoverKind::PullRequestReview { .. }
+        | PopoverKind::MergePullRequest { .. }
         | PopoverKind::CreatePullRequest { .. } => Some(DIALOG_540_WIDTH),
         PopoverKind::StashDropConfirm { .. }
         | PopoverKind::Repo {
