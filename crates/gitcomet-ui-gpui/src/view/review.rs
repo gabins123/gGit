@@ -7,7 +7,7 @@
 
 use super::panel_focus::FocusPanel;
 use super::*;
-use crate::github::{ReviewAnchor, ReviewComment, ReviewSide};
+use crate::github::{ReplyTarget, ReviewAnchor, ReviewComment, ReviewSide, ReviewThread};
 use gitcomet_state::model::SidebarMode;
 
 /// A pending review as saved on disk.
@@ -117,6 +117,9 @@ pub(super) struct ReviewMode {
     /// only a newer one than the last written lands, so the file always ends
     /// on the latest draft.
     write_seq: u64,
+    /// Review threads already on GitHub, loaded when review mode opens.
+    pub(super) threads: Vec<ReviewThread>,
+    threads_loading: bool,
     written_seq: std::sync::Arc<std::sync::Mutex<u64>>,
 }
 
@@ -130,6 +133,14 @@ impl ReviewMode {
             .comments
             .iter()
             .filter(|comment| comment.anchor.path == path)
+            .count()
+    }
+
+    /// Threads on lines of `path`: the ones `t` reaches and Details shows.
+    pub(super) fn threads_on(&self, path: &str) -> usize {
+        self.threads
+            .iter()
+            .filter(|thread| thread.path == path && thread.line.is_some())
             .count()
     }
 
@@ -249,12 +260,15 @@ impl GitCometView {
             armed_delete: None,
             write_seq: 0,
             written_seq: Default::default(),
+            threads: Vec::new(),
+            threads_loading: !cfg!(test),
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
             cx.notify();
         });
         self.review_open_file(file_ix, cx);
+        self.load_review_threads(cx);
         self.diff_return_panel = FocusPanel::Sidebar;
         self.focus_diff_when_open = true;
     }
@@ -313,16 +327,19 @@ impl GitCometView {
         self.notify_pull_request_panes(cx);
     }
 
-    /// After gh accepted the review: exactly the comments that went up leave
-    /// the draft. Any added while it was posting stay pending, and review mode
-    /// stays for them; otherwise the draft goes and review mode closes.
+    /// After a submit: exactly the comments and replies that reached GitHub
+    /// leave the draft. When the review itself went up and nothing is left,
+    /// the draft goes and review mode closes; replies posted on their own
+    /// leave the review, and its viewed files, as they were. Returns how many
+    /// pending comments remain.
     pub(super) fn finish_review(
         &mut self,
         repo_id: RepoId,
         number: u64,
         submitted: &[ReviewComment],
+        review_posted: bool,
         cx: &mut gpui::Context<Self>,
-    ) {
+    ) -> usize {
         let is_submitted = |comment: &ReviewComment| submitted.contains(comment);
         let Some(review) = self
             .review
@@ -335,7 +352,7 @@ impl GitCometView {
                 && let Ok(Some(mut draft)) = ReviewDraft::load(&repo, number)
             {
                 draft.comments.retain(|comment| !is_submitted(comment));
-                if draft.comments.is_empty() {
+                if review_posted && draft.comments.is_empty() {
                     draft.viewed.clear();
                 }
                 if let (Some(file), Ok(contents)) =
@@ -343,8 +360,9 @@ impl GitCometView {
                 {
                     let _ = write_draft(&file, contents.as_deref());
                 }
+                return draft.comments.len();
             }
-            return;
+            return 0;
         };
         review
             .draft
@@ -352,20 +370,11 @@ impl GitCometView {
             .retain(|comment| !is_submitted(comment));
         review.selected_comment = None;
         let remaining = review.draft.comments.len();
-        if remaining > 0 {
+        if remaining > 0 || !review_posted {
             self.save_review(cx);
             self.sync_review_marks(cx);
             self.notify_pull_request_panes(cx);
-            self.push_toast(
-                components::ToastKind::Warning,
-                format!(
-                    "{remaining} comment{} added while it was posting {} still pending.",
-                    if remaining == 1 { "" } else { "s" },
-                    if remaining == 1 { "is" } else { "are" }
-                ),
-                cx,
-            );
-            return;
+            return remaining;
         }
         review.draft.viewed.clear();
         self.save_review(cx);
@@ -373,6 +382,7 @@ impl GitCometView {
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = false;
             pane.review_marks.clear();
+            pane.review_thread_marks.clear();
             cx.notify();
         });
         if self.active_repo_id() == Some(repo_id) {
@@ -390,6 +400,7 @@ impl GitCometView {
             });
         }
         self.notify_pull_request_panes(cx);
+        0
     }
 
     /// Shows file `ix` of the review, fetching the pull request's commits the
@@ -499,8 +510,171 @@ impl GitCometView {
         .detach();
     }
 
-    /// The shown file's pending comment lines, for the diff's gutter marks.
+    /// Fetches the review threads already on GitHub, for their marks, `t`
+    /// and replies. Tests never run gh.
+    fn load_review_threads(&mut self, cx: &mut gpui::Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let (repo_id, number) = (review.repo_id, review.number);
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            crate::github::list_review_threads(&target.workdir, &target.slug, number)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                if let Some(review) = this
+                    .review
+                    .as_mut()
+                    .filter(|review| review.repo_id == repo_id && review.number == number)
+                {
+                    review.threads_loading = false;
+                    if let Ok(threads) = &result {
+                        review.threads = threads.clone();
+                    }
+                }
+                if let Err(err) = result {
+                    this.push_toast(
+                        components::ToastKind::Warning,
+                        format!("Couldn't load the review threads of #{number}: {err}"),
+                        cx,
+                    );
+                }
+                this.sync_review_marks(cx);
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The threads already on GitHub on the line under the cursor, oldest
+    /// first. Two reviewers often start one each on the same line.
+    pub(super) fn review_threads_at_cursor(&self, cx: &App) -> Vec<&ReviewThread> {
+        let Some(review) = self.active_review() else {
+            return Vec::new();
+        };
+        let (Some(path), true) = (review.current_path(), self.review_diff_shown()) else {
+            return Vec::new();
+        };
+        let Some(row) = self.main_pane.read(cx).review_cursor_row() else {
+            return Vec::new();
+        };
+        threads_on_row(&review.threads, path, row.old_line, row.new_line)
+    }
+
+    /// Details shows the thread under the cursor; the cursor lives in the
+    /// diff, so a move repaints Details once the diff has moved it.
+    fn notify_review_details_after_move(&self, cx: &mut gpui::Context<Self>) {
+        let details = self.details_pane.clone();
+        cx.defer(move |cx| details.update(cx, |_, cx| cx.notify()));
+    }
+
+    /// `t`/`T`: the next or previous thread of the shown file.
+    fn review_step_thread(&mut self, direction: i8, cx: &mut gpui::Context<Self>) {
+        let Some(review) = self.active_review() else {
+            return;
+        };
+        let Some(path) = review.current_path() else {
+            return;
+        };
+        let targets: Vec<(ReviewSide, u32)> = review
+            .threads
+            .iter()
+            .filter(|thread| thread.path == path)
+            .filter_map(|thread| Some((thread.side, thread.line?)))
+            .collect();
+        if targets.is_empty() {
+            let message = if review.threads_loading {
+                "Still loading the threads."
+            } else {
+                "No threads on this file's lines."
+            };
+            self.push_toast(components::ToastKind::Warning, message.to_string(), cx);
+            return;
+        }
+        if !self.review_diff_shown() {
+            return;
+        }
+        self.defer_pane_action(self.main_pane.clone(), cx, move |pane, _, cx| {
+            pane.review_step_to(&targets, direction, cx)
+        });
+        self.notify_review_details_after_move(cx);
+    }
+
+    /// `r` in the diff: a reply to the thread on the line under the cursor.
+    fn review_reply_at_cursor(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let Some((repo_id, number)) = self
+            .active_review()
+            .map(|review| (review.repo_id, review.number))
+        else {
+            return;
+        };
+        // Several threads on the line: the one talked in most recently.
+        let thread = self
+            .review_threads_at_cursor(cx)
+            .into_iter()
+            .max_by_key(|thread| thread.comments.last().map(|comment| comment.at.clone()));
+        let Some(thread) = thread else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "No thread on this line. c comments on it; t goes to the next thread.".to_string(),
+                cx,
+            );
+            return;
+        };
+        let Some(line) = thread.line else {
+            return;
+        };
+        let anchor = ReviewAnchor {
+            path: thread.path.clone(),
+            side: thread.side,
+            line,
+            start: None,
+        };
+        let reply_to = ReplyTarget {
+            id: thread.root_id,
+            author: thread
+                .comments
+                .first()
+                .map(|comment| comment.author.clone())
+                .unwrap_or_default(),
+        };
+        self.open_review_composer(
+            repo_id,
+            number,
+            anchor,
+            None,
+            Some(reply_to),
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// The shown file's pending comment lines and thread lines, for the
+    /// diff's gutter marks.
     fn sync_review_marks(&mut self, cx: &mut gpui::Context<Self>) {
+        let threads: rustc_hash::FxHashSet<(ReviewSide, u32)> = self
+            .review
+            .as_ref()
+            .and_then(|review| {
+                let path = review.current_path()?;
+                Some(
+                    review
+                        .threads
+                        .iter()
+                        .filter(|thread| thread.path == path)
+                        .filter_map(|thread| Some((thread.side, thread.line?)))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
         let marks: rustc_hash::FxHashSet<(ReviewSide, u32)> = self
             .review
             .as_ref()
@@ -519,6 +693,7 @@ impl GitCometView {
             .unwrap_or_default();
         self.main_pane.update(cx, |pane, cx| {
             pane.review_marks = marks;
+            pane.review_thread_marks = threads;
             cx.notify();
         });
     }
@@ -540,8 +715,21 @@ impl GitCometView {
             );
             return;
         }
-        match self.main_pane.read(cx).review_selection_anchor(&path) {
-            Ok(anchor) => self.open_review_composer(repo_id, number, anchor, None, window, cx),
+        let main = self.main_pane.read(cx);
+        let anchor = main.review_selection_anchor(&path);
+        // A suggestion replaces lines of the new version only.
+        let head_side_only = anchor.as_ref().is_ok_and(|anchor| {
+            anchor.side == ReviewSide::Right
+                && anchor
+                    .start
+                    .is_none_or(|(side, _)| side == ReviewSide::Right)
+        });
+        let suggestion = head_side_only
+            .then(|| main.review_selection_new_text())
+            .flatten();
+        match anchor {
+            Ok(anchor) => self
+                .open_review_composer(repo_id, number, anchor, None, None, suggestion, window, cx),
             Err(message) => {
                 self.push_toast(components::ToastKind::Warning, message.to_string(), cx)
             }
@@ -554,6 +742,8 @@ impl GitCometView {
         number: u64,
         anchor: ReviewAnchor,
         edit: Option<usize>,
+        reply_to: Option<ReplyTarget>,
+        suggestion: Option<String>,
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
@@ -564,14 +754,18 @@ impl GitCometView {
                 number,
                 anchor,
                 edit,
+                reply_to,
             },
             window,
             cx,
         );
-        if let Some(text) = prefill {
-            self.popover_host
-                .update(cx, |host, cx| host.prefill_review_comment(text, cx));
-        }
+        // Set after the dialog opens: it can't read the root while opening.
+        self.popover_host.update(cx, |host, cx| {
+            host.set_review_suggestion(suggestion, cx);
+            if let Some(text) = prefill {
+                host.prefill_review_comment(text, cx);
+            }
+        });
     }
 
     /// The composer's ctrl+enter: adds the comment, or replaces the one being
@@ -583,6 +777,7 @@ impl GitCometView {
         anchor: ReviewAnchor,
         body: String,
         edit: Option<usize>,
+        reply_to: Option<ReplyTarget>,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
         let Some(review) = self
@@ -595,6 +790,7 @@ impl GitCometView {
         let comment = ReviewComment {
             anchor,
             body: body.trim_end().to_string(),
+            reply_to,
         };
         let ix = match edit.filter(|ix| *ix < review.draft.comments.len()) {
             Some(ix) => {
@@ -735,12 +931,14 @@ impl GitCometView {
             review.needs_cursor = false;
         }
         let main = self.main_pane.clone();
+        let details = self.details_pane.clone();
         let view = cx.entity();
         window.defer(cx, move |_window, cx| {
             let landed = main.update(cx, |pane, cx| match jump {
                 Some((side, line)) => pane.review_jump_to(side, line, cx),
                 None => pane.review_cursor_to_start(cx),
             });
+            details.update(cx, |_, cx| cx.notify());
             if !landed && jump.is_some() {
                 view.update(cx, |this, cx| {
                     this.push_toast(
@@ -781,9 +979,12 @@ impl GitCometView {
             (_, "s", true) => self.open_review_submit(window, cx),
             // History is hidden while reviewing; the diff stays.
             (_, "2", false) => {}
-            // Replies arrive with threads; until then `r` does nothing here
-            // rather than start another review.
+            (Some(FocusPanel::Diff), "r", false) => self.review_reply_at_cursor(window, cx),
+            // Elsewhere `r` does nothing rather than start another review.
             (_, "r", false) => {}
+            (Some(FocusPanel::Diff), "t", _) => {
+                self.review_step_thread(if shift { -1 } else { 1 }, cx)
+            }
             (_, "]", false) => self.review_step_file(1, cx),
             (_, "[", false) => self.review_step_file(-1, cx),
             // After the jump the range is gone; collapsing it back onto the
@@ -794,6 +995,7 @@ impl GitCometView {
                     pane.review_collapse_selection(cx);
                     moved
                 });
+                self.notify_review_details_after_move(cx);
             }
             (Some(FocusPanel::Diff), "{", _) | (Some(FocusPanel::Diff), "[", true) => {
                 self.defer_pane_action(self.main_pane.clone(), cx, |pane, _, cx| {
@@ -801,12 +1003,14 @@ impl GitCometView {
                     pane.review_collapse_selection(cx);
                     moved
                 });
+                self.notify_review_details_after_move(cx);
             }
             (Some(FocusPanel::Diff), _, _) if direction != 0 => {
                 if shown {
                     self.defer_pane_action(self.main_pane.clone(), cx, move |pane, _, cx| {
                         pane.review_move_cursor(i32::from(direction), shift, cx)
                     });
+                    self.notify_review_details_after_move(cx);
                 }
             }
             (Some(FocusPanel::Diff), "c", false) => self.review_comment_at_cursor(window, cx),
@@ -836,11 +1040,26 @@ impl GitCometView {
             (Some(FocusPanel::Details), "e", false) => {
                 let picked = self.active_review().and_then(|review| {
                     let ix = review.selected_comment?;
-                    let anchor = review.draft.comments.get(ix)?.anchor.clone();
-                    Some((review.repo_id, review.number, ix, anchor))
+                    let comment = review.draft.comments.get(ix)?;
+                    Some((
+                        review.repo_id,
+                        review.number,
+                        ix,
+                        comment.anchor.clone(),
+                        comment.reply_to.clone(),
+                    ))
                 });
-                if let Some((repo_id, number, ix, anchor)) = picked {
-                    self.open_review_composer(repo_id, number, anchor, Some(ix), window, cx);
+                if let Some((repo_id, number, ix, anchor, reply_to)) = picked {
+                    self.open_review_composer(
+                        repo_id,
+                        number,
+                        anchor,
+                        Some(ix),
+                        reply_to,
+                        None,
+                        window,
+                        cx,
+                    );
                 }
             }
             (Some(FocusPanel::Details), "d", false) => {
@@ -883,5 +1102,99 @@ impl GitCometView {
             window,
             cx,
         );
+    }
+}
+
+/// The threads on a diff row of `path`: a base-side thread by the row's old
+/// line, a head-side one by its new line. Outdated threads have no line.
+fn threads_on_row<'a>(
+    threads: &'a [ReviewThread],
+    path: &str,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+) -> Vec<&'a ReviewThread> {
+    threads
+        .iter()
+        .filter(|thread| {
+            thread.path == path
+                && thread.line.is_some_and(|line| match thread.side {
+                    ReviewSide::Left => old_line == Some(line),
+                    ReviewSide::Right => new_line == Some(line),
+                })
+        })
+        .collect()
+}
+
+/// Whether a submit posts a review at all. Pending replies post on their own
+/// threads; with nothing else to say (a Comment with no summary and no line
+/// comments), there's no review to post around them.
+pub(super) fn review_needed(
+    kind: crate::github::ReviewKind,
+    body: &str,
+    line_comments: usize,
+    replies: usize,
+) -> bool {
+    replies == 0
+        || line_comments > 0
+        || kind != crate::github::ReviewKind::Comment
+        || !body.trim().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::{ReviewKind, ThreadComment};
+
+    #[test]
+    fn a_review_posts_unless_only_replies_remain_with_nothing_to_say() {
+        use ReviewKind::*;
+        let cases = [
+            (Comment, "", 0, 0, true),
+            (Comment, "", 2, 0, true),
+            (Comment, "", 0, 1, false),
+            (Comment, "  ", 0, 1, false),
+            (Comment, "summary", 0, 1, true),
+            (Comment, "", 1, 1, true),
+            (Approve, "", 0, 1, true),
+            (RequestChanges, "why", 0, 1, true),
+        ];
+        for (kind, body, lines, replies, posts) in cases {
+            assert_eq!(
+                review_needed(kind, body, lines, replies),
+                posts,
+                "{kind:?} {body:?} {lines} {replies}"
+            );
+        }
+    }
+
+    #[test]
+    fn threads_match_a_row_by_their_own_side() {
+        let thread = |root_id, side, line| ReviewThread {
+            root_id,
+            path: "a.rs".into(),
+            side,
+            line,
+            comments: vec![ThreadComment {
+                author: "octo".into(),
+                body: "?".into(),
+                at: String::new(),
+            }],
+        };
+        let threads = [
+            thread(1, ReviewSide::Right, Some(7)),
+            thread(2, ReviewSide::Left, Some(6)),
+            thread(3, ReviewSide::Right, Some(7)),
+            thread(4, ReviewSide::Right, None),
+        ];
+        let ids = |old_line, new_line| {
+            threads_on_row(&threads, "a.rs", old_line, new_line)
+                .into_iter()
+                .map(|thread| thread.root_id)
+                .collect::<Vec<_>>()
+        };
+        // A split-view pair carries both an old and a new line.
+        assert_eq!(ids(Some(6), Some(7)), [1, 2, 3]);
+        assert_eq!(ids(None, Some(7)), [1, 3]);
+        assert_eq!(ids(Some(7), None), Vec::<u64>::new());
     }
 }

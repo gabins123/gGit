@@ -3155,7 +3155,7 @@ impl SidebarPaneView {
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
             };
-            let rows: Vec<(String, bool, usize)> = review
+            let rows: Vec<(String, bool, usize, usize)> = review
                 .files
                 .iter()
                 .map(|path| {
@@ -3163,110 +3163,126 @@ impl SidebarPaneView {
                         path.clone(),
                         review.draft.viewed.contains(path),
                         review.comments_on(path),
+                        review.threads_on(path),
                     )
                 })
                 .collect();
             (review.number, review.title.clone(), review.file_ix, rows)
         };
-        let viewed = rows.iter().filter(|(_, viewed, _)| *viewed).count();
+        let viewed = rows.iter().filter(|(_, viewed, ..)| *viewed).count();
         let total = rows.len();
         let secondary = theme.colors.foreground.secondary;
         let success = theme.colors.status.success.foreground;
         let warning = theme.colors.status.warning.foreground;
 
-        let file_rows = rows
-            .into_iter()
-            .enumerate()
-            .map(|(ix, (path, is_viewed, comments))| {
-                let name = path
-                    .rsplit_once('/')
-                    .map_or(path.as_str(), |(_, name)| name);
-                div()
-                    .id(SharedString::from(format!("review_file_{ix}")))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .mx_1()
-                    .px_2()
-                    .py(px(4.0))
-                    .rounded(px(theme.radii.control))
-                    .control_interaction(
-                        controls::InteractionStyle::new(theme),
-                        controls::InteractionState::default()
-                            .selected(ix == current, theme.colors.interaction.selected_background),
-                    )
-                    .on_activate(
-                        false,
-                        controls::ControlActivation::Composite,
-                        cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            window.focus(&this.panel_focus_handle, cx);
-                            // The root repaints this pane; it can't while we're mid-update.
-                            let root = this.root_view.clone();
-                            cx.defer(move |cx| {
-                                let _ = root.update(cx, |root, cx| root.review_open_file(ix, cx));
-                            });
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(3.0))
-                            .border_1()
-                            .border_color(if is_viewed { success } else { secondary })
-                            .when(is_viewed, |check| {
-                                check.bg(success).child(crate::view::icons::svg_icon(
-                                    "icons/check.svg",
-                                    theme.colors.surface.chrome,
-                                    px(10.0),
-                                ))
+        let file_rows =
+            rows.into_iter()
+                .enumerate()
+                .map(|(ix, (path, is_viewed, comments, threads))| {
+                    let name = path
+                        .rsplit_once('/')
+                        .map_or(path.as_str(), |(_, name)| name);
+                    div()
+                        .id(SharedString::from(format!("review_file_{ix}")))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_1()
+                        .px_2()
+                        .py(px(4.0))
+                        .rounded(px(theme.radii.control))
+                        .control_interaction(
+                            controls::InteractionStyle::new(theme),
+                            controls::InteractionState::default().selected(
+                                ix == current,
+                                theme.colors.interaction.selected_background,
+                            ),
+                        )
+                        .on_activate(
+                            false,
+                            controls::ControlActivation::Composite,
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                window.focus(&this.panel_focus_handle, cx);
+                                // The root repaints this pane; it can't while we're mid-update.
+                                let root = this.root_view.clone();
+                                cx.defer(move |cx| {
+                                    let _ =
+                                        root.update(cx, |root, cx| root.review_open_file(ix, cx));
+                                });
                             }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(theme.ui_text(12.5))
-                                    .when(is_viewed, |text| text.text_color(secondary))
-                                    .child(name.to_string()),
-                            )
-                            .when(name != path, |row| {
-                                row.child(
-                                    div()
-                                        .truncate()
-                                        .text_size(theme.ui_text(11.0))
-                                        .text_color(secondary)
-                                        .child(path.clone()),
-                                )
-                            }),
-                    )
-                    .when(comments > 0, |row| {
-                        row.child(
+                        )
+                        .child(
                             div()
                                 .flex_none()
+                                .w(px(14.0))
+                                .h(px(14.0))
                                 .flex()
                                 .items_center()
-                                .gap_1()
-                                .text_size(theme.ui_text(11.5))
-                                .text_color(warning)
-                                .child(crate::view::icons::svg_icon(
-                                    "icons/pencil.svg",
-                                    warning,
-                                    px(11.0),
-                                ))
-                                .child(comments.to_string()),
+                                .justify_center()
+                                .rounded(px(3.0))
+                                .border_1()
+                                .border_color(if is_viewed { success } else { secondary })
+                                .when(is_viewed, |check| {
+                                    check.bg(success).child(crate::view::icons::svg_icon(
+                                        "icons/check.svg",
+                                        theme.colors.surface.chrome,
+                                        px(10.0),
+                                    ))
+                                }),
                         )
-                    })
-            });
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(theme.ui_text(12.5))
+                                        .when(is_viewed, |text| text.text_color(secondary))
+                                        .child(name.to_string()),
+                                )
+                                .when(name != path, |row| {
+                                    row.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(theme.ui_text(11.0))
+                                            .text_color(secondary)
+                                            .child(path.clone()),
+                                    )
+                                }),
+                        )
+                        .when(threads > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(secondary)
+                                    .child(format!(
+                                        "{threads} thread{}",
+                                        if threads == 1 { "" } else { "s" }
+                                    )),
+                            )
+                        })
+                        .when(comments > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(warning)
+                                    .child(crate::view::icons::svg_icon(
+                                        "icons/pencil.svg",
+                                        warning,
+                                        px(11.0),
+                                    ))
+                                    .child(comments.to_string()),
+                            )
+                        })
+                });
 
         div()
             .id("review_files")

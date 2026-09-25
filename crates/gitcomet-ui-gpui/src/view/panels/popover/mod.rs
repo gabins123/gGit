@@ -368,7 +368,9 @@ pub(in super::super) struct PopoverHost {
     review_comment_input: Entity<components::TextInput>,
     review_comment_scroll: ScrollHandle,
     /// Text of a new line comment closed with esc, reopened on the same lines.
-    review_comment_unsaved: Option<(crate::github::ReviewAnchor, String)>,
+    review_comment_unsaved: Option<(crate::github::ReviewAnchor, Option<u64>, String)>,
+    /// The selected lines' new text, which alt+s turns into a suggestion.
+    review_comment_suggestion: Option<String>,
     pull_request_title_input: Entity<components::TextInput>,
     pull_request_base_input: Entity<components::TextInput>,
     pull_request_body_input: Entity<components::TextInput>,

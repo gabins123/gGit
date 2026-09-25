@@ -2438,7 +2438,7 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (comments, selected, head_moved) = {
+        let (comments, selected, head_moved, thread) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
@@ -2447,6 +2447,10 @@ impl DetailsPaneView {
                 review.draft.comments.clone(),
                 review.selected_comment,
                 review.head_moved,
+                root.review_threads_at_cursor(cx)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
             )
         };
         let count = comments.len();
@@ -2458,6 +2462,10 @@ impl DetailsPaneView {
                 .map_or(comment.anchor.path.as_str(), |(_, name)| name)
                 .to_string();
             let first_line = comment.body.lines().next().unwrap_or_default().to_string();
+            let where_ = match &comment.reply_to {
+                Some(to) => format!("reply to {} · {}", to.author, comment.anchor.lines_label()),
+                None => comment.anchor.lines_label(),
+            };
             div()
                 .id(SharedString::from(format!("review_comment_{ix}")))
                 .flex()
@@ -2493,7 +2501,7 @@ impl DetailsPaneView {
                         .text_size(theme.ui_text(11.5))
                         .text_color(secondary)
                         .child(div().truncate().child(file))
-                        .child(div().flex_none().child(comment.anchor.lines_label())),
+                        .child(div().flex_none().child(where_)),
                 )
                 .child(
                     div()
@@ -2563,9 +2571,65 @@ impl DetailsPaneView {
                     .gap_1()
                     .text_size(theme.ui_text(12.0))
                     .text_color(secondary)
-                    .child("Saved on this computer. Nothing is on GitHub until you submit; the comments go up together as one review.")
+                    .child("Saved on this computer. Nothing is on GitHub until you submit: the comments go up as one review, replies right after it.")
                     .child("enter go to line · e edit · d d delete · S submit"),
             )
+            .when(!thread.is_empty(), |panel| {
+                let heading = if thread.len() == 1 {
+                    "Thread on this line".to_string()
+                } else {
+                    format!("{} threads on this line", thread.len())
+                };
+                // GitHub text from anyone who can comment: plain text only.
+                let said = thread.into_iter().flat_map(|thread| thread.comments).map(|comment| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(theme.ui_text(11.0))
+                                .text_color(secondary)
+                                .child(format!(
+                                    "{} · {}",
+                                    comment.author,
+                                    comment.at.get(..10).unwrap_or(&comment.at)
+                                )),
+                        )
+                        .child(div().text_size(theme.ui_text(12.5)).child(comment.body))
+                });
+                panel.child(
+                    div()
+                        .id("review_thread_at_cursor")
+                        .max_h(px(260.0))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(theme.colors.stroke.default)
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(theme.ui_text(12.5))
+                                        .child(heading),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme.ui_text(11.5))
+                                        .text_color(secondary)
+                                        .child("in the diff: r reply · t next thread"),
+                                ),
+                        )
+                        .children(said),
+                )
+            })
             .into_any_element()
     }
 

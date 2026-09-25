@@ -449,6 +449,8 @@ impl GitCometView {
                     ("j/k", "line"),
                     ("shift+j/k", "select"),
                     ("c", "comment"),
+                    ("t/T", "thread"),
+                    ("r", "reply"),
                     ("}/{", "change"),
                     ("]/[", "file"),
                     ("space", "viewed"),
@@ -506,7 +508,12 @@ impl GitCometView {
                 FocusPanel::Diff | FocusPanel::History => &[
                     ("j / k", "Line cursor down / up"),
                     ("shift+j / k", "Select lines from the cursor"),
-                    ("c", "Comment on the line or selection"),
+                    (
+                        "c",
+                        "Comment on the line or selection; alt+s suggests a change",
+                    ),
+                    ("t / T", "Next / previous thread already on GitHub"),
+                    ("r", "Reply to the thread on this line"),
                     ("} / {", "Next / previous change"),
                     ("] / [", "Next / previous file"),
                     ("space", "Mark viewed, then the next unviewed file"),

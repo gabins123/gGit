@@ -1035,6 +1035,7 @@ impl PopoverHost {
             review_comment_input,
             review_comment_scroll,
             review_comment_unsaved: None,
+            review_comment_suggestion: None,
             pull_request_title_input,
             pull_request_base_input,
             pull_request_body_input,
@@ -1656,14 +1657,20 @@ impl PopoverHost {
             | Some(PopoverKind::CreatePullRequest { .. }) => {
                 self.close_popover_and_restore_focus(window, cx)
             }
-            Some(PopoverKind::ReviewComment { anchor, edit, .. }) => {
-                // A new comment's text waits for the same lines; an edit is
-                // just abandoned, the pending comment is unchanged.
+            Some(PopoverKind::ReviewComment {
+                anchor,
+                edit,
+                reply_to,
+                ..
+            }) => {
+                // A new comment's text waits for the same lines; an edit or a
+                // reply is just abandoned, the pending review is unchanged.
                 let text = self
                     .review_comment_input
                     .read_with(cx, |input, _| input.text().to_string());
                 if edit.is_none() && !text.trim().is_empty() {
-                    self.review_comment_unsaved = Some((anchor.clone(), text));
+                    let reply = reply_to.as_ref().map(|to| to.id);
+                    self.review_comment_unsaved = Some((anchor.clone(), reply, text));
                 }
                 self.close_popover_and_restore_focus(window, cx)
             }
@@ -1881,6 +1888,42 @@ impl PopoverHost {
         }
     }
 
+    /// The selected lines' new text for alt+s; the root sets it once the
+    /// dialog is open.
+    pub(in crate::view) fn set_review_suggestion(
+        &mut self,
+        text: Option<String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if matches!(self.popover, Some(PopoverKind::ReviewComment { .. })) {
+            self.review_comment_suggestion = text;
+            cx.notify();
+        }
+    }
+
+    /// alt+s: the selected lines as a GitHub suggestion block, after whatever
+    /// has been typed, to edit into the fix.
+    pub(super) fn insert_review_suggestion(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(lines) = self.review_comment_suggestion.clone() else {
+            return false;
+        };
+        self.review_comment_input.update(cx, |input, cx| {
+            let typed = input.text().trim_end().to_string();
+            let lead = if typed.is_empty() {
+                String::new()
+            } else {
+                format!("{typed}\n")
+            };
+            // Longer than any run of backticks in the code, so the code can't
+            // close the block early.
+            let longest = lines.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+            let fence = "`".repeat((longest + 1).max(3));
+            input.set_text(format!("{lead}{fence}suggestion\n{lines}\n{fence}"), cx);
+        });
+        cx.notify();
+        true
+    }
+
     /// ctrl+enter in the comment box: the comment joins the pending review.
     pub(super) fn submit_review_comment(
         &mut self,
@@ -1892,6 +1935,7 @@ impl PopoverHost {
             number,
             anchor,
             edit,
+            reply_to,
         }) = self.popover.clone()
         else {
             return false;
@@ -1905,7 +1949,7 @@ impl PopoverHost {
         let landed = self
             .root_view
             .update(cx, |root, cx| {
-                root.add_review_comment(repo_id, number, anchor, body, edit, cx)
+                root.add_review_comment(repo_id, number, anchor, body, edit, reply_to, cx)
             })
             .unwrap_or(false);
         if landed {
@@ -3279,9 +3323,20 @@ impl PopoverHost {
                         .read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
                 }
-                PopoverKind::ReviewComment { anchor, edit, .. } => {
+                PopoverKind::ReviewComment {
+                    anchor,
+                    edit,
+                    reply_to,
+                    ..
+                } => {
+                    self.review_comment_suggestion = None;
+                    let reply = reply_to.as_ref().map(|to| to.id);
                     let restored = match (edit, &self.review_comment_unsaved) {
-                        (None, Some((unsaved_at, text))) if unsaved_at == anchor => text.clone(),
+                        (None, Some((unsaved_at, unsaved_reply, text)))
+                            if unsaved_at == anchor && *unsaved_reply == reply =>
+                        {
+                            text.clone()
+                        }
                         _ => String::new(),
                     };
                     let theme = self.theme;

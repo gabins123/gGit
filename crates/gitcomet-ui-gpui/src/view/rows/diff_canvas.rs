@@ -1229,6 +1229,7 @@ fn paint_review_mark(
     window: &mut Window,
     row_bounds: Bounds<Pixels>,
     left: Pixels,
+    pending: bool,
     theme: AppTheme,
     ui_scale_percent: u32,
 ) {
@@ -1239,7 +1240,13 @@ fn paint_review_mark(
     window.paint_quad(
         fill(
             Bounds::new(point(left, top), size(width, height)),
-            theme.colors.status.warning.foreground,
+            // Amber for your pending comments, the accent for threads already
+            // on GitHub.
+            if pending {
+                theme.colors.status.warning.foreground
+            } else {
+                theme.colors.accent.foreground
+            },
         )
         .corner_radii(width * 0.5),
     );
@@ -2426,11 +2433,12 @@ pub(super) fn inline_diff_line_row_canvas(
                 );
             }
 
-            if view.read(cx).review_mark_side(visible_ix).is_some() {
+            if let Some((_, pending)) = view.read(cx).review_mark(visible_ix) {
                 paint_review_mark(
                     window,
                     prepaint.bounds,
                     prepaint.bounds.left() + prepaint.annot_w,
+                    pending,
                     theme,
                     ui_scale_percent,
                 );
@@ -2752,7 +2760,7 @@ pub(super) fn split_diff_line_row_canvas(
                 }
             }
 
-            if let Some(side) = view.read(cx).review_mark_side(visible_ix) {
+            if let Some((side, pending)) = view.read(cx).review_mark(visible_ix) {
                 let column = match side {
                     ReviewSide::Left => prepaint.left_col,
                     ReviewSide::Right => prepaint.right_col,
@@ -2761,6 +2769,7 @@ pub(super) fn split_diff_line_row_canvas(
                     window,
                     prepaint.bounds,
                     column.left(),
+                    pending,
                     theme,
                     ui_scale_percent,
                 );
@@ -3066,13 +3075,14 @@ pub(super) fn patch_split_column_row_canvas(
                 record_focused_change_block_for_tests(visible_ix, region, row, outline);
             }
 
-            if let Some(side) = view.read(cx).review_mark_side(visible_ix)
+            if let Some((side, pending)) = view.read(cx).review_mark(visible_ix)
                 && (side == ReviewSide::Left) == (region == DiffTextRegion::SplitLeft)
             {
                 paint_review_mark(
                     window,
                     prepaint.bounds,
                     prepaint.bounds.left() + prepaint.annot_w,
+                    pending,
                     theme,
                     ui_scale_percent,
                 );

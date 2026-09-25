@@ -60,33 +60,40 @@ impl ReviewRow {
     }
 }
 
+/// A shown diff row, as whichever presentation holds it.
+enum ReviewLine {
+    Annotated(AnnotatedDiffLine),
+    Split(FileDiffRow),
+}
+
 impl MainPaneView {
-    pub(in crate::view) fn review_row(&self, visible_ix: usize) -> Option<ReviewRow> {
+    fn review_line(&self, visible_ix: usize) -> Option<ReviewLine> {
         let mapped_ix = self.diff_mapped_ix_for_visible_ix(visible_ix)?;
         if self.is_collapsed_diff_projection_active() || self.is_file_diff_view_active() {
             return match self.diff_view {
                 DiffViewMode::Inline => self
                     .file_diff_inline_row(mapped_ix)
-                    .and_then(ReviewRow::from_annotated),
-                DiffViewMode::Split => self
-                    .file_diff_split_row(mapped_ix)
-                    .and_then(|row| ReviewRow::from_split(&row)),
+                    .map(ReviewLine::Annotated),
+                DiffViewMode::Split => self.file_diff_split_row(mapped_ix).map(ReviewLine::Split),
             };
         }
         match self.diff_view {
-            DiffViewMode::Inline => self
-                .patch_diff_row(mapped_ix)
-                .and_then(ReviewRow::from_annotated),
+            DiffViewMode::Inline => self.patch_diff_row(mapped_ix).map(ReviewLine::Annotated),
             DiffViewMode::Split => match self.patch_diff_split_row(mapped_ix)? {
-                PatchSplitRow::Aligned { row, .. } => ReviewRow::from_split(&row),
+                PatchSplitRow::Aligned { row, .. } => Some(ReviewLine::Split(row)),
                 PatchSplitRow::Raw {
                     src_ix,
                     click_kind: DiffClickKind::Line,
-                } => self
-                    .patch_diff_row(src_ix)
-                    .and_then(ReviewRow::from_annotated),
+                } => self.patch_diff_row(src_ix).map(ReviewLine::Annotated),
                 PatchSplitRow::Raw { .. } => None,
             },
+        }
+    }
+
+    pub(in crate::view) fn review_row(&self, visible_ix: usize) -> Option<ReviewRow> {
+        match self.review_line(visible_ix)? {
+            ReviewLine::Annotated(line) => ReviewRow::from_annotated(line),
+            ReviewLine::Split(row) => ReviewRow::from_split(&row),
         }
     }
 
@@ -309,19 +316,110 @@ impl MainPaneView {
         true
     }
 
-    /// Which side of this row has a pending review comment; read per painted row.
-    pub(in crate::view) fn review_mark_side(&self, visible_ix: usize) -> Option<ReviewSide> {
-        if !self.review_active || self.review_marks.is_empty() {
+    /// The review mark on this row, read per painted row: its side, and
+    /// whether it is a pending comment of yours (else a thread already on
+    /// GitHub). A pending comment wins over a thread on the same line.
+    pub(in crate::view) fn review_mark(&self, visible_ix: usize) -> Option<(ReviewSide, bool)> {
+        if !self.review_active
+            || (self.review_marks.is_empty() && self.review_thread_marks.is_empty())
+        {
             return None;
         }
         let row = self.review_row(visible_ix)?;
-        if let Some(new_line) = row.new_line
-            && self.review_marks.contains(&(ReviewSide::Right, new_line))
-        {
-            return Some(ReviewSide::Right);
+        let keys = [
+            row.new_line.map(|line| (ReviewSide::Right, line)),
+            row.old_line.map(|line| (ReviewSide::Left, line)),
+        ];
+        keys.iter()
+            .flatten()
+            .find(|key| self.review_marks.contains(key))
+            .map(|key| (key.0, true))
+            .or_else(|| {
+                keys.iter()
+                    .flatten()
+                    .find(|key| self.review_thread_marks.contains(key))
+                    .map(|key| (key.0, false))
+            })
+    }
+
+    #[cfg(test)]
+    pub(in crate::view) fn review_mark_side(&self, visible_ix: usize) -> Option<ReviewSide> {
+        self.review_mark(visible_ix).map(|(side, _)| side)
+    }
+
+    /// The row under the cursor.
+    pub(in crate::view) fn review_cursor_row(&self) -> Option<ReviewRow> {
+        self.review_row(self.review_head()?)
+    }
+
+    /// `t`/`T`: moves the cursor to the next or previous row on any of
+    /// `targets` (a base-side target matches the row's old line, a head-side
+    /// one its new line). Stops at the ends.
+    pub(in crate::view) fn review_step_to(
+        &mut self,
+        targets: &[(ReviewSide, u32)],
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let head = self.review_head();
+        let hits: Vec<usize> = self
+            .review_rows()
+            .filter(|(_, row)| {
+                targets.iter().any(|&(side, line)| match side {
+                    ReviewSide::Left => row.old_line == Some(line),
+                    ReviewSide::Right => row.new_line == Some(line),
+                })
+            })
+            .map(|(visible_ix, _)| visible_ix)
+            .collect();
+        let target = if direction < 0 {
+            hits.into_iter()
+                .rev()
+                .find(|ix| head.is_none_or(|head| *ix < head))
+        } else {
+            hits.into_iter()
+                .find(|ix| head.is_none_or(|head| *ix > head))
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.review_set_cursor(target, target, gpui::ScrollStrategy::Center, cx);
+        true
+    }
+
+    /// The head-side text of the selected lines, for a suggestion block. None
+    /// when the selection ends on a removed line: a suggestion replaces lines
+    /// of the new version.
+    pub(in crate::view) fn review_selection_new_text(&self) -> Option<String> {
+        let (lo, hi) = self
+            .diff_selection_range
+            .or(self.diff_selection_anchor.map(|ix| (ix, ix)))?;
+        if self.review_row(hi)?.side_line().0 == ReviewSide::Left {
+            return None;
         }
-        row.old_line
-            .filter(|old_line| self.review_marks.contains(&(ReviewSide::Left, *old_line)))
-            .map(|_| ReviewSide::Left)
+        let first = self.diff_source_visible_ix_for_visible_ix(lo)?;
+        let last = self.diff_source_visible_ix_for_visible_ix(hi)?;
+        let lines: Vec<String> = (first..=last)
+            .filter_map(|source_ix| {
+                self.review_row_new_text(self.diff_visual_ix_for_source_visible_ix(source_ix))
+            })
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// A row's text on the head side, if it has one, without the diff's
+    /// `+`/` ` marker (inline rows carry it; split rows don't).
+    fn review_row_new_text(&self, visible_ix: usize) -> Option<String> {
+        let text = match self.review_line(visible_ix)? {
+            ReviewLine::Annotated(line) => {
+                line.new_line?;
+                crate::view::diff_utils::diff_content_text(&line).to_string()
+            }
+            ReviewLine::Split(row) => {
+                row.new_line?;
+                row.new?.as_ref().to_string()
+            }
+        };
+        Some(text.trim_end_matches(['\n', '\r']).to_string())
     }
 }

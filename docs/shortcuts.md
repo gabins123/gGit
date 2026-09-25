@@ -115,11 +115,14 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Move the line cursor | `j` / `k`, `Down` / `Up` | Diff | The cursor starts on the file's first change. |
 | Select lines | `Shift+J` / `Shift+K`, `Shift+Down` / `Shift+Up` | Diff | Grows a selection from the cursor; a plain move drops it, as does `Escape`. No modes. |
 | Comment | `c` | Diff | On the line or the selected lines. `Ctrl+Enter` adds it to the review; `Escape` closes the box and keeps the text for those lines. GitHub only takes comments on changed lines and the 3 lines around them. |
+| Suggest a change | `Alt+S` | Comment box | Puts the selected lines in a GitHub suggestion block, after what's typed, to edit into the fix. GitHub then offers to commit it. Not on removed lines. |
+| Next / previous thread | `t` / `Shift+T` | Diff | Threads already on GitHub, marked in blue (your pending comments are amber). Details shows the thread under the cursor. |
+| Reply | `r` | Diff | To the thread on the line under the cursor. The reply waits with the rest of the review and posts right after it. |
 | Next / previous change | `}` / `{` | Diff | |
 | Next / previous file | `]` / `[` | Any panel | `j` / `k` in the Sidebar too. |
 | Mark the file viewed | `Space` | Diff, Sidebar | Then goes to the next file not yet viewed. `Space` again unmarks it. |
 | Go to a pending comment | `Enter` | Details | `j` / `k` pick one; `e` edits it, `d` `d` deletes it. |
-| Submit | `Shift+S` | Any panel | The review dialog, with the verdict and summary, and the pending line comments going up with it. A Comment review with line comments needs no summary; Request changes always does. On success those comments leave the draft and review mode closes. |
+| Submit | `Shift+S` | Any panel | The review dialog, with the verdict and summary, and the pending line comments going up with it; replies post right after. A Comment review with line comments needs no summary; Request changes always does, and pending replies alone post without a review. Whatever reaches GitHub leaves the draft, even if something after it fails; review mode closes once nothing is left. |
 | Leave | `q` | Any panel | Back to the pull request list. The pending review stays saved; `r` picks it up again. |
 
 ### Codex

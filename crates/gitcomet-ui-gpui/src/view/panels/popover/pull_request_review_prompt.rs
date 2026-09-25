@@ -130,7 +130,7 @@ pub(super) fn panel(
                     .text_size(theme.ui_text(12.0))
                     .text_color(theme.colors.foreground.secondary)
                     .child(format!(
-                        "With it: {comments} line comment{} on {files} file{}.{}",
+                        "With it: {comments} pending comment{} on {files} file{}.{}",
                         if comments == 1 { "" } else { "s" },
                         if files == 1 { "" } else { "s" },
                         if head_moved {

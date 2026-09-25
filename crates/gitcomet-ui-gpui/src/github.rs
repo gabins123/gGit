@@ -489,11 +489,104 @@ impl ReviewAnchor {
     }
 }
 
-/// One pending line comment of a review.
+/// One pending line comment of a review, or a reply to someone's thread.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, Deserialize)]
 pub(crate) struct ReviewComment {
     pub(crate) anchor: ReviewAnchor,
     pub(crate) body: String,
+    /// Set for a reply: the thread it answers. Replies post after the review,
+    /// each on its own thread (GitHub's create-review call can't carry them).
+    #[serde(default)]
+    pub(crate) reply_to: Option<ReplyTarget>,
+}
+
+/// The thread a pending reply answers: its first comment, by id.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, Deserialize)]
+pub(crate) struct ReplyTarget {
+    pub(crate) id: u64,
+    pub(crate) author: String,
+}
+
+/// One comment of a review thread already on GitHub.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadComment {
+    pub(crate) author: String,
+    pub(crate) body: String,
+    /// ISO 8601, as GitHub gives it.
+    pub(crate) at: String,
+}
+
+/// A review thread already on GitHub: where it sits and what was said. Its
+/// text is from anyone who can comment, shown as plain text only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewThread {
+    /// The first comment's id, which replies answer.
+    pub(crate) root_id: u64,
+    pub(crate) path: String,
+    pub(crate) side: ReviewSide,
+    /// None once the lines it was on changed (outdated), or for a comment on
+    /// the whole file.
+    pub(crate) line: Option<u32>,
+    pub(crate) comments: Vec<ThreadComment>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RawReviewComment {
+    id: u64,
+    #[serde(default)]
+    in_reply_to_id: Option<u64>,
+    path: String,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    side: Option<ReviewSide>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    user: Option<Author>,
+    #[serde(default)]
+    created_at: String,
+}
+
+/// Review comments as threads: each first comment with the replies to it,
+/// oldest first, threads in file and line order.
+fn review_threads(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
+    let mut raw = raw;
+    raw.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let comment = |raw: &RawReviewComment| ThreadComment {
+        author: raw
+            .user
+            .as_ref()
+            .map_or_else(|| "ghost".to_string(), |user| user.login.clone()),
+        body: raw
+            .body
+            .trim()
+            .chars()
+            .take(MAX_CONVERSATION_BODY_CHARS)
+            .collect(),
+        at: raw.created_at.clone(),
+    };
+    let mut threads: Vec<ReviewThread> = raw
+        .iter()
+        .filter(|raw| raw.in_reply_to_id.is_none())
+        .map(|root| ReviewThread {
+            root_id: root.id,
+            path: root.path.clone(),
+            side: root.side.unwrap_or(ReviewSide::Right),
+            line: root.line,
+            comments: vec![comment(root)],
+        })
+        .collect();
+    for reply in raw.iter().filter(|raw| raw.in_reply_to_id.is_some()) {
+        if let Some(thread) = threads
+            .iter_mut()
+            .find(|thread| Some(thread.root_id) == reply.in_reply_to_id)
+        {
+            thread.comments.push(comment(reply));
+        }
+    }
+    threads.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    threads
 }
 
 /// A whole review for GitHub's create-review call: verdict, summary and line
@@ -506,6 +599,7 @@ fn review_payload(
 ) -> serde_json::Value {
     let comments: Vec<serde_json::Value> = comments
         .iter()
+        .filter(|comment| comment.reply_to.is_none())
         .map(|comment| {
             let mut value = serde_json::json!({
                 "path": comment.anchor.path,
@@ -809,11 +903,65 @@ pub(crate) fn create_review(
         )));
     }
     let payload = review_payload(commit_id, kind, body, comments).to_string();
+    api_post(
+        workdir,
+        &format!("repos/{repo}/pulls/{number}/reviews"),
+        &payload,
+    )
+}
+
+/// Posts a reply to a review thread, answering its first comment.
+pub(crate) fn reply_to_thread(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+    root_id: u64,
+    body: &str,
+) -> Result<(), PrError> {
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
+    let payload = serde_json::json!({ "body": body }).to_string();
+    api_post(
+        workdir,
+        &format!("repos/{repo}/pulls/{number}/comments/{root_id}/replies"),
+        &payload,
+    )
+}
+
+/// The pull request's review threads already on GitHub, every page of them.
+pub(crate) fn list_review_threads(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+) -> Result<Vec<ReviewThread>, PrError> {
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
     let mut command = gh(workdir);
     command.args([
         "api",
         "--hostname=github.com",
-        &format!("repos/{repo}/pulls/{number}/reviews"),
+        &format!("repos/{repo}/pulls/{number}/comments?per_page=100"),
+        "--paginate",
+        "--slurp",
+    ]);
+    let pages: Vec<Vec<RawReviewComment>> = parse_json(&run(command, None)?)?;
+    Ok(review_threads(pages.into_iter().flatten().collect()))
+}
+
+/// `gh api --method=POST` with a JSON body on stdin. A refusal reports the
+/// API's own explanation, which gh prints as JSON on stdout.
+fn api_post(workdir: &Path, path: &str, payload: &str) -> Result<(), PrError> {
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "--hostname=github.com",
+        path,
         "--method=POST",
         "--input=-",
     ]);
@@ -1145,6 +1293,7 @@ mod tests {
                     start: Some((ReviewSide::Right, 10)),
                 },
                 body: "range".into(),
+                reply_to: None,
             },
             ReviewComment {
                 anchor: ReviewAnchor {
@@ -1154,6 +1303,7 @@ mod tests {
                     start: Some((ReviewSide::Left, 3)),
                 },
                 body: "one removed line".into(),
+                reply_to: None,
             },
         ];
         let payload = review_payload(&"a".repeat(40), ReviewKind::RequestChanges, "  ", &comments);
@@ -1177,10 +1327,65 @@ mod tests {
                 start: Some((ReviewSide::Left, 6)),
             },
             body: "old and new line 6".into(),
+            reply_to: None,
         }];
         let payload = review_payload(&"a".repeat(40), ReviewKind::Comment, "", &modified_line);
         assert_eq!(payload["comments"][0]["start_side"], "LEFT");
         assert_eq!(payload["comments"][0]["start_line"], 6);
+    }
+
+    #[test]
+    fn threads_gather_replies_under_their_first_comment() {
+        let json = r#"[
+            {"id": 2, "in_reply_to_id": 1, "path": "src/a.rs", "line": 4, "side": "RIGHT",
+             "body": "Agreed.", "user": {"login": "me"}, "created_at": "2026-09-02T00:00:00Z"},
+            {"id": 1, "path": "src/a.rs", "line": 4, "side": "RIGHT",
+             "body": "Wrap here?", "user": {"login": "octo"}, "created_at": "2026-09-01T00:00:00Z"},
+            {"id": 3, "path": "src/a.rs", "line": null, "side": "LEFT",
+             "body": "Outdated one", "user": null, "created_at": "2026-08-01T00:00:00Z"}
+        ]"#;
+        let raw: Vec<RawReviewComment> = parse_json(json.as_bytes()).expect("valid comments");
+        let threads = review_threads(raw);
+        assert_eq!(threads.len(), 2);
+        // Outdated (no line) sorts first; its deleted author reads as ghost.
+        assert_eq!((threads[0].line, threads[0].side), (None, ReviewSide::Left));
+        assert_eq!(threads[0].comments[0].author, "ghost");
+        assert_eq!(threads[1].root_id, 1);
+        assert_eq!(threads[1].line, Some(4));
+        let said: Vec<_> = threads[1]
+            .comments
+            .iter()
+            .map(|comment| (comment.author.as_str(), comment.body.as_str()))
+            .collect();
+        assert_eq!(said, [("octo", "Wrap here?"), ("me", "Agreed.")]);
+    }
+
+    #[test]
+    fn replies_stay_out_of_the_review_payload() {
+        let anchor = ReviewAnchor {
+            path: "src/a.rs".into(),
+            side: ReviewSide::Right,
+            line: 4,
+            start: None,
+        };
+        let comments = [
+            ReviewComment {
+                anchor: anchor.clone(),
+                body: "line comment".into(),
+                reply_to: None,
+            },
+            ReviewComment {
+                anchor,
+                body: "a reply".into(),
+                reply_to: Some(ReplyTarget {
+                    id: 1,
+                    author: "octo".into(),
+                }),
+            },
+        ];
+        let payload = review_payload(&"a".repeat(40), ReviewKind::Comment, "", &comments);
+        assert_eq!(payload["comments"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["comments"][0]["body"], "line comment");
     }
 
     #[test]

@@ -135,6 +135,35 @@ index 1111111..2222222 100644
                 (ReviewSide::Right, 6, None)
             );
 
+            // t/T: step between thread lines, either side.
+            let threads = [(ReviewSide::Right, 9), (ReviewSide::Left, 6)];
+            assert!(pane.review_jump_to(ReviewSide::Right, 7, cx));
+            assert!(pane.review_step_to(&threads, 1, cx));
+            assert_eq!(pane.diff_selection_range, Some((9, 9)));
+            assert!(!pane.review_step_to(&threads, 1, cx), "none after the last");
+            assert!(pane.review_step_to(&threads, -1, cx));
+            assert_eq!(pane.diff_selection_range, Some((5, 5)));
+            assert!(
+                !pane.review_step_to(&threads, -1, cx),
+                "none before the first"
+            );
+            let row = pane.review_cursor_row().expect("a row");
+            assert_eq!((row.old_line, row.new_line), (Some(6), None));
+
+            // alt+s: the new side of the selected lines, removed ones skipped.
+            assert!(pane.review_jump_to(ReviewSide::Right, 5, cx));
+            assert!(pane.review_move_cursor(2, true, cx));
+            assert_eq!(
+                pane.review_selection_new_text().as_deref(),
+                Some(
+                    "line 5
+line six"
+                )
+            );
+            // Ending on a removed line has no new text to suggest over.
+            assert!(pane.review_jump_to(ReviewSide::Left, 6, cx));
+            assert_eq!(pane.review_selection_new_text(), None);
+
             assert_eq!(pane.review_mark_side(7), None);
             pane.review_marks.insert((ReviewSide::Right, 7));
             pane.review_marks.insert((ReviewSide::Left, 6));

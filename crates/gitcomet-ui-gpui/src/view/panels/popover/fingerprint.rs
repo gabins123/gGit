@@ -962,12 +962,14 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
             number,
             anchor,
             edit,
+            reply_to,
         } => {
             123u8.hash(hasher);
             repo_id.hash(hasher);
             number.hash(hasher);
             anchor.hash(hasher);
             edit.hash(hasher);
+            reply_to.hash(hasher);
         }
         PopoverKind::MergePullRequest {
             repo_id,

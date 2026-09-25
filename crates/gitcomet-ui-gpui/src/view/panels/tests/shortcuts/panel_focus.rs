@@ -651,39 +651,73 @@ fn review_mode_walks_files_keeps_comments_and_leaves_with_q(cx: &mut gpui::TestA
                 },
                 "Nit".into(),
                 None,
+                None,
                 cx,
             );
         })
     });
     assert_eq!(review(cx).map(|(.., comments)| comments), Some(1));
-    // The composer: typing then ctrl+enter lands the comment in the review.
-    cx.update(|window, app| {
-        view.update(app, |this, cx| {
-            this.open_review_composer(
-                REPO,
-                7,
-                ReviewAnchor {
-                    path: "b.rs".into(),
-                    side: ReviewSide::Right,
-                    line: 2,
-                    start: None,
-                },
-                None,
-                window,
-                cx,
-            );
+    // The composer: typing, alt+s for the selected lines as a suggestion,
+    // then ctrl+enter lands the comment in the review.
+    let b_line_2 = ReviewAnchor {
+        path: "b.rs".into(),
+        side: ReviewSide::Right,
+        line: 2,
+        start: None,
+    };
+    let open = |cx: &mut gpui::VisualTestContext,
+                reply_to: Option<crate::github::ReplyTarget>,
+                suggestion: Option<String>| {
+        let anchor = b_line_2.clone();
+        cx.update(|window, app| {
+            view.update(app, |this, cx| {
+                this.open_review_composer(REPO, 7, anchor, None, reply_to, suggestion, window, cx);
+            })
+        });
+        draw_and_drain_test_window(cx);
+    };
+    let bodies = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_review()
+                .map(|review| {
+                    review
+                        .draft
+                        .comments
+                        .iter()
+                        .map(|comment| (comment.body.clone(), comment.reply_to.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
         })
-    });
-    draw_and_drain_test_window(cx);
-    press(cx, "o k");
-    press(cx, "secondary-enter");
+    };
+    open(cx, None, Some("let x = 1;".into()));
+    press(cx, "o k alt-s secondary-enter");
     assert!(!popover_is_open(cx, &view));
-    assert_eq!(review(cx).map(|(.., comments)| comments), Some(2));
+    assert_eq!(
+        bodies(cx)[1],
+        (
+            "ok
+```suggestion
+let x = 1;
+```"
+            .to_string(),
+            None
+        )
+    );
+    // A reply to someone's thread waits in the review like any comment.
+    let octo = crate::github::ReplyTarget {
+        id: 99,
+        author: "octo".into(),
+    };
+    open(cx, Some(octo.clone()), None);
+    press(cx, "t y secondary-enter");
+    assert_eq!(bodies(cx)[2], ("ty".to_string(), Some(octo)));
     // Your review: the second d deletes, a single one only asks.
     press(cx, "4 j d");
-    assert_eq!(review(cx).map(|(.., comments)| comments), Some(2));
+    assert_eq!(bodies(cx).len(), 3);
     press(cx, "d");
-    assert_eq!(review(cx).map(|(.., comments)| comments), Some(1));
+    assert_eq!(bodies(cx).len(), 2);
 
     // S is the submit dialog for this pull request.
     press(cx, "shift-s");

@@ -1,5 +1,5 @@
 use super::*;
-use crate::github::ReviewAnchor;
+use crate::github::{ReplyTarget, ReviewAnchor};
 
 /// A line comment for the review in progress: it joins the pending review,
 /// and nothing is posted until the review is submitted.
@@ -7,6 +7,7 @@ pub(super) fn panel(
     this: &mut PopoverHost,
     anchor: ReviewAnchor,
     edit: Option<usize>,
+    reply_to: Option<ReplyTarget>,
     cx: &mut gpui::Context<PopoverHost>,
 ) -> gpui::Div {
     let theme = this.theme;
@@ -14,10 +15,13 @@ pub(super) fn panel(
     let empty = this
         .review_comment_input
         .read_with(cx, |input, _| input.text().trim().is_empty());
-    let title = match edit {
-        Some(_) => format!("Edit comment on {}", anchor.lines_label()),
-        None => format!("Comment on {}", anchor.lines_label()),
+    let title = match (&reply_to, edit) {
+        (Some(to), Some(_)) => format!("Edit reply to {} on {}", to.author, anchor.lines_label()),
+        (Some(to), None) => format!("Reply to {} on {}", to.author, anchor.lines_label()),
+        (None, Some(_)) => format!("Edit comment on {}", anchor.lines_label()),
+        (None, None) => format!("Comment on {}", anchor.lines_label()),
     };
+    let can_suggest = reply_to.is_none() && this.review_comment_suggestion.is_some();
 
     div()
         .flex()
@@ -30,6 +34,18 @@ pub(super) fn panel(
                 }
             }),
         )
+        .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _window, cx| {
+            let mods = e.keystroke.modifiers;
+            if mods.alt
+                && !mods.control
+                && !mods.platform
+                && !mods.shift
+                && e.keystroke.key == "s"
+                && this.insert_review_suggestion(cx)
+            {
+                cx.stop_propagation();
+            }
+        }))
         .child(popover_title(theme, title))
         .child(super::popover_detail(theme, anchor.path.clone()))
         .child(super::popover_rule(theme))
@@ -51,7 +67,11 @@ pub(super) fn panel(
                     div()
                         .text_size(theme.ui_text(12.0))
                         .text_color(theme.colors.foreground.secondary)
-                        .child("Pending until you submit the review. esc keeps the text."),
+                        .child(if can_suggest {
+                            "alt+s suggests a change. Pending until you submit the review."
+                        } else {
+                            "Pending until you submit the review. esc keeps the text."
+                        }),
                 )
                 .child(
                     div()

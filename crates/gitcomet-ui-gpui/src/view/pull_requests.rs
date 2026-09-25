@@ -113,6 +113,15 @@ pub(super) fn remote_branch_head(repo: &RepoState, remote: &str, branch: &str) -
     }
 }
 
+/// What a review submit got onto GitHub before anything failed.
+struct ReviewSubmitted {
+    /// The review itself (verdict, summary, line comments) went up.
+    review: bool,
+    /// The pending comments and replies now on GitHub.
+    comments: Vec<crate::github::ReviewComment>,
+    error: Option<PrError>,
+}
+
 /// The dialog a gh submit came from, so its outcome reaches that dialog and
 /// no other.
 #[derive(Clone, Copy)]
@@ -168,7 +177,7 @@ impl PullRequestsState {
 #[derive(Clone)]
 pub(super) struct GitHubTarget {
     pub(super) repo_id: RepoId,
-    workdir: std::path::PathBuf,
+    pub(super) workdir: std::path::PathBuf,
     remote: String,
     pub(super) slug: String,
 }
@@ -598,63 +607,141 @@ impl GitCometView {
         entry.submit_error = None;
         let slug = target.slug.clone();
         // A review in progress goes up with its line comments, pinned to the
-        // commit they were written against.
+        // commit they were written against; replies follow, one per thread.
         let pending = self
             .review_of(repo_id, number)
             .map(|review| (review.draft.head_oid.clone(), review.draft.comments.clone()));
         let in_review = pending.is_some();
-        let submitted: Vec<crate::github::ReviewComment> = pending
-            .as_ref()
-            .map(|(_, comments)| comments.clone())
-            .unwrap_or_default();
-        let comment_count = submitted.len();
         let task = cx.background_spawn(async move {
-            match pending {
-                Some((head_oid, comments)) if !comments.is_empty() => github::create_review(
+            let Some((head_oid, comments)) = pending else {
+                let result = github::review(&target.workdir, &target.slug, number, kind, &body);
+                return ReviewSubmitted {
+                    review: result.is_ok(),
+                    comments: Vec::new(),
+                    error: result.err(),
+                };
+            };
+            let (line_comments, replies): (Vec<_>, Vec<_>) = comments
+                .into_iter()
+                .partition(|comment| comment.reply_to.is_none());
+            let mut out = ReviewSubmitted {
+                review: false,
+                comments: Vec::new(),
+                error: None,
+            };
+            if super::review::review_needed(kind, &body, line_comments.len(), replies.len()) {
+                let result = if line_comments.is_empty() {
+                    github::review(&target.workdir, &target.slug, number, kind, &body)
+                } else {
+                    github::create_review(
+                        &target.workdir,
+                        &target.slug,
+                        number,
+                        &head_oid,
+                        kind,
+                        &body,
+                        &line_comments,
+                    )
+                };
+                if let Err(err) = result {
+                    out.error = Some(err);
+                    return out;
+                }
+                out.review = true;
+                out.comments.extend(line_comments);
+            }
+            for reply in replies {
+                let Some(to) = reply.reply_to.as_ref() else {
+                    continue;
+                };
+                match github::reply_to_thread(
                     &target.workdir,
                     &target.slug,
                     number,
-                    &head_oid,
-                    kind,
-                    &body,
-                    &comments,
-                ),
-                _ => github::review(&target.workdir, &target.slug, number, kind, &body),
+                    to.id,
+                    &reply.body,
+                ) {
+                    Ok(()) => out.comments.push(reply),
+                    Err(err) => {
+                        out.error = Some(err);
+                        break;
+                    }
+                }
             }
+            out
         });
         cx.spawn(async move |view, cx| {
-            let result = task.await;
+            let submitted = task.await;
             let _ = view.update(cx, |this, cx| {
-                let entry = this.pull_requests.repo_mut(repo_id);
-                entry.submitting = false;
-                match result {
-                    Ok(()) => {
+                this.pull_requests.repo_mut(repo_id).submitting = false;
+                // What reached GitHub leaves the draft, whatever failed after.
+                let posted_anything = submitted.review || !submitted.comments.is_empty();
+                let remaining = if in_review && posted_anything {
+                    this.finish_review(repo_id, number, &submitted.comments, submitted.review, cx)
+                } else {
+                    0
+                };
+                let replies = submitted
+                    .comments
+                    .iter()
+                    .filter(|comment| comment.reply_to.is_some())
+                    .count();
+                let line_comments = submitted.comments.len() - replies;
+                let plural = |n: usize, word: &str, words: &str| match n {
+                    0 => String::new(),
+                    1 => format!(" · 1 {word}"),
+                    n => format!(" · {n} {words}"),
+                };
+                let what = format!(
+                    "#{number}{}{}",
+                    plural(line_comments, "comment", "comments"),
+                    plural(replies, "reply", "replies")
+                );
+                let verb = match (submitted.review, kind) {
+                    (false, _) => "Replied on",
+                    (true, ReviewKind::Comment) => "Commented on",
+                    (true, ReviewKind::Approve) => "Approved",
+                    (true, ReviewKind::RequestChanges) => "Requested changes on",
+                };
+                match submitted.error {
+                    None => {
                         this.close_pull_request_prompt(repo_id, PrDialog::Review(number), cx);
-                        let verb = match kind {
-                            ReviewKind::Comment => "Commented on",
-                            ReviewKind::Approve => "Approved",
-                            ReviewKind::RequestChanges => "Requested changes on",
-                        };
-                        let with = match comment_count {
-                            0 => String::new(),
-                            1 => " · 1 comment".to_string(),
-                            n => format!(" · {n} comments"),
-                        };
-                        if in_review {
-                            this.finish_review(repo_id, number, &submitted, cx);
-                        }
                         this.push_toast_with_link(
                             components::ToastKind::Success,
-                            format!("{verb} #{number}{with}"),
+                            format!("{verb} {what}"),
                             format!("https://github.com/{slug}/pull/{number}"),
                             "View on GitHub".to_string(),
                             cx,
                         );
+                        if submitted.review && remaining > 0 {
+                            this.push_toast(
+                                components::ToastKind::Warning,
+                                format!(
+                                    "{remaining} comment{} added while it was posting {} still pending.",
+                                    if remaining == 1 { "" } else { "s" },
+                                    if remaining == 1 { "is" } else { "are" }
+                                ),
+                                cx,
+                            );
+                        }
                         // Pick up the new review decision, unless the user has
                         // moved on to another pull request meanwhile.
                         this.reload_pull_request(repo_id, number, cx);
                     }
-                    Err(err) => this.report_pull_request_error(
+                    // Part of it is on GitHub: resubmitting would post that
+                    // part again, so the dialog closes and the rest waits.
+                    Some(err) if posted_anything => {
+                        this.close_pull_request_prompt(repo_id, PrDialog::Review(number), cx);
+                        this.push_toast(
+                            components::ToastKind::Error,
+                            format!(
+                                "{verb} {what}, but a reply didn't go up: {err}. What's left is still pending."
+                            ),
+                            cx,
+                        );
+                        this.reload_pull_request(repo_id, number, cx);
+                    }
+                    Some(err) => this.report_pull_request_error(
                         repo_id,
                         PrDialog::Review(number),
                         format!("Couldn't post the review on #{number}: {err}"),
@@ -663,7 +750,6 @@ impl GitCometView {
                     ),
                 }
                 this.notify_pull_request_panes(cx);
-                this.popover_host.update(cx, |_, cx| cx.notify());
             });
         })
         .detach();
