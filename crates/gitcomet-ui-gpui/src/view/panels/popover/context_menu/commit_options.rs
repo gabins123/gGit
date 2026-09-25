@@ -19,7 +19,7 @@ fn repo_has_head_commit(repo: &RepoState) -> bool {
     }
 }
 
-fn can_amend(repo: Option<&RepoState>) -> bool {
+pub(in crate::view) fn can_amend(repo: Option<&RepoState>) -> bool {
     let Some(repo) = repo else {
         return false;
     };

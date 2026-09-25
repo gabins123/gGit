@@ -639,6 +639,7 @@ mod repo_tabs_bar;
 
 pub(super) use action_bar::{ActionBarView, action_bar_density, action_bar_height};
 pub(super) use bottom_status_bar::BottomStatusBarView;
+pub(super) use popover::context_menu::{branch_action_reference, can_amend};
 pub(super) use popover::{PopoverHost, PopoverHostInit};
 #[cfg(feature = "benchmarks")]
 pub(in crate::view) use popover::{

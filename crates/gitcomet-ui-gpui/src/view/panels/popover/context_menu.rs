@@ -2,6 +2,8 @@ use super::*;
 use crate::kit::interaction::ControlInteractionExt as _;
 
 mod branch;
+pub(in crate::view) use branch::branch_action_reference;
+pub(in crate::view) use commit_options::can_amend;
 mod branch_group;
 mod branch_section;
 mod browse_history;

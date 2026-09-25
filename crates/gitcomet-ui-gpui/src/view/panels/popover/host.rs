@@ -371,6 +371,59 @@ impl PopoverHost {
             input
         });
 
+        let multiline_input = |placeholder: &str,
+                               scroll: &ScrollHandle,
+                               window: &mut Window,
+                               cx: &mut gpui::Context<Self>| {
+            let placeholder = placeholder.to_string();
+            let scroll = scroll.clone();
+            cx.new(|cx| {
+                let mut input = components::TextInput::new(
+                    components::TextInputOptions {
+                        placeholder: placeholder.into(),
+                        multiline: true,
+                        soft_wrap: true,
+                        min_lines: 5,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                input.set_vertical_scroll_handle(Some(scroll));
+                input
+            })
+        };
+        let pull_request_review_scroll = ScrollHandle::new();
+        let pull_request_review_input =
+            multiline_input("Leave a comment", &pull_request_review_scroll, window, cx);
+        let pull_request_body_scroll = ScrollHandle::new();
+        let pull_request_body_input = multiline_input(
+            "Describe the change (Markdown)",
+            &pull_request_body_scroll,
+            window,
+            cx,
+        );
+        let pull_request_title_input = cx.new(|cx| {
+            components::TextInput::new(
+                components::TextInputOptions {
+                    placeholder: "Title".into(),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+        let pull_request_base_input = cx.new(|cx| {
+            components::TextInput::new(
+                components::TextInputOptions {
+                    placeholder: "default branch".into(),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+
         let gitignore_patterns_scroll = ScrollHandle::new();
         let gitignore_patterns_input = cx.new(|cx| {
             let mut input = components::TextInput::new(
@@ -641,6 +694,20 @@ impl PopoverHost {
                 }
             },
         ));
+        // The submit buttons enable on text, so typing has to repaint them.
+        for input in [&pull_request_review_input, &pull_request_title_input] {
+            prompt_input_subscriptions.push(cx.observe(input, |this, _input, cx| {
+                if matches!(
+                    this.popover,
+                    Some(
+                        PopoverKind::PullRequestReview { .. }
+                            | PopoverKind::CreatePullRequest { .. }
+                    )
+                ) {
+                    cx.notify();
+                }
+            }));
+        }
         for input in [&clone_repo_url_input, &clone_repo_parent_dir_input] {
             prompt_input_subscriptions.push(Self::prompt_enter_subscription(
                 input,
@@ -955,6 +1022,13 @@ impl PopoverHost {
             rebase_onto_submit_focus_handle,
             clone_repo_focus,
             create_tag_focus,
+            pull_request_review_input,
+            pull_request_review_scroll,
+            pull_request_title_input,
+            pull_request_base_input,
+            pull_request_body_input,
+            pull_request_body_scroll,
+            pull_request_draft: false,
             remote_add_focus,
             remote_edit_focus,
             push_upstream_focus,
@@ -991,6 +1065,10 @@ impl PopoverHost {
             &self.rebase_onto_input,
             &self.create_tag_input,
             &self.create_tag_message_input,
+            &self.pull_request_review_input,
+            &self.pull_request_title_input,
+            &self.pull_request_base_input,
+            &self.pull_request_body_input,
             &self.gitignore_patterns_input,
             &self.squash_message_input,
             &self.squash_description_input,
@@ -1429,6 +1507,8 @@ impl PopoverHost {
                 | Some(PopoverKind::CommitPrompt { .. })
                 | Some(PopoverKind::CloneRepo)
                 | Some(PopoverKind::CreateTagPrompt { .. })
+                | Some(PopoverKind::PullRequestReview { .. })
+                | Some(PopoverKind::CreatePullRequest { .. })
                 | Some(PopoverKind::SquashPrompt { .. })
                 | Some(PopoverKind::PushSetUpstreamPrompt { .. })
                 | Some(PopoverKind::Repo {
@@ -1557,6 +1637,10 @@ impl PopoverHost {
                 kind: RepoPopoverKind::Submodule(SubmodulePopoverKind::ChangePointerPrompt { .. }),
                 ..
             }) => self.dismiss_inline_popover(window, cx),
+            Some(PopoverKind::PullRequestReview { .. })
+            | Some(PopoverKind::CreatePullRequest { .. }) => {
+                self.close_popover_and_restore_focus(window, cx)
+            }
             Some(PopoverKind::CloneRepo)
             | Some(PopoverKind::CreateTagPrompt { .. })
             | Some(PopoverKind::SquashPrompt { .. })
@@ -1605,8 +1689,11 @@ impl PopoverHost {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        let focus = self
+            .focus_return
+            .take()
+            .unwrap_or_else(|| self.main_pane.read(cx).diff_panel_focus_handle.clone());
         self.close_popover(cx);
-        let focus = self.main_pane.read(cx).diff_panel_focus_handle.clone();
         window.focus(&focus, cx);
         cx.notify();
     }
@@ -1676,6 +1763,203 @@ impl PopoverHost {
             annotated,
         });
         self.close_popover(cx);
+    }
+
+    fn reset_pull_request_inputs(
+        &mut self,
+        inputs: &[&Entity<components::TextInput>],
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let theme = self.theme;
+        for input in inputs {
+            input.update(cx, |input, cx| {
+                input.clear_transient_key_presses();
+                input.set_theme(theme, cx);
+                input.set_text("", cx);
+                cx.notify();
+            });
+        }
+    }
+
+    /// Switches the open review between Comment, Approve and Request changes,
+    /// keeping whatever has been typed.
+    pub(super) fn set_pull_request_review_kind(
+        &mut self,
+        next: crate::github::ReviewKind,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(PopoverKind::PullRequestReview { kind, .. }) = self.popover.as_mut()
+            && *kind != next
+        {
+            *kind = next;
+            cx.notify();
+        }
+    }
+
+    /// Codex drafts the review; the text lands in the box once it's done, and
+    /// only if the box is still empty. Posting stays a separate step.
+    pub(super) fn draft_pull_request_review_with_codex(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.start_codex(
+                crate::view::codex_panel::CodexAction::ReviewPullRequest,
+                crate::view::codex_panel::CodexDestination::ReviewDraft(repo_id, number),
+                window,
+                cx,
+            );
+        });
+    }
+
+    pub(in crate::view) fn fill_pull_request_review_draft(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        text: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let open_for = match self.popover {
+            Some(PopoverKind::PullRequestReview {
+                repo_id: open_repo,
+                number: open,
+                ..
+            }) => (open_repo, open),
+            _ => return,
+        };
+        if open_for != (repo_id, number) {
+            return;
+        }
+        self.pull_request_review_input.update(cx, |input, cx| {
+            if input.text().trim().is_empty() {
+                input.set_text(text, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::view) fn pull_request_prompt_open(&self) -> bool {
+        matches!(
+            self.popover,
+            Some(PopoverKind::PullRequestReview { .. } | PopoverKind::CreatePullRequest { .. })
+        )
+    }
+
+    pub(super) fn toggle_pull_request_draft(&mut self, cx: &mut gpui::Context<Self>) {
+        if matches!(self.popover, Some(PopoverKind::CreatePullRequest { .. })) {
+            self.pull_request_draft = !self.pull_request_draft;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn can_submit_pull_request_review(&self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(PopoverKind::PullRequestReview { kind, .. }) = self.popover else {
+            return false;
+        };
+        !self.pull_request_submitting(cx)
+            && (!kind.needs_body()
+                || self
+                    .pull_request_review_input
+                    .read_with(cx, |input, _| !input.text().trim().is_empty()))
+    }
+
+    pub(super) fn can_submit_create_pull_request(&self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(PopoverKind::CreatePullRequest { repo_id }) = self.popover else {
+            return false;
+        };
+        !self.pull_request_submitting(cx)
+            && self
+                .state
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_id)
+                .is_some_and(|repo| {
+                    super::create_pull_request_prompt::pull_request_head(repo).is_ok()
+                })
+            && self
+                .pull_request_title_input
+                .read_with(cx, |input, _| !input.text().trim().is_empty())
+    }
+
+    pub(super) fn pull_request_submitting(&self, cx: &mut gpui::Context<Self>) -> bool {
+        self.root_view
+            .upgrade()
+            .and_then(|root| {
+                root.read(cx)
+                    .active_pull_requests()
+                    .map(|prs| prs.submitting)
+            })
+            .unwrap_or(false)
+    }
+
+    pub(super) fn pull_request_submit_error(&self, cx: &mut gpui::Context<Self>) -> Option<String> {
+        self.root_view.upgrade().and_then(|root| {
+            root.read(cx)
+                .active_pull_requests()
+                .and_then(|prs| prs.submit_error.clone())
+        })
+    }
+
+    /// `ctrl+enter` or the submit button. Posting is always this explicit step.
+    pub(in crate::view) fn submit_pull_request_prompt(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        match self.popover.clone() {
+            Some(PopoverKind::PullRequestReview {
+                repo_id,
+                number,
+                kind,
+            }) => {
+                cx.notify();
+                if self.can_submit_pull_request_review(cx) {
+                    let body = self
+                        .pull_request_review_input
+                        .read_with(cx, |input, _| input.text().to_string());
+                    let _ = self.root_view.update(cx, |root, cx| {
+                        root.submit_pull_request_review(repo_id, number, kind, body, cx)
+                    });
+                }
+                true
+            }
+            Some(PopoverKind::CreatePullRequest { repo_id }) => {
+                cx.notify();
+                if self.can_submit_create_pull_request(cx) {
+                    let head = self
+                        .state
+                        .repos
+                        .iter()
+                        .find(|repo| repo.id == repo_id)
+                        .and_then(|repo| {
+                            super::create_pull_request_prompt::pull_request_head(repo).ok()
+                        });
+                    if let Some(head) = head {
+                        let read =
+                            |input: &Entity<components::TextInput>,
+                             cx: &mut gpui::Context<Self>| {
+                                input.read_with(cx, |input, _| input.text().trim().to_string())
+                            };
+                        let pr = crate::github::NewPullRequest {
+                            base: read(&self.pull_request_base_input, cx),
+                            head,
+                            title: read(&self.pull_request_title_input, cx),
+                            body: self
+                                .pull_request_body_input
+                                .read_with(cx, |input, _| input.text().to_string()),
+                            draft: self.pull_request_draft,
+                        };
+                        let _ = self
+                            .root_view
+                            .update(cx, |root, cx| root.submit_new_pull_request(repo_id, pr, cx));
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn submit_clone_repo(&mut self, cx: &mut gpui::Context<Self>) {
@@ -2808,6 +3092,28 @@ impl PopoverHost {
                     self.sync_squash_prompt_prefill(cx);
                     let focus = self
                         .squash_message_input
+                        .read_with(cx, |i, _| i.focus_handle());
+                    window.focus(&focus, cx);
+                }
+                PopoverKind::PullRequestReview { .. } => {
+                    self.reset_pull_request_inputs(&[&self.pull_request_review_input.clone()], cx);
+                    let focus = self
+                        .pull_request_review_input
+                        .read_with(cx, |i, _| i.focus_handle());
+                    window.focus(&focus, cx);
+                }
+                PopoverKind::CreatePullRequest { .. } => {
+                    self.pull_request_draft = false;
+                    self.reset_pull_request_inputs(
+                        &[
+                            &self.pull_request_title_input.clone(),
+                            &self.pull_request_base_input.clone(),
+                            &self.pull_request_body_input.clone(),
+                        ],
+                        cx,
+                    );
+                    let focus = self
+                        .pull_request_title_input
                         .read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
                 }

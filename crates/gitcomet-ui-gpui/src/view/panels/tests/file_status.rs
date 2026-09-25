@@ -6431,8 +6431,7 @@ fn clicking_outside_a_focused_input_blurs_it(cx: &mut gpui::TestAppContext) {
         "precondition: the input is focused"
     );
 
-    // The branch sidebar: a real surface that takes no focus of its own, so
-    // without an explicit blur the input stays focused behind the user's back.
+    // The branch sidebar: a keyboard panel, so the press moves focus there.
     let size = cx.update(|window, _app| window.viewport_size());
     let sidebar = gpui::point(size.width * 0.05, size.height * 0.5);
     cx.simulate_mouse_move(sidebar, None, gpui::Modifiers::default());
@@ -6447,15 +6446,19 @@ fn clicking_outside_a_focused_input_blurs_it(cx: &mut gpui::TestAppContext) {
 
     assert!(
         cx.update(|window, app| !input.read(app).focus_handle().is_focused(window)),
-        "a press on a surface that takes no focus must still blur the input"
+        "a press elsewhere must blur the input"
     );
-    // Deliberately nothing focused rather than a fallback surface: the press
-    // landed on something that is not a pane, so handing focus to one would
-    // silently redirect the user's next keystroke. Global bindings still
-    // resolve at the window root.
+    // The sidebar is a keyboard panel (`1`, `h`/`l`): a press on it focuses the
+    // panel itself, so the next panel key acts where the user clicked.
     assert!(
-        cx.update(|window, app| window.focused(app).is_none()),
-        "blur leaves no element focused"
+        cx.update(|window, app| {
+            view.read(app)
+                .sidebar_pane
+                .read(app)
+                .panel_focus_handle
+                .is_focused(window)
+        }),
+        "the press focuses the sidebar panel"
     );
 }
 

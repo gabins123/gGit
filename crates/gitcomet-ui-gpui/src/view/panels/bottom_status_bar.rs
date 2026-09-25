@@ -1,3 +1,4 @@
+use super::super::panel_focus::PANEL_STATUS_HINTS;
 use super::*;
 use crate::kit::interaction as controls;
 use crate::view::components::{ControlInteractionExt, InteractionState, InteractionStyle};
@@ -299,6 +300,56 @@ impl Render for BottomStatusBarView {
                 },
             );
 
+        // The live panel keys, lazygit style, while a panel has keyboard focus.
+        let key_hints = self
+            .root_view
+            .upgrade()
+            .and_then(|view| {
+                let root = view.read(cx);
+                root.key_hint_panel(window, cx)
+                    .map(|panel| root.key_hints(panel))
+            })
+            .map(|hints| {
+                div()
+                    .debug_selector(|| "panel_key_hints".to_string())
+                    .flex()
+                    .items_center()
+                    .gap(scaled_px(10.0))
+                    .pl(scaled_px(8.0))
+                    .children(
+                        hints
+                            .iter()
+                            .chain(PANEL_STATUS_HINTS)
+                            .map(|&(keys, label)| {
+                                div()
+                                .flex()
+                                .items_center()
+                                .gap(scaled_px(4.0))
+                                .child(
+                                    div()
+                                        .h(scaled_px(16.0))
+                                        .px(scaled_px(4.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(scaled_px(3.0))
+                                        .bg(theme.hover_overlay())
+                                        .font_family(
+                                            crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY,
+                                        )
+                                        .text_size(theme.ui_text(11.0))
+                                        .text_color(theme.colors.foreground.secondary)
+                                        .child(keys),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme.ui_text(11.0))
+                                        .text_color(theme.colors.foreground.secondary)
+                                        .child(label),
+                                )
+                            }),
+                    )
+            });
+
         let (active_repo_id, active_hook_count, has_hook_warning) =
             Self::hook_activity_summary(&self.state);
         let keep_minimized =
@@ -538,7 +589,8 @@ impl Render for BottomStatusBarView {
                     .flex()
                     .items_center()
                     .gap(scaled_px(2.0))
-                    .child(sidebar_toggle),
+                    .child(sidebar_toggle)
+                    .children(key_hints),
             )
             .child(
                 div()

@@ -312,6 +312,12 @@ pub(in super::super) struct SidebarPaneView {
     sidebar_request_fingerprint: SidebarRequestFingerprint,
     pub(in super::super) active_context_menu_invoker: Option<SharedString>,
     selected_branch: Option<SelectedBranch>,
+    /// Keyboard focus for the panel itself (`1`, `h`/`l`), as opposed to its
+    /// filter inputs.
+    pub(in super::super) panel_focus_handle: FocusHandle,
+    /// The branch row `j`/`k` last landed on. A pinned branch is listed twice,
+    /// so the selection alone does not say which copy the keyboard is on.
+    branch_keyboard_row: Option<usize>,
     file_search_options: DiffSearchOptions,
     file_browser_rows_cache: FileBrowserRowsCache,
     /// Set transiently while rendering a collapsed-sidebar section popover so the
@@ -637,6 +643,8 @@ impl SidebarPaneView {
             sidebar_request_fingerprint: SidebarRequestFingerprint::default(),
             active_context_menu_invoker: None,
             selected_branch: None,
+            panel_focus_handle: cx.focus_handle().tab_index(0).tab_stop(false),
+            branch_keyboard_row: None,
             file_search_options: DiffSearchOptions::default(),
             file_browser_rows_cache: std::cell::RefCell::new(None),
             collapsed_popover_presentation: None,
@@ -747,6 +755,70 @@ impl SidebarPaneView {
         self.set_selected_branch(repo_id, target.clone(), cx);
         self.reveal_branch_commit_in_history(repo_id, target, commit_id, fallback_scope, cx);
         cx.notify();
+    }
+
+    /// Moves the branch selection to the next (`direction > 0`) or previous
+    /// branch row, revealing its tip in History exactly as a click does. With
+    /// nothing selected yet it starts from the first or last branch.
+    pub(in crate::view) fn select_adjacent_branch(
+        &mut self,
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        if self.state.sidebar_mode != SidebarMode::Branches {
+            return false;
+        }
+        let Some(repo_id) = self.active_repo_id() else {
+            return false;
+        };
+        let Some(presentation) = self.branch_sidebar_presentation_cached() else {
+            return false;
+        };
+        let rows = presentation.rows;
+        let is_branch = |row: &BranchSidebarRow| matches!(row, BranchSidebarRow::Branch { .. });
+        let is_selected_row = |row: &BranchSidebarRow, selected: &SelectedBranch| matches!(row, BranchSidebarRow::Branch { target, .. } if *target == selected.target);
+        let current = self
+            .selected_branch()
+            .filter(|selected| selected.repo_id == repo_id)
+            .and_then(|selected| {
+                self.branch_keyboard_row
+                    .filter(|&ix| {
+                        rows.get(ix)
+                            .is_some_and(|row| is_selected_row(row, selected))
+                    })
+                    .or_else(|| rows.iter().position(|row| is_selected_row(row, selected)))
+            });
+        let next_ix = match (current, direction < 0) {
+            (Some(ix), false) => (ix + 1..rows.len()).find(|&ix| is_branch(&rows[ix])),
+            (Some(ix), true) => (0..ix).rev().find(|&ix| is_branch(&rows[ix])),
+            (None, false) => rows.iter().position(is_branch),
+            (None, true) => rows.iter().rposition(is_branch),
+        };
+        let Some(next_ix) = next_ix else {
+            return false;
+        };
+        let BranchSidebarRow::Branch {
+            target, is_head, ..
+        } = &rows[next_ix]
+        else {
+            unreachable!("next_ix only lands on branch rows");
+        };
+        let Some(reveal) = self.active_repo().and_then(|repo| {
+            super::super::rows::sidebar::branch_click_history_reveal_target(repo, target, *is_head)
+        }) else {
+            return false;
+        };
+        self.select_branch_and_reveal_tip(
+            repo_id,
+            target.clone(),
+            reveal.commit_id,
+            reveal.fallback_scope,
+            cx,
+        );
+        self.branch_keyboard_row = Some(next_ix);
+        self.branches_scroll
+            .scroll_to_item(next_ix, gpui::ScrollStrategy::Nearest);
+        true
     }
 
     pub(in super::super) fn selected_branch(&self) -> Option<&SelectedBranch> {
@@ -1145,6 +1217,7 @@ impl SidebarPaneView {
         let content = match mode {
             SidebarMode::Branches => self.render_branches_content(theme, cx),
             SidebarMode::Files => self.render_file_browser_content(theme, cx),
+            SidebarMode::PullRequests => self.render_pull_requests_content(theme, cx),
         };
 
         // `size_full`, not just `h_full`: mounted as a cached view this is laid
@@ -1155,6 +1228,7 @@ impl SidebarPaneView {
             .flex_col()
             .size_full()
             .min_h(px(0.0))
+            .track_focus(&self.panel_focus_handle)
             .child(tab_bar)
             .child(content)
     }
@@ -1775,6 +1849,12 @@ impl SidebarPaneView {
             cx,
         );
         let files_tab = make_tab("sidebar_tab_files", "Files", SidebarMode::Files, cx);
+        let pull_requests_tab = make_tab(
+            "sidebar_tab_pull_requests",
+            "Pull requests",
+            SidebarMode::PullRequests,
+            cx,
+        );
 
         // Each tab keeps its locate action in the same trailing slot for the
         // whole time its tree is visible. Unavailable actions grey out instead
@@ -1800,6 +1880,7 @@ impl SidebarPaneView {
             .bg(bg)
             .child(branches_tab)
             .child(files_tab)
+            .child(pull_requests_tab)
             .when(mode == SidebarMode::Branches, |strip| {
                 let tooltip = active_local_branch_name.map_or_else(
                     || SharedString::from("No active local branch to show"),
@@ -3045,6 +3126,202 @@ impl SidebarPaneView {
                 });
             });
         });
+    }
+}
+
+impl SidebarPaneView {
+    /// The Pull requests tab: the repository's open PRs, listed through gh.
+    fn render_pull_requests_content(
+        &mut self,
+        theme: AppTheme,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        use super::super::pull_requests::PrLoad;
+        use crate::github::PrError;
+
+        let Some(root) = self.root_view.upgrade() else {
+            return div().into_any_element();
+        };
+        let (has_github, list, selected) = {
+            let root = root.read(cx);
+            let prs = root.active_pull_requests();
+            (
+                root.github_target().is_some(),
+                prs.map(|prs| prs.list.clone()).unwrap_or_default(),
+                prs.and_then(|prs| prs.selected),
+            )
+        };
+        if has_github && matches!(list, PrLoad::Idle) {
+            let root = self.root_view.clone();
+            cx.defer(move |cx| {
+                let _ = root.update(cx, |root, cx| root.ensure_pull_requests_loaded(cx));
+            });
+        }
+
+        let empty = |title: &'static str, message: String| {
+            components::empty_state(theme, title, message).into_any_element()
+        };
+        if !has_github {
+            return empty(
+                "No GitHub remote",
+                "Pull requests work with a github.com remote.".to_string(),
+            );
+        }
+        match list {
+            PrLoad::Idle | PrLoad::Loading => {
+                components::empty_state_message(theme, "Loading pull requests…").into_any_element()
+            }
+            PrLoad::Failed(PrError::GhMissing) => empty(
+                "GitHub CLI not found",
+                "Pull requests go through gh. Install it and sign in, then press R.".to_string(),
+            ),
+            PrLoad::Failed(PrError::GhSignedOut) => empty(
+                "gh isn't signed in",
+                "Run `gh auth login` in a terminal, then press R.".to_string(),
+            ),
+            PrLoad::Failed(PrError::Failed(message)) => {
+                empty("Couldn't list pull requests", message)
+            }
+            PrLoad::Ready(list) if list.is_empty() => empty(
+                "No open pull requests",
+                "n opens one from the checked-out branch.".to_string(),
+            ),
+            PrLoad::Ready(list) => self.pull_request_rows(theme, &list, selected, cx),
+        }
+    }
+
+    fn pull_request_rows(
+        &mut self,
+        theme: AppTheme,
+        list: &[crate::github::PullRequestSummary],
+        selected: Option<u64>,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        use crate::github::ReviewDecision;
+
+        let secondary = theme.colors.foreground.secondary;
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .child(
+                div()
+                    .text_size(theme.ui_text(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("Open · {}", list.len())),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(theme.ui_text(11.0))
+                    .text_color(secondary)
+                    .child("n new · R refresh"),
+            );
+
+        let rows = list.iter().map(|pr| {
+            let number = pr.number;
+            let mut badges: Vec<(String, gpui::Rgba)> = Vec::new();
+            if pr.is_draft {
+                badges.push(("Draft".to_string(), secondary));
+            }
+            if let Some(review) = pr.review {
+                let color = match review {
+                    ReviewDecision::Approved => theme.colors.status.success.foreground,
+                    ReviewDecision::ChangesRequested => theme.colors.status.danger.foreground,
+                    ReviewDecision::ReviewRequired => theme.colors.status.warning.foreground,
+                };
+                badges.push((review.label().to_string(), color));
+            }
+            let checks = pr.checks;
+            if checks.total() > 0 {
+                let (label, color) = if checks.failing > 0 {
+                    (
+                        format!("{} failing", checks.failing),
+                        theme.colors.status.danger.foreground,
+                    )
+                } else if checks.pending > 0 {
+                    (
+                        format!("{} pending", checks.pending),
+                        theme.colors.status.warning.foreground,
+                    )
+                } else {
+                    (
+                        format!("{} passing", checks.passing),
+                        theme.colors.status.success.foreground,
+                    )
+                };
+                badges.push((label, color));
+            }
+            div()
+                .id(SharedString::from(format!("pull_request_row_{number}")))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .mx_1()
+                .px_2()
+                .py_1()
+                .rounded(px(theme.radii.control))
+                .control_interaction(
+                    controls::InteractionStyle::new(theme),
+                    controls::InteractionState::default().selected(
+                        selected == Some(number),
+                        theme.colors.interaction.selected_background,
+                    ),
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.panel_focus_handle, cx);
+                        // The root repaints this pane; it can't while we're mid-update.
+                        let root = this.root_view.clone();
+                        cx.defer(move |cx| {
+                            let _ =
+                                root.update(cx, |root, cx| root.select_pull_request(number, cx));
+                        });
+                    }),
+                )
+                .child(
+                    div()
+                        .text_size(theme.ui_text(13.0))
+                        .truncate()
+                        .child(pr.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_size(theme.ui_text(11.0))
+                        .text_color(secondary)
+                        .child(div().truncate().child(format!(
+                            "#{number} · {} · {} → {}",
+                            pr.author, pr.head, pr.base
+                        )))
+                        .children(badges.into_iter().map(|(label, color)| {
+                            div().flex_none().text_color(color).child(label)
+                        })),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(header)
+            .child(
+                div()
+                    .id("pull_request_list")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .into_any_element()
     }
 }
 

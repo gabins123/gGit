@@ -3397,7 +3397,9 @@ fn full_chrome_layout_caches_the_pane_subviews() {
         "expected bottom status bar to mount directly"
     );
     assert!(
+        // rustfmt may wrap a mount site and leave a trailing comma inside it.
         normalized
+            .replace(",)", ")")
             .matches("stable_cached_fill_view(self.main_pane.clone())")
             .count()
             >= 2,

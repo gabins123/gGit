@@ -8,6 +8,7 @@ Source of truth:
 - `crates/gitcomet-ui-gpui/src/view/terminal_panel.rs`
 - `crates/gitcomet-ui-gpui/src/view/panels/main/diff_view.rs`
 - `crates/gitcomet-ui-gpui/src/view/conflict_resolver.rs`
+- `crates/gitcomet-ui-gpui/src/view/panel_focus.rs`
 
 Notes:
 - `Cmd` and `Option` are the macOS names. `Ctrl` and `Alt` are the Windows/Linux equivalents.
@@ -39,6 +40,75 @@ macOS-only window-management shortcuts:
 - `Cmd-M`: Minimize the active window.
 - `Cmd-H`: Hide GitComet.
 - `Option-Cmd-H`: Hide other applications.
+
+## Panel navigation
+
+Lazygit-style keyboard focus across the four main panels. The focused panel carries an outline.
+
+These keys only work while a panel itself has focus (or nothing does). They are inert while typing in any text field, in the embedded terminal, and while a menu, popover, picker, dialog, the command palette or the conflict resolver has focus.
+
+| Action | Key | Notes |
+| --- | --- | --- |
+| Focus Sidebar / History / Diff / Details | `1` / `2` / `3` / `4` | Opens a collapsed Sidebar or Details first. History and the diff share the main area: `2` closes an open diff, and `3` does nothing unless a diff is open. |
+| Previous / next panel | `h` / `l`, `Left` / `Right` | Skips collapsed panels and whichever of History or Diff is not showing. Never wraps. |
+| Move within the focused panel | `j` / `k`, `Down` / `Up` | `j` moves down and `k` up. Sidebar: next/previous branch, revealed in History. History: next/previous commit. Diff: next/previous change. Details: next/previous file, opening its diff; starts at the first file when none is selected. |
+| Open | `Enter` | Sidebar → History. History → Details (the commit's files). Details → the file's diff. |
+| Back from a diff | `Escape` | Closes the diff and returns focus to the panel it was opened from. |
+| Previous / next sidebar tab | `[` / `]` | Branches, Files and Pull requests. |
+| List the focused panel's keys | `?` | Modal; `Escape` or `?` closes it. The status bar also shows the focused panel's main keys. |
+
+When a dialog or menu opened from these keys closes, focus returns to the panel it was opened from. Focus whose element disappears (a dialog confirmed, a row removed) likewise returns to the last focused panel.
+
+### Git actions
+
+Single keys for everyday Git work, lazygit-style. Each one runs the same action (and the same confirmation dialog) as the matching context-menu entry or button. `m` opens the selection's full context menu, driven with the arrow keys and `Enter` (the commit menu's entries also have letter keys), so every row action is reachable without the mouse.
+
+| Action | Key | Where | Notes |
+| --- | --- | --- | --- |
+| Write the commit message | `c` | Any panel | Opens Details and focuses the message box. A commit selected in History is deselected first so the box shows. |
+| Toggle amending the last commit | `Shift+A` | Any panel | Then focuses the message box. Unavailable during a merge or rebase, or before the first commit. |
+| Pull / push | `p` / `Shift+P` | Any panel | The main Pull and Push buttons: the default pull mode, and a set-upstream dialog for a branch without one. |
+| Fetch all remotes | `f` | Any panel | |
+| Stash the changes | `s` | Any panel | Opens the stash dialog. Apply, pop and drop are in the command palette. |
+| Stage / unstage the open file, then the next | `Space` | Details, Diff | The diff's existing `Space`, reachable from Details too. |
+| Stage everything, or unstage it all | `a` | Details | Stages all changes; with nothing left to stage, unstages everything. |
+| Discard the open file's changes | `d` | Details, Diff | Always confirms. Not for conflicted files. |
+| The selection's context menu | `m` | Any panel | Sidebar: the branch. History: the commit. Details and Diff: the open file. |
+| Check out the branch | `Space` | Sidebar | A remote branch asks for the local branch name. |
+| New branch from the selected one | `n` | Sidebar | With no branch selected, from the current one. |
+| Delete the branch | `Shift+D` twice | Sidebar | The first press asks for the second. Local branches other than the checked-out one. An unmerged branch then asks before force-deleting. |
+| Merge it into the current branch | `Shift+M` twice | Sidebar | The first press asks for the second. |
+| Rebase the current branch onto it | `Shift+R` | Sidebar | Confirms first. |
+| Cherry-pick the commit | `Shift+C` | History | Confirms first. Not the HEAD commit. |
+| Revert the commit | `t` | History | Confirms first. |
+| Reset to the commit | `g` | History | A mixed reset, after confirming. Soft and hard resets are in the commit's menu (`m`). |
+| Tag the commit | `Shift+T` | History | |
+
+On the Pull requests tab, its own keys (`n`, `r`, `o`, `Shift+R`) take precedence. While the conflict resolver is open, `a`–`d` (with or without `Shift`) stay its picks.
+
+### Pull requests tab
+
+GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`), which owns sign-in; GitComet never sees a token. The tab lists the open pull requests of the repository's github.com remote: `upstream` first (a fork's parent, where gh sends pull requests too), then `origin`. A branch pushed to a fork opens its pull request as `owner:branch`.
+
+| Action | Key | Notes |
+| --- | --- | --- |
+| Next / previous pull request | `j` / `k` | Sidebar. Selecting one shows it in Details. |
+| Next / previous changed file | `j` / `k` | Details, while it shows a pull request. Moves the diff along once one is open. |
+| Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. Pull requests over 100 files or 20,000 changed lines are left to GitHub. |
+| New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, and `Ctrl+Enter` (`Cmd+Enter`) creates. |
+| Review | `r` | `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
+| Open on GitHub | `o` | The selected pull request, or the repository's pull request list. |
+| Refresh | `Shift+R` | The list loads when the tab first shows; there is no polling. |
+
+### Codex
+
+Read-only suggestions from Codex through the `codex` CLI on your ChatGPT subscription; sign-in stays with the CLI (`codex login`). Each run is `codex exec` with its shell tool off, a read-only sandbox, no saved session and in an empty temporary directory with none of your Codex config, rules, hooks, apps or plugins, and with shell, browser, computer-use, image and web-search tools off. Your global Codex instructions (`~/.codex/AGENTS.md`) may still apply. GitComet gathers the material itself and pipes it in, marked as data; pull request content is also marked as untrusted. Nothing is posted, committed or pushed. The one write is filling the commit message box, and only while it is empty.
+
+| Action | Key | Notes |
+| --- | --- | --- |
+| Codex actions | `i` | A menu: `m` commit message, `r` review local changes, `d` explain the open diff, `c` explain the selected commit, `f` explain the open file, `p` review the selected pull request, `q` ask about the repository. |
+| Focus the Codex panel | `0` | The answer is editable. In the panel: `y` copy, `u` use as the selected pull request's review, `e` edit, `a` ask, `s` stop a run, `x` or `Escape` close. |
+| Draft a review with Codex | `Alt+G` | In the review dialog. The draft fills the box when it is still empty. |
 
 ## Text input shortcuts
 
