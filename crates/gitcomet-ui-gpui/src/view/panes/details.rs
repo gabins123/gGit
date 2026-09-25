@@ -1,5 +1,6 @@
 use super::super::path_display;
 use super::super::*;
+use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use crate::kit::text_truncation::path_alignment_visible_signature;
 use gitcomet_state::model::{AuthRetryOperation, CommandLogEntry};
 use rustc_hash::FxHasher;
@@ -2502,20 +2503,26 @@ impl DetailsPaneView {
                 .px_2()
                 .py(px(3.0))
                 .rounded(px(theme.radii.control))
-                .cursor(CursorStyle::PointingHand)
-                .when(selected_file == Some(ix), |row| {
-                    row.bg(theme.colors.interaction.selected_background)
-                })
-                .hover(move |style| style.bg(theme.colors.interaction.hover_background))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    window.focus(&this.panel_focus_handle, cx);
-                    // The root repaints this pane; it can't while we're mid-update.
-                    let root = this.root_view.clone();
-                    cx.defer(move |cx| {
-                        let _ =
-                            root.update(cx, |root, cx| root.open_pull_request_diff(Some(ix), cx));
-                    });
-                }))
+                .control_interaction(
+                    controls::InteractionStyle::new(theme),
+                    controls::InteractionState::default().selected(
+                        selected_file == Some(ix),
+                        theme.colors.interaction.selected_background,
+                    ),
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.panel_focus_handle, cx);
+                        // The root repaints this pane; it can't while we're mid-update.
+                        let root = this.root_view.clone();
+                        cx.defer(move |cx| {
+                            let _ = root
+                                .update(cx, |root, cx| root.open_pull_request_diff(Some(ix), cx));
+                        });
+                    }),
+                )
                 .child(
                     div()
                         .flex_1()

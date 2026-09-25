@@ -3263,19 +3263,26 @@ impl SidebarPaneView {
                 .px_2()
                 .py_1()
                 .rounded(px(theme.radii.control))
-                .cursor(CursorStyle::PointingHand)
-                .when(selected == Some(number), |row| {
-                    row.bg(theme.colors.interaction.selected_background)
-                })
-                .hover(move |style| style.bg(theme.colors.interaction.hover_background))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    window.focus(&this.panel_focus_handle, cx);
-                    // The root repaints this pane; it can't while we're mid-update.
-                    let root = this.root_view.clone();
-                    cx.defer(move |cx| {
-                        let _ = root.update(cx, |root, cx| root.select_pull_request(number, cx));
-                    });
-                }))
+                .control_interaction(
+                    controls::InteractionStyle::new(theme),
+                    controls::InteractionState::default().selected(
+                        selected == Some(number),
+                        theme.colors.interaction.selected_background,
+                    ),
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.panel_focus_handle, cx);
+                        // The root repaints this pane; it can't while we're mid-update.
+                        let root = this.root_view.clone();
+                        cx.defer(move |cx| {
+                            let _ =
+                                root.update(cx, |root, cx| root.select_pull_request(number, cx));
+                        });
+                    }),
+                )
                 .child(
                     div()
                         .text_size(theme.ui_text(13.0))

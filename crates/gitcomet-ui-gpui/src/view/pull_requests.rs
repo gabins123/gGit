@@ -13,18 +13,13 @@ use crate::github::{
 use gitcomet_state::model::SidebarMode;
 
 /// A value gh is fetching or has fetched.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(super) enum PrLoad<T> {
+    #[default]
     Idle,
     Loading,
     Ready(T),
     Failed(PrError),
-}
-
-impl<T> Default for PrLoad<T> {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl<T> PrLoad<T> {
