@@ -1014,4 +1014,12 @@ fn slash_filters_the_changes_list_fuzzily_and_by_file_type(cx: &mut gpui::TestAp
     press(cx, "escape");
     assert_eq!(shown(cx).len(), 3);
     assert_eq!(focused(cx, &view), Some(Details));
+
+    // `/` works from another panel too: the Changes list is still what it
+    // filters.
+    press(cx, "2 /");
+    press(cx, "p a n e");
+    assert_eq!(shown(cx), ["src/pane.rs", "src/panel.rs"]);
+    press(cx, "escape");
+    assert_eq!(shown(cx).len(), 3);
 }

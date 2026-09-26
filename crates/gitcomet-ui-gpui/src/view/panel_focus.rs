@@ -1006,9 +1006,12 @@ impl GitCometView {
             (Some(FocusPanel::Details), "a") if worktree_shown => {
                 self.stage_or_unstage_all(window, cx)
             }
-            (Some(FocusPanel::Details), "/")
-                if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>
-            {
+            // From any panel, or none: the Changes list is the one list
+            // it filters, and it's on screen whenever this is true.
+            (_, "/") if self.changes_list_shown() => {
+                if self.details_collapsed {
+                    self.set_details_collapsed(false, cx);
+                }
                 self.details_pane
                     .update(cx, |pane, cx| pane.open_changes_query(cx));
             }
