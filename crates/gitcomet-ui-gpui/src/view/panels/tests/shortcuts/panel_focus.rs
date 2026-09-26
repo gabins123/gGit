@@ -956,3 +956,62 @@ fn the_create_dialog_steps_the_base_toggles_the_push_and_guards_submit(
     seed(cx, "owner");
     assert!(!form(cx).2);
 }
+
+#[gpui::test]
+fn slash_filters_the_changes_list_fuzzily_and_by_file_type(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    let file = |path: &str| gitcomet_core::domain::FileStatus {
+        path: path.into(),
+        kind: FileStatusKind::Modified,
+        conflict: None,
+    };
+    repo.worktree_status = Loadable::Ready(Arc::new(vec![
+        file("docs/notes.md"),
+        file("src/pane.rs"),
+        file("src/panel.rs"),
+    ]));
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_change_tracking_view(crate::view::ChangeTrackingView::Unified, cx)
+        })
+    });
+    draw_and_drain_test_window(cx);
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .details_pane
+                .read(app)
+                .changes_drawn(REPO)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(shown(cx).len(), 3);
+
+    // `/` hands the keyboard to the filter box: letters filter, they don't
+    // run panel keys. "pnl" is in order in panel.rs only.
+    press(cx, "4 /");
+    press(cx, "p n l");
+    assert_eq!(shown(cx), ["src/panel.rs"]);
+    assert_eq!(focused(cx, &view), None);
+
+    // Enter keeps the filter and goes back to the list; Esc there clears it.
+    press(cx, "enter");
+    assert_eq!(focused(cx, &view), Some(Details));
+    assert_eq!(shown(cx), ["src/panel.rs"]);
+    press(cx, "escape");
+    assert_eq!(shown(cx).len(), 3);
+
+    // `.md` keeps a file type; Esc in the box clears it and returns too.
+    press(cx, "/");
+    press(cx, ". m d");
+    assert_eq!(shown(cx), ["docs/notes.md"]);
+    press(cx, "escape");
+    assert_eq!(shown(cx).len(), 3);
+    assert_eq!(focused(cx, &view), Some(Details));
+}

@@ -501,8 +501,8 @@ impl GitCometView {
                         ("j/k", "file"),
                         ("space", "stage"),
                         ("a", "all"),
-                        ("F", "filter"),
-                        ("c", "commit"),
+                        ("/", "filter"),
+                        ("F", "kind"),
                     ];
                 }
                 FocusPanel::Diff => {
@@ -598,7 +598,12 @@ impl GitCometView {
                         ("space", "Stage / unstage the open file; it keeps its place"),
                         ("a", "Stage what the list shows, or unstage it all"),
                         ("shift+space", "Stage / unstage the open file's folder"),
-                        ("F", "Filter: all, unstaged, staged, untracked"),
+                        (
+                            "/",
+                            "Filter by path, fuzzy; .rs keeps a file type. Enter keeps it",
+                        ),
+                        ("esc", "Clear the / filter"),
+                        ("F", "Show all, unstaged, staged or untracked"),
                         ("`", "Tree or flat list"),
                         ("o", "Sort the list"),
                         ("d", "Discard the open file's changes"),
@@ -1000,6 +1005,20 @@ impl GitCometView {
             (Some(panel), "m") => self.open_selection_menu(panel, repo_id, window, cx),
             (Some(FocusPanel::Details), "a") if worktree_shown => {
                 self.stage_or_unstage_all(window, cx)
+            }
+            (Some(FocusPanel::Details), "/")
+                if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>
+            {
+                self.details_pane
+                    .update(cx, |pane, cx| pane.open_changes_query(cx));
+            }
+            (Some(FocusPanel::Details), "escape")
+                if worktree_shown
+                    && self.change_tracking_view == ChangeTrackingView::Unified
+                    && self.details_pane.read(cx).changes_query_active() =>
+            {
+                self.details_pane
+                    .update(cx, |pane, cx| pane.clear_changes_query(window, cx));
             }
             (Some(FocusPanel::Details), "SPACE")
                 if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>

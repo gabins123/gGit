@@ -118,6 +118,76 @@ impl ChangesFilter {
     }
 }
 
+/// The `/` filter. Space-separated words must each fuzzy-match the path: its
+/// letters in order, anything in between, the way fzf and lazygit match.
+/// `.rs` or `*.rs` words name the file types to keep instead, any of them.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub(in crate::view) struct ChangesQuery {
+    terms: Vec<Box<str>>,
+    types: Vec<Box<str>>,
+}
+
+impl ChangesQuery {
+    pub(in crate::view) fn parse(raw: &str) -> Self {
+        let mut query = Self::default();
+        for word in raw.split_whitespace() {
+            let word = word.to_lowercase();
+            match word.strip_prefix("*.").or_else(|| word.strip_prefix('.')) {
+                // A bare `.` or `*.` is a type still being typed.
+                Some("") => {}
+                Some(file_type) => query.types.push(file_type.into()),
+                None => query.terms.push(word.into()),
+            }
+        }
+        query
+    }
+
+    pub(in crate::view) fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.types.is_empty()
+    }
+
+    fn matches(&self, haystack: &str, file_type: &str) -> bool {
+        (self.types.is_empty() || self.types.iter().any(|kept| **kept == *file_type))
+            && self.terms.iter().all(|term| fuzzy_contains(haystack, term))
+    }
+}
+
+/// Whether `needle`'s characters appear in `haystack` in order. Both come
+/// lowercased; ASCII, which nearly every path is, compares bytes and
+/// allocates nothing, so a keystroke over thousands of files stays instant.
+fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
+    if haystack.is_ascii() && needle.is_ascii() {
+        let mut rest = haystack.as_bytes();
+        return needle
+            .bytes()
+            .all(|byte| match rest.iter().position(|b| *b == byte) {
+                Some(ix) => {
+                    rest = &rest[ix + 1..];
+                    true
+                }
+                None => false,
+            });
+    }
+    let mut rest = haystack.chars();
+    needle
+        .chars()
+        .all(|ch| rest.any(|candidate| candidate == ch))
+}
+
+/// A file's type as the filter spells it: its extension, or a dotfile's own
+/// name (`.gitignore` is type `gitignore`). Lowercase; empty when it has none.
+fn file_type(path: &Path) -> Box<str> {
+    match path.extension() {
+        Some(ext) => ext.to_string_lossy().to_lowercase().into(),
+        None => path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .and_then(|name| name.strip_prefix('.').map(str::to_lowercase))
+            .unwrap_or_default()
+            .into(),
+    }
+}
+
 /// Every changed path once, in path order.
 pub(in crate::view) struct ChangesList {
     /// The worktree entry where there is one, else the staged one: its kind is
@@ -126,6 +196,12 @@ pub(in crate::view) struct ChangesList {
     pub(in crate::view) lanes: Vec<ChangeLanes>,
     /// Both lanes' `+/-` added up, for the rows and the edit-size sorts.
     stats: FxHashMap<PathBuf, LineStats>,
+    /// Per entry: the path lowercased with `/` separators, and its file type.
+    /// Worked out once per status so the `/` filter only compares.
+    haystacks: Vec<Box<str>>,
+    types: Vec<Box<str>>,
+    /// The file types present, most files first, for the filter's type chips.
+    type_counts: Vec<(Box<str>, usize)>,
 }
 
 impl ChangesList {
@@ -148,11 +224,25 @@ impl ChangesList {
         let mut entries = Vec::with_capacity(by_path.len());
         let mut lanes = Vec::with_capacity(by_path.len());
         let mut stats = FxHashMap::default();
+        let mut haystacks = Vec::with_capacity(by_path.len());
+        let mut types = Vec::with_capacity(by_path.len());
+        let mut type_counts: FxHashMap<Box<str>, usize> = FxHashMap::default();
         for (path, (staged, unstaged)) in by_path {
             let Some(entry) = unstaged.or(staged) else {
                 continue;
             };
             entries.push(entry.clone());
+            haystacks.push(
+                path.to_string_lossy()
+                    .replace('\\', "/")
+                    .to_lowercase()
+                    .into_boxed_str(),
+            );
+            let kind = file_type(path);
+            if !kind.is_empty() {
+                *type_counts.entry(kind.clone()).or_default() += 1;
+            }
+            types.push(kind);
             lanes.push(ChangeLanes {
                 staged: staged.map(|entry| entry.kind),
                 unstaged: unstaged.map(|entry| entry.kind),
@@ -175,11 +265,25 @@ impl ChangesList {
                 stats.insert(path.to_path_buf(), combined);
             }
         }
+        let mut type_counts: Vec<(Box<str>, usize)> = type_counts.into_iter().collect();
+        type_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Self {
             entries,
             lanes,
             stats,
+            haystacks,
+            types,
+            type_counts,
         }
+    }
+
+    /// Which entries `query` keeps, as a mask over the list; `None` keeps all.
+    fn matching(&self, query: &ChangesQuery) -> Option<Vec<bool>> {
+        (!query.is_empty()).then(|| {
+            (0..self.entries.len())
+                .map(|ix| query.matches(&self.haystacks[ix], &self.types[ix]))
+                .collect()
+        })
     }
 
     pub(in crate::view) fn position(&self, path: &Path) -> Option<usize> {
@@ -188,11 +292,13 @@ impl ChangesList {
             .ok()
     }
 
-    fn counts(&self) -> [usize; 4] {
+    /// Per kind filter, the files it shows among `matched` (all when `None`).
+    fn counts(&self, matched: Option<&[bool]>) -> [usize; 4] {
         ChangesFilter::ALL.map(|filter| {
-            self.lanes
-                .iter()
-                .filter(|lanes| lanes.shown_by(filter))
+            (0..self.lanes.len())
+                .filter(|ix| {
+                    matched.is_none_or(|matched| matched[*ix]) && self.lanes[*ix].shown_by(filter)
+                })
                 .count()
         })
     }
@@ -241,6 +347,11 @@ fn changes_step(drawn: &[&Path], path: &Path, direction: i8) -> Option<usize> {
 #[derive(Default)]
 pub(super) struct ChangesCache {
     list: std::cell::RefCell<Option<(u64, Arc<ChangesList>)>>,
+    /// What the `/` filter keeps, keyed by the list and the query.
+    matched: std::cell::RefCell<Option<(u64, Option<Arc<[bool]>>)>>,
+    /// The kind-filtered list sorted, without the `/` filter: a keystroke
+    /// only masks this, it never sorts again.
+    sorted: std::cell::RefCell<Option<(u64, Arc<[usize]>)>>,
     order: std::cell::RefCell<Option<(u64, Arc<[usize]>)>>,
     plan: std::cell::RefCell<crate::view::rows::FileListPlanCache>,
 }
@@ -261,6 +372,8 @@ fn changes_list_key(repo: &RepoState) -> u64 {
 /// Which of the list's entries a tree row shows, or a folder's files.
 struct ChangesRows {
     list: Arc<ChangesList>,
+    /// What the `/` filter keeps, before the kind filter; `None` is all.
+    matched: Option<Arc<[bool]>>,
     /// Projection order: filtered and sorted indexes into `list`.
     order: Arc<[usize]>,
     plan: Arc<crate::view::rows::FileListPlan>,
@@ -313,13 +426,61 @@ impl DetailsPaneView {
             changes_list_key(repo),
             self.file_list_sort_for(FileListId::Changes),
             self.changes_filter,
+            &self.changes_query,
         )
             .hash(&mut hasher);
         hasher.finish()
     }
 
+    /// The kind-filtered list in sort order, before the `/` filter.
+    fn changes_sorted(
+        &self,
+        repo: &RepoState,
+        list: &ChangesList,
+        sort: crate::view::rows::CommitFileSort,
+    ) -> Arc<[usize]> {
+        let mut hasher = FxHasher::default();
+        (changes_list_key(repo), sort, self.changes_filter).hash(&mut hasher);
+        let key = hasher.finish();
+        let mut cache = self.changes.sorted.borrow_mut();
+        if let Some((cached, sorted)) = cache.as_ref()
+            && *cached == key
+        {
+            return Arc::clone(sorted);
+        }
+        let shown: Vec<usize> = (0..list.entries.len())
+            .filter(|ix| list.lanes[*ix].shown_by(self.changes_filter))
+            .collect();
+        let sorted = crate::view::rows::status_section_sorted_indexes(
+            &list.entries,
+            &shown,
+            sort,
+            Some(&list.stats),
+        );
+        *cache = Some((key, Arc::clone(&sorted)));
+        sorted
+    }
+
+    /// The `/` filter's matches, recomputed only when the list or the query
+    /// changes, so scrolling and repaints never re-run it.
+    fn changes_matched(&self, repo: &RepoState, list: &ChangesList) -> Option<Arc<[bool]>> {
+        let mut hasher = FxHasher::default();
+        (changes_list_key(repo), &self.changes_query).hash(&mut hasher);
+        let key = hasher.finish();
+        let mut cache = self.changes.matched.borrow_mut();
+        if let Some((cached, matched)) = cache.as_ref()
+            && *cached == key
+        {
+            return matched.clone();
+        }
+        let matched: Option<Arc<[bool]>> = list.matching(&self.changes_query).map(Into::into);
+        *cache = Some((key, matched.clone()));
+        matched
+    }
+
     fn changes_rows(&self, repo: &RepoState) -> Option<ChangesRows> {
         let list = self.changes_list(repo)?;
+        let matched = self.changes_matched(repo, &list);
         let sort = self.file_list_sort_for(FileListId::Changes);
         let key = self.changes_projection_key(repo);
         let order = {
@@ -327,15 +488,11 @@ impl DetailsPaneView {
             match cache.as_ref() {
                 Some((cached, order)) if *cached == key => Arc::clone(order),
                 _ => {
-                    let shown: Vec<usize> = (0..list.entries.len())
-                        .filter(|ix| list.lanes[*ix].shown_by(self.changes_filter))
-                        .collect();
-                    let order = crate::view::rows::status_section_sorted_indexes(
-                        &list.entries,
-                        &shown,
-                        sort,
-                        Some(&list.stats),
-                    );
+                    let sorted = self.changes_sorted(repo, &list, sort);
+                    let order: Arc<[usize]> = match &matched {
+                        Some(matched) => sorted.iter().copied().filter(|ix| matched[*ix]).collect(),
+                        None => sorted,
+                    };
                     *cache = Some((key, Arc::clone(&order)));
                     order
                 }
@@ -363,7 +520,12 @@ impl DetailsPaneView {
                         sort,
                     )
                 });
-        Some(ChangesRows { list, order, plan })
+        Some(ChangesRows {
+            list,
+            matched,
+            order,
+            plan,
+        })
     }
 
     /// The shown files in drawn order, for `j`/`k` from Details and the diff.
@@ -538,7 +700,8 @@ impl DetailsPaneView {
             .order
             .iter()
             .map(|ix| (rows.list.entries[*ix].path.as_path(), rows.list.lanes[*ix]));
-        let all = self.changes_filter == ChangesFilter::All;
+        // Filtered either way, it names the files: an empty list is all of them.
+        let all = self.changes_filter == ChangesFilter::All && self.changes_query.is_empty();
         let Some((stage, paths)) = toggle_plan(shown, stage, all) else {
             return;
         };
@@ -575,6 +738,84 @@ impl DetailsPaneView {
             Some((false, paths)) => self.unstage_changes(repo_id, paths, cx),
             None => {}
         }
+    }
+
+    /// Whether the `/` filter narrows the list.
+    pub(in crate::view) fn changes_query_active(&self) -> bool {
+        !self.changes_query.is_empty()
+    }
+
+    /// `/`: shows the filter box and focuses it on the next frame, so the `/`
+    /// that opened it isn't typed into it.
+    pub(in crate::view) fn open_changes_query(&mut self, cx: &mut gpui::Context<Self>) {
+        self.changes_query_open = true;
+        self.changes_query_focus_pending = true;
+        cx.notify();
+    }
+
+    /// Esc: drops the filter and hands the keyboard back to the list.
+    pub(in crate::view) fn clear_changes_query(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.changes_query_open = false;
+        if !self.changes_query_input.read(cx).text().is_empty() {
+            self.changes_query_input
+                .update(cx, |input, cx| input.set_text("", cx));
+        }
+        if !self.changes_query.is_empty() {
+            self.changes_query = ChangesQuery::default();
+            self.notify_commit_file_projection_dependents(cx);
+        }
+        window.focus(&self.panel_focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Typing filters as it goes; Enter keeps the filter and goes back to the
+    /// list, Esc drops it.
+    pub(super) fn changes_query_input_changed(
+        &mut self,
+        input: Entity<components::TextInput>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let (enter, escape) = input.update(cx, |input, _| {
+            (input.take_enter_pressed(), input.take_escape_pressed())
+        });
+        if escape {
+            self.clear_changes_query(window, cx);
+            return;
+        }
+        let query = ChangesQuery::parse(input.read(cx).text());
+        if query != self.changes_query {
+            self.changes_query = query;
+            self.notify_commit_file_projection_dependents(cx);
+            cx.notify();
+        }
+        if enter {
+            self.changes_query_open = false;
+            window.focus(&self.panel_focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// A type chip: adds `.ext` to the filter, or takes it back out.
+    fn toggle_changes_type(&mut self, file_type: &str, cx: &mut gpui::Context<Self>) {
+        let text = self.changes_query_input.read(cx).text().to_string();
+        let token = format!(".{file_type}");
+        let starred = format!("*{token}");
+        let mut words: Vec<&str> = text.split_whitespace().collect();
+        let before = words.len();
+        words.retain(|word| {
+            !word.eq_ignore_ascii_case(&token) && !word.eq_ignore_ascii_case(&starred)
+        });
+        if words.len() == before {
+            words.push(&token);
+        }
+        let next = words.join(" ");
+        self.changes_query_input
+            .update(cx, |input, cx| input.set_text(next, cx));
     }
 
     /// `Shift+Space`: the open file's folder, stage or unstage; the folder
@@ -619,7 +860,11 @@ impl DetailsPaneView {
             });
         let busy = repo.local_actions_in_flight > 0;
         let rows = self.changes_rows(repo);
-        let counts = rows.as_ref().map_or([0; 4], |rows| rows.list.counts());
+        let counts = rows
+            .as_ref()
+            .map_or([0; 4], |rows| rows.list.counts(rows.matched.as_deref()));
+        let total = rows.as_ref().map_or(0, |rows| rows.list.entries.len());
+        let querying = !self.changes_query.is_empty();
         let shown = rows.as_ref().map_or(0, |rows| rows.order.len());
         let row_count = rows.as_ref().map_or(0, |rows| rows.plan.row_len());
         let any_unstaged = rows
@@ -656,7 +901,11 @@ impl DetailsPaneView {
                     .text_size(theme.ui_text(14.0))
                     .font_weight(FontWeight::BOLD)
                     .whitespace_nowrap()
-                    .child(format!("Changes · {}", counts[0])),
+                    .child(if querying {
+                        format!("Changes · {} of {total}", counts[0])
+                    } else {
+                        format!("Changes · {}", counts[0])
+                    }),
             )
             .child(svg_icon("icons/chevron_down.svg", icon_muted, px(12.0)))
             .on_activate(
@@ -758,6 +1007,99 @@ impl DetailsPaneView {
             );
         }
 
+        let query_bar = (self.changes_query_open || querying).then(|| {
+            let kept_types = &self.changes_query.types;
+            let type_chips = rows
+                .as_ref()
+                .map(|rows| {
+                    rows.list
+                        .type_counts
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (file_type, count))| {
+                    let selected = kept_types.contains(&file_type);
+                    div()
+                        .id(("changes_type_chip", ix))
+                        .debug_selector(move || format!("changes_type_chip_{ix}"))
+                        .flex_none()
+                        .px(ui_scale.px(6.0))
+                        .h(components::control_height(ui_scale))
+                        .flex()
+                        .items_center()
+                        .rounded(px(theme.radii.control))
+                        .text_size(theme.ui_text(12.0))
+                        .whitespace_nowrap()
+                        .text_color(if selected {
+                            theme.colors.interaction.selected_foreground
+                        } else {
+                            theme.colors.foreground.secondary
+                        })
+                        .control_interaction(
+                            InteractionStyle::new(theme).selection_outline(false),
+                            InteractionState::default()
+                                .selected(selected, theme.colors.interaction.selected_background),
+                        )
+                        .child(format!(".{file_type} {count}"))
+                        .on_activate(
+                            false,
+                            controls::ControlActivation::Action,
+                            cx.listener(move |this, e: &ClickEvent, _window, cx| {
+                                if e.standard_click() {
+                                    this.toggle_changes_type(&file_type, cx);
+                                }
+                            }),
+                        )
+                })
+                .collect::<Vec<_>>();
+            div()
+                .px_2()
+                .pb_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .rounded(px(theme.radii.control))
+                        .border_1()
+                        .border_color(theme.colors.stroke.default)
+                        .bg(theme.colors.surface.raised)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .py(ui_scale.px(4.0))
+                                .child(self.changes_query_input.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(theme.ui_text(11.5))
+                                .text_color(theme.colors.foreground.secondary)
+                                .child("Enter keeps · Esc clears"),
+                        ),
+                )
+                .when(!type_chips.is_empty(), |bar| {
+                    bar.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .children(type_chips),
+                    )
+                })
+        });
+
         let body = if let Some(error) = status_error.filter(|_| rows.is_none()) {
             components::empty_state_message(theme, format!("Couldn't read the changes: {error}"))
                 .into_any_element()
@@ -765,6 +1107,9 @@ impl DetailsPaneView {
             components::empty_state_message(theme, "Loading…").into_any_element()
         } else if counts[0] == 0 {
             components::empty_state_message(theme, "Working tree clean.").into_any_element()
+        } else if shown == 0 && querying {
+            components::empty_state_message(theme, "Nothing matches the filter. Esc clears it.")
+                .into_any_element()
         } else if shown == 0 {
             components::empty_state_message(
                 theme,
@@ -820,6 +1165,7 @@ impl DetailsPaneView {
             .h_full()
             .child(header)
             .child(chips)
+            .children(query_bar)
             .child(
                 div()
                     .relative()
@@ -1278,7 +1624,7 @@ mod tests {
         assert_eq!(list.lanes[1].area(), DiffArea::Unstaged);
         assert!(list.lanes[1].stages() && !list.lanes[0].stages());
         assert_eq!(list.position(Path::new("b.rs")), Some(1));
-        assert_eq!(list.counts(), [3, 1, 2, 1]);
+        assert_eq!(list.counts(None), [3, 1, 2, 1]);
     }
 
     #[test]
@@ -1359,6 +1705,49 @@ mod tests {
         assert_eq!(changes_step(&drawn, Path::new("b.rs"), 1), Some(1));
         assert_eq!(changes_step(&drawn, Path::new("b.rs"), -1), Some(0));
         assert_eq!(changes_step(&drawn, Path::new("z.rs"), 1), None);
+    }
+
+    #[test]
+    fn the_filter_matches_fuzzily_and_keeps_file_types() {
+        let query = ChangesQuery::parse("pnl FOC .RS");
+        assert!(query.matches("src/view/panel_focus.rs", "rs"));
+        assert!(!query.matches("src/view/panel_focus.md", "md"));
+        // Every word has to match, in any order of words.
+        assert!(!query.matches("src/view/panes/details.rs", "rs"));
+        // `*.md` too, and several types keep any of them.
+        let types = ChangesQuery::parse("*.md .toml");
+        assert!(types.matches("docs/shortcuts.md", "md"));
+        assert!(types.matches("cargo.toml", "toml"));
+        assert!(!types.matches("src/lib.rs", "rs"));
+        // A lone dot is a type still being typed, not a filter.
+        assert!(ChangesQuery::parse(". *.").is_empty());
+        assert!(fuzzy_contains("crates/ünïcode/ß.rs", "üß"));
+        assert!(!fuzzy_contains("abc", "cab"));
+        assert_eq!(&*file_type(Path::new(".gitignore")), "gitignore");
+        assert_eq!(&*file_type(Path::new("src/Main.RS")), "rs");
+        assert_eq!(&*file_type(Path::new("Makefile")), "");
+    }
+
+    #[test]
+    fn the_list_counts_types_most_first_and_filters_by_query() {
+        let worktree = [
+            status("src/a.rs", FileStatusKind::Modified),
+            status("src/b.rs", FileStatusKind::Modified),
+            status("docs/c.md", FileStatusKind::Modified),
+        ];
+        let list = ChangesList::build(&worktree, &[], None, None);
+        assert_eq!(list.type_counts, vec![("rs".into(), 2), ("md".into(), 1)]);
+        // Path order: docs/c.md, src/a.rs, src/b.rs.
+        assert_eq!(
+            list.matching(&ChangesQuery::parse(".md")),
+            Some(vec![true, false, false])
+        );
+        assert_eq!(
+            list.matching(&ChangesQuery::parse("src b")),
+            Some(vec![false, false, true])
+        );
+        assert_eq!(list.matching(&ChangesQuery::default()), None);
+        assert_eq!(list.counts(Some(&[false, true, true])), [2, 2, 0, 0]);
     }
 
     #[test]

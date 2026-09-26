@@ -203,6 +203,13 @@ pub(in super::super) struct DetailsPaneView {
     /// The one-list view's caches, and what its filter shows.
     changes: changes::ChangesCache,
     pub(in crate::view) changes_filter: ChangesFilter,
+    /// The `/` filter: its box, what it parsed to, whether the box shows while
+    /// empty, and a focus to hand it on the next frame.
+    pub(in crate::view) changes_query_input: Entity<components::TextInput>,
+    _changes_query_subscription: gpui::Subscription,
+    changes_query: changes::ChangesQuery,
+    changes_query_open: bool,
+    changes_query_focus_pending: bool,
 }
 
 pub(in super::super) struct DetailsPaneInit {
@@ -378,6 +385,22 @@ impl DetailsPaneView {
             this.apply_state_snapshot(next, cx);
             cx.notify();
         });
+
+        let changes_query_input = cx.new(|cx| {
+            components::TextInput::new_inert(
+                components::TextInputOptions {
+                    placeholder: "Filter: words match fuzzily; .rs keeps a file type".into(),
+                    leading_icon: Some("icons/zoom.svg"),
+                    chromeless: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        let changes_query_subscription =
+            cx.observe_in(&changes_query_input, window, |this, input, window, cx| {
+                this.changes_query_input_changed(input, window, cx)
+            });
 
         let commit_message_scroll = ScrollHandle::new();
         let commit_message_input = cx.new(|cx| {
@@ -597,6 +620,11 @@ impl DetailsPaneView {
             ),
             changes: Default::default(),
             changes_filter: ChangesFilter::default(),
+            changes_query_input,
+            _changes_query_subscription: changes_query_subscription,
+            changes_query: Default::default(),
+            changes_query_open: false,
+            changes_query_focus_pending: false,
         };
         pane.sync_scaled_section_heights_from_design();
         pane.set_theme(theme, cx);
@@ -2955,7 +2983,11 @@ impl DetailsPaneView {
 }
 
 impl Render for DetailsPaneView {
-    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.changes_query_focus_pending) {
+            let handle = self.changes_query_input.read(cx).focus_handle();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
         let (reviewing, pull_request) = self
             .root_view
             .upgrade()
