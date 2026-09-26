@@ -63,7 +63,9 @@ version = "0.2.5"
 edition = "2024"
 license = "AGPL-3.0-only"
 authors = ["AutoExplore Oy <info@autoexplore.ai>"]
-repository = "https://github.com/Auto-Explore/GitComet"
+# The fork's own: the update check follows its releases (ggit-release.yml),
+# and crash reports open issues here.
+repository = "https://github.com/gabins123/gGit"
 rust-version = "1.98.1"
 
 [workspace.dependencies]
