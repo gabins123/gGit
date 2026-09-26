@@ -2477,7 +2477,7 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (comments, selected, head_moved, thread, suggested, last_review) = {
+        let (comments, selected, head_moved, thread, suggested, last_review, offline, outdated) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
@@ -2517,10 +2517,62 @@ impl DetailsPaneView {
                     .map(|(_, suggestion)| suggestion.body.clone())
                     .collect::<Vec<_>>(),
                 last_review,
+                review.viewed_sync == super::super::review::ViewedSync::Offline,
+                // GitHub text from anyone who can comment: plain text only.
+                review
+                    .outdated_threads()
+                    .map(|thread| {
+                        let first = thread.comments.first();
+                        (
+                            format!(
+                                "{}:{}",
+                                thread.path,
+                                thread.original_line.unwrap_or_default()
+                            ),
+                            first.map(|c| c.author.clone()).unwrap_or_default(),
+                            first
+                                .and_then(|c| c.body.lines().next())
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
             )
         };
         let (last_line, last_body, last_gone) = last_review;
         let count = comments.len();
+        let outdated_count = outdated.len();
+        let outdated_rows = outdated
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (at, author, first))| {
+                div()
+                    .id(SharedString::from(format!("review_outdated_{ix}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(theme.radii.control))
+                    .control_interaction(
+                        controls::InteractionStyle::new(theme),
+                        controls::InteractionState::default().selected(
+                            selected == Some(count + ix),
+                            theme.colors.interaction.selected_background,
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_size(theme.ui_text(11.5))
+                            .text_color(secondary)
+                            .child(div().truncate().child(at))
+                            .child(div().flex_none().child(author)),
+                    )
+                    .child(div().truncate().text_size(theme.ui_text(12.5)).child(first))
+            });
         let rows = comments.into_iter().enumerate().map(|(ix, comment)| {
             let file = comment
                 .anchor
@@ -2627,6 +2679,16 @@ impl DetailsPaneView {
                         }),
                 )
             })
+            .when(offline, |panel| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(warning)
+                        .child("GitHub couldn't be reached, so viewed marks are this computer's only."),
+                )
+            })
             .when(head_moved, |panel| {
                 panel.child(
                     div()
@@ -2655,7 +2717,29 @@ impl DetailsPaneView {
                                 .child("No comments yet. In the diff, c comments on the line under the cursor; shift+j/k selects more lines."),
                         )
                     })
-                    .children(rows),
+                    .children(rows)
+                    .when(outdated_count > 0, |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .pt_2()
+                                .pb_1()
+                                .flex()
+                                .gap_2()
+                                .text_size(theme.ui_text(12.0))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("Outdated conversations ({outdated_count})")),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(secondary)
+                                        .child("j/k pick · r reply"),
+                                ),
+                        )
+                        .children(outdated_rows)
+                    }),
             )
             .child(
                 div()

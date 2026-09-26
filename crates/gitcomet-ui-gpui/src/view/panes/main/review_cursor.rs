@@ -15,6 +15,62 @@ const REVIEW_NO_LINE: &str = "Move to a line of the diff first.";
 const REVIEW_OUTSIDE_HUNK: &str =
     "GitHub only takes comments on changed lines and the 3 lines around them.";
 const REVIEW_ACROSS_GAP: &str = "A comment's lines have to be one unbroken run of the diff.";
+const REVIEW_SINCE_OLD_SIDE: &str = "Since your last review, the old side is that review's version, not the pull request's base: comment on new lines, or press L for the whole pull request.";
+const REVIEW_SINCE_OUTSIDE: &str = "GitHub only takes comments inside the pull request's own changes and the 3 lines around them; press L to see them.";
+const REVIEW_SINCE_LOADING: &str =
+    "Still working out which lines of this file the pull request changed.";
+const REVIEW_SINCE_FAILED: &str = "Couldn't work out which lines of this file the pull request changed; press L for the whole pull request.";
+
+/// The head-side lines of a file that the pull request's own diff covers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) enum SinceLines {
+    Loading,
+    Failed,
+    /// (first, last) ranges, GitHub's context included.
+    Ranges(Vec<(u32, u32)>),
+}
+
+/// Which lines of the shown diff take a review comment.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::view) enum ReviewCommentScope {
+    /// The pull request's own diff: changed lines and GitHub's context.
+    #[default]
+    Full,
+    /// The changes since your last review: only head-side lines inside the
+    /// pull request's own hunks.
+    Since(SinceLines),
+}
+
+/// A comment from `start` to `end` while the diff shows the changes since
+/// your last review: both ends on the head side, inside one hunk of the pull
+/// request's own diff.
+fn since_anchor(
+    path: &str,
+    start: ReviewRow,
+    end: ReviewRow,
+    lines: &SinceLines,
+) -> Result<ReviewAnchor, &'static str> {
+    let ranges = match lines {
+        SinceLines::Loading => return Err(REVIEW_SINCE_LOADING),
+        SinceLines::Failed => return Err(REVIEW_SINCE_FAILED),
+        SinceLines::Ranges(ranges) => ranges,
+    };
+    let head_line = |row: ReviewRow| match row.side_line() {
+        (ReviewSide::Right, line) => Ok(line),
+        (ReviewSide::Left, _) => Err(REVIEW_SINCE_OLD_SIDE),
+    };
+    let (first, last) = (head_line(start)?, head_line(end)?);
+    ranges
+        .iter()
+        .find(|(lo, hi)| (*lo..=*hi).contains(&first) && (*lo..=*hi).contains(&last))
+        .ok_or(REVIEW_SINCE_OUTSIDE)?;
+    Ok(ReviewAnchor {
+        path: path.to_owned(),
+        side: ReviewSide::Right,
+        line: last,
+        start: (first != last).then_some((ReviewSide::Right, first)),
+    })
+}
 
 /// What a gutter mark stands for, in the order one wins over another.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,6 +276,9 @@ impl MainPaneView {
         let Some(row) = self.review_row(visible_ix) else {
             return false;
         };
+        if let ReviewCommentScope::Since(lines) = &self.review_comment_scope {
+            return since_anchor("", row, row, lines).is_ok();
+        }
         if row.changed {
             return true;
         }
@@ -257,22 +316,25 @@ impl MainPaneView {
             .ok_or(REVIEW_NO_LINE)?;
         let start_row = self.review_row(lo).ok_or(REVIEW_NO_LINE)?;
         let end_row = self.review_row(hi).ok_or(REVIEW_NO_LINE)?;
-        // GitHub refuses a range whole if any row of it is outside a hunk, or
-        // if it spans the hidden gap behind a hunk header.
         let (Some(first), Some(last)) = (
             self.diff_source_visible_ix_for_visible_ix(lo),
             self.diff_source_visible_ix_for_visible_ix(hi),
         ) else {
             return Err(REVIEW_NO_LINE);
         };
-        for source_ix in first..=last {
-            let visible_ix = self.diff_visual_ix_for_source_visible_ix(source_ix);
-            if self.review_row(visible_ix).is_none() {
-                return Err(REVIEW_ACROSS_GAP);
-            }
-            if !self.review_row_commentable(visible_ix) {
-                return Err(REVIEW_OUTSIDE_HUNK);
-            }
+        // A range across the hidden gap behind a hunk header would hide lines
+        // it covers (a suggestion would delete them), in either diff.
+        let rows =
+            || (first..=last).map(|source_ix| self.diff_visual_ix_for_source_visible_ix(source_ix));
+        if rows().any(|visible_ix| self.review_row(visible_ix).is_none()) {
+            return Err(REVIEW_ACROSS_GAP);
+        }
+        if let ReviewCommentScope::Since(lines) = &self.review_comment_scope {
+            return since_anchor(path, start_row, end_row, lines);
+        }
+        // GitHub refuses a range whole if any row of it is outside a hunk.
+        if rows().any(|visible_ix| !self.review_row_commentable(visible_ix)) {
+            return Err(REVIEW_OUTSIDE_HUNK);
         }
         let end = end_row.side_line();
         // A range ending on a removed line counts in old line numbers, so it
@@ -445,5 +507,60 @@ impl MainPaneView {
             }
         };
         Some(text.trim_end_matches(['\n', '\r']).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn since_your_last_review_only_head_lines_in_the_prs_hunks_take_comments() {
+        let row = |old_line, new_line| ReviewRow {
+            old_line,
+            new_line,
+            changed: true,
+        };
+        let ranges = SinceLines::Ranges(vec![(10, 20), (40, 44)]);
+        let anchor = since_anchor("a.rs", row(None, Some(12)), row(Some(3), Some(15)), &ranges)
+            .expect("inside a hunk");
+        assert_eq!(
+            (anchor.side, anchor.line, anchor.start),
+            (ReviewSide::Right, 15, Some((ReviewSide::Right, 12)))
+        );
+        let one = since_anchor("a.rs", row(None, Some(44)), row(None, Some(44)), &ranges)
+            .expect("a single line");
+        assert_eq!(one.start, None);
+        let err =
+            |start, end, ranges: &SinceLines| since_anchor("a.rs", start, end, ranges).unwrap_err();
+        assert_eq!(
+            err(row(None, Some(30)), row(None, Some(30)), &ranges),
+            REVIEW_SINCE_OUTSIDE
+        );
+        // Across two hunks is two comments on GitHub, not one.
+        assert_eq!(
+            err(row(None, Some(20)), row(None, Some(40)), &ranges),
+            REVIEW_SINCE_OUTSIDE
+        );
+        assert_eq!(
+            err(row(Some(12), None), row(Some(12), None), &ranges),
+            REVIEW_SINCE_OLD_SIDE
+        );
+        assert_eq!(
+            err(
+                row(None, Some(12)),
+                row(None, Some(12)),
+                &SinceLines::Loading
+            ),
+            REVIEW_SINCE_LOADING
+        );
+        assert_eq!(
+            err(
+                row(None, Some(12)),
+                row(None, Some(12)),
+                &SinceLines::Failed
+            ),
+            REVIEW_SINCE_FAILED
+        );
     }
 }

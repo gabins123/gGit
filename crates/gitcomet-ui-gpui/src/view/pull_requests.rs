@@ -450,10 +450,14 @@ impl GitCometView {
         let Some(file) = detail.files.get(file_ix) else {
             return false;
         };
+        // Review mode's `L` starts the diff at your last review instead.
+        let from = self
+            .review_diff_base(repo_id, detail.number)
+            .unwrap_or_else(|| merge_base.clone());
         self.store.dispatch(Msg::SelectDiff {
             repo_id,
             target: DiffTarget::CommitRange {
-                from_commit_id: CommitId(merge_base.as_str().into()),
+                from_commit_id: CommitId(from.as_str().into()),
                 to_commit_id: Some(CommitId(detail.head_oid.as_str().into())),
                 path: Some(std::path::PathBuf::from(&file.path)),
             },
@@ -1145,6 +1149,16 @@ impl GitCometView {
         let entry = self.pull_requests.repo_mut(repo_id);
         entry.detail = PrLoad::Ready(Arc::new(detail));
         entry.diff_base = PrLoad::Ready(merge_base);
+    }
+
+    /// The pull request's head moved: its merge base may have too (a base
+    /// merged in), so the next diff works it out again.
+    pub(super) fn reset_pull_request_diff_base(&mut self, repo_id: RepoId) {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if !matches!(entry.diff_base, PrLoad::Idle) {
+            entry.diff_base = PrLoad::Idle;
+            entry.diff_seq += 1;
+        }
     }
 
     /// Clears a stale gh refusal when a review or create dialog opens.

@@ -536,7 +536,16 @@ pub(crate) struct ReviewThread {
     /// None once the lines it was on changed (outdated), or for a comment on
     /// the whole file.
     pub(crate) line: Option<u32>,
+    /// The line it was written on, in the commit it was written on.
+    pub(crate) original_line: Option<u32>,
     pub(crate) comments: Vec<ThreadComment>,
+}
+
+impl ReviewThread {
+    /// The lines it was on changed since: GitHub shows it as outdated.
+    pub(crate) fn outdated(&self) -> bool {
+        self.line.is_none() && self.original_line.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -547,6 +556,8 @@ struct RawReviewComment {
     path: String,
     #[serde(default)]
     line: Option<u32>,
+    #[serde(default)]
+    original_line: Option<u32>,
     #[serde(default)]
     side: Option<ReviewSide>,
     #[serde(default)]
@@ -583,6 +594,7 @@ fn review_threads(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
             path: root.path.clone(),
             side: root.side.unwrap_or(ReviewSide::Right),
             line: root.line,
+            original_line: root.original_line,
             comments: vec![comment(root)],
         })
         .collect();
@@ -1096,6 +1108,163 @@ pub(crate) fn last_review(
     Ok(latest_review_by(pages, &login))
 }
 
+/// Your viewed state of a pull request file, as GitHub keeps it per user.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ViewedState {
+    Viewed,
+    Unviewed,
+    /// Viewed, then changed by a later commit.
+    Dismissed,
+}
+
+/// The pull request's node id, which the viewed mutations take, and your
+/// viewed state of each of its files.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ViewedStates {
+    pub(crate) pr_id: String,
+    pub(crate) files: std::collections::BTreeMap<String, ViewedState>,
+}
+
+const VIEWED_STATES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { id files(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { path viewerViewedState } } } } }";
+
+/// GitHub's node ids are opaque but plain: nothing else reaches a mutation.
+fn is_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '='))
+}
+
+/// `owner/name` and a number GraphQL's 32-bit Int can carry.
+fn graphql_target(repo: &str, number: u64) -> Result<(&str, &str), PrError> {
+    match repo.split_once('/') {
+        Some((owner, name)) if is_repo_slug(repo) && number <= i32::MAX as u64 => Ok((owner, name)),
+        _ => Err(PrError::Failed(format!(
+            "{repo}#{number} isn't a GitHub pull request"
+        ))),
+    }
+}
+
+/// Your viewed state of every file of the pull request, every page of them.
+pub(crate) fn viewed_states(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+) -> Result<ViewedStates, PrError> {
+    let (owner, name) = graphql_target(repo, number)?;
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "graphql",
+        "--hostname=github.com",
+        "--paginate",
+        &format!("--raw-field=query={VIEWED_STATES_QUERY}"),
+        &format!("--raw-field=owner={owner}"),
+        &format!("--raw-field=name={name}"),
+        &format!("--field=number={number}"),
+    ]);
+    parse_viewed_states(&run(command, None)?)
+}
+
+/// gh's paginated GraphQL output: one JSON object per page, one after the
+/// other (or, with `--slurp`, an array of them).
+fn parse_viewed_states(stdout: &[u8]) -> Result<ViewedStates, PrError> {
+    #[derive(Deserialize)]
+    struct Page {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Repository,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Repository {
+        pull_request: PullRequest,
+    }
+    #[derive(Deserialize)]
+    struct PullRequest {
+        id: String,
+        files: Files,
+    }
+    #[derive(Deserialize)]
+    struct Files {
+        #[serde(default)]
+        nodes: Vec<Option<File>>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct File {
+        path: String,
+        viewer_viewed_state: String,
+    }
+    let unexpected =
+        |err: serde_json::Error| PrError::Failed(format!("unexpected gh output: {err}"));
+    let mut pages: Vec<Page> = Vec::new();
+    for value in serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>() {
+        match value.map_err(unexpected)? {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    pages.push(serde_json::from_value(item).map_err(unexpected)?);
+                }
+            }
+            item => pages.push(serde_json::from_value(item).map_err(unexpected)?),
+        }
+    }
+    let mut states = ViewedStates::default();
+    for page in pages {
+        let pr = page.data.repository.pull_request;
+        states.pr_id = pr.id;
+        for file in pr.files.nodes.into_iter().flatten() {
+            let state = match file.viewer_viewed_state.as_str() {
+                "VIEWED" => ViewedState::Viewed,
+                "DISMISSED" => ViewedState::Dismissed,
+                _ => ViewedState::Unviewed,
+            };
+            states.files.insert(file.path, state);
+        }
+    }
+    if !is_node_id(&states.pr_id) {
+        return Err(PrError::Failed(
+            "GitHub returned no pull request id".to_string(),
+        ));
+    }
+    Ok(states)
+}
+
+/// Marks one file of the pull request viewed on GitHub, or not.
+pub(crate) fn set_file_viewed(
+    workdir: &Path,
+    pr_id: &str,
+    path: &str,
+    viewed: bool,
+) -> Result<(), PrError> {
+    if !is_node_id(pr_id) || path.is_empty() {
+        return Err(PrError::Failed(
+            "not a pull request file GitHub knows".to_string(),
+        ));
+    }
+    let mutation = if viewed {
+        "markFileAsViewed"
+    } else {
+        "unmarkFileAsViewed"
+    };
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "graphql",
+        "--hostname=github.com",
+        &format!(
+            "--raw-field=query=mutation($id: ID!, $path: String!) {{ {mutation}(input: {{pullRequestId: $id, path: $path}}) {{ clientMutationId }} }}"
+        ),
+        &format!("--raw-field=id={pr_id}"),
+        // A raw field: gh never reads a path starting with `@` as a file.
+        &format!("--raw-field=path={path}"),
+    ]);
+    run(command, None).map(drop)
+}
+
 /// `gh api --method=POST` with a JSON body on stdin. A refusal reports the
 /// API's own explanation, which gh prints as JSON on stdout.
 fn api_post(workdir: &Path, path: &str, payload: &str) -> Result<(), PrError> {
@@ -1436,6 +1605,58 @@ pub(crate) fn changes_since(
     Ok(ChangesSince { files, commits })
 }
 
+/// The head-side line ranges (first, last) of `path`'s hunks in the pull
+/// request's own diff, with GitHub's 3 lines of context: the lines GitHub
+/// takes a head-side comment on.
+pub(crate) fn pr_hunk_ranges(
+    workdir: &Path,
+    merge_base: &str,
+    head: &str,
+    path: &str,
+) -> Result<Vec<(u32, u32)>, PrError> {
+    if !is_object_id(merge_base) || !is_object_id(head) {
+        return Err(PrError::Failed(
+            "GitHub returned an unexpected commit id".to_string(),
+        ));
+    }
+    let mut command = git(workdir);
+    // Literal: a path from GitHub is never pathspec magic.
+    command.args([
+        "--literal-pathspecs",
+        "diff",
+        "-U3",
+        // Config can't widen the hunks past GitHub's.
+        "--inter-hunk-context=0",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--no-renames",
+        merge_base,
+        head,
+        "--",
+        path,
+    ]);
+    Ok(parse_new_hunk_ranges(&String::from_utf8_lossy(&run_git(
+        command,
+    )?)))
+}
+
+/// `@@ -a,b +c,d @@` headers as head-side ranges; an empty side (`d` 0) has
+/// no lines to comment on.
+fn parse_new_hunk_ranges(diff: &str) -> Vec<(u32, u32)> {
+    diff.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("@@ -")?;
+            let new = rest.split_once(" +")?.1.split_once(" @@")?.0;
+            let (start, count) = match new.split_once(',') {
+                Some((start, count)) => (start.parse::<u32>().ok()?, count.parse::<u32>().ok()?),
+                None => (new.parse::<u32>().ok()?, 1),
+            };
+            (count > 0).then(|| (start, start + count - 1))
+        })
+        .collect()
+}
+
 /// `git diff --name-only -z` output as paths.
 fn parse_name_list(stdout: &[u8]) -> std::collections::BTreeSet<String> {
     stdout
@@ -1504,6 +1725,65 @@ mod tests {
         )
         .expect("pages");
         assert_eq!(super::latest_review_by(only_pending, "me"), None);
+    }
+
+    #[test]
+    fn viewed_states_read_every_page() {
+        use super::ViewedState::*;
+        let page = |path: &str, state: &str| {
+            format!(
+                r#"{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kw1","files":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{{"path":"{path}","viewerViewedState":"{state}"}}]}}}}}}}}}}"#
+            )
+        };
+        // One object per page, as `--paginate` prints them.
+        let stream = format!("{}\n{}", page("a.rs", "VIEWED"), page("b.rs", "DISMISSED"));
+        let states = super::parse_viewed_states(stream.as_bytes()).expect("states");
+        assert_eq!(states.pr_id, "PR_kw1");
+        assert_eq!(
+            states.files.into_iter().collect::<Vec<_>>(),
+            [
+                ("a.rs".to_string(), Viewed),
+                ("b.rs".to_string(), Dismissed)
+            ]
+        );
+        // `--slurp`'s array of pages reads the same.
+        let slurped = format!("[{}]", page("c.rs", "UNVIEWED"));
+        let states = super::parse_viewed_states(slurped.as_bytes()).expect("states");
+        assert_eq!(states.files.get("c.rs"), Some(&Unviewed));
+        assert!(super::parse_viewed_states(b"").is_err());
+        assert!(
+            super::parse_viewed_states(
+                br#"{"data":{"repository":{"pullRequest":{"id":"a b","files":{"nodes":[]}}}}}"#
+            )
+            .is_err()
+        );
+        assert!(super::graphql_target("o/r", 1 << 40).is_err());
+        assert!(super::graphql_target("o/../r", 1).is_err());
+        assert_eq!(super::graphql_target("o/r", 7).ok(), Some(("o", "r")));
+    }
+
+    #[test]
+    fn hunk_headers_give_the_head_side_lines() {
+        let diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,3 +1,4 @@ fn x\n a\n+b\n@@ -20 +21 @@\n-c\n+d\n@@ -30,2 +32,0 @@\n-e\n-f\n";
+        assert_eq!(super::parse_new_hunk_ranges(diff), [(1, 4), (21, 21)]);
+        assert!(super::parse_new_hunk_ranges("").is_empty());
+    }
+
+    #[test]
+    fn outdated_threads_keep_the_line_they_were_written_on() {
+        let raw: Vec<super::RawReviewComment> = serde_json::from_str(
+            r#"[{"id": 1, "path": "a.rs", "line": null, "original_line": 12, "body": "old"},
+                {"id": 2, "path": "a.rs", "line": 3, "original_line": 3, "body": "now"},
+                {"id": 3, "path": "a.rs", "line": null, "original_line": null, "body": "whole file"}]"#,
+        )
+        .expect("comments");
+        let threads = super::review_threads(raw);
+        let outdated: Vec<_> = threads
+            .iter()
+            .filter(|thread| thread.outdated())
+            .map(|thread| (thread.root_id, thread.original_line))
+            .collect();
+        assert_eq!(outdated, [(1, Some(12))]);
     }
 
     #[test]

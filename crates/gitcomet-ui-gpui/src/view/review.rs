@@ -2,10 +2,13 @@
 //! wait as a pending review until one submit posts them all.
 //!
 //! The pending review lives on this computer, one JSON file per repository
-//! and pull request, pinned to the head commit the diff shows. Nothing reaches
-//! GitHub before the submit dialog's explicit confirm.
+//! and pull request, pinned to the head commit the diff shows. Nothing of it
+//! reaches GitHub before the submit dialog's explicit confirm. Viewed marks
+//! are the exception: GitHub keeps them as your own private state per pull
+//! request, and each one is sent as you mark it.
 
 use super::panel_focus::FocusPanel;
+use super::panes::main::SinceLines;
 use super::*;
 use crate::github::{ReplyTarget, ReviewAnchor, ReviewComment, ReviewSide, ReviewThread};
 use gitcomet_state::model::SidebarMode;
@@ -25,6 +28,18 @@ pub(super) struct ReviewDraft {
     /// request moves on, the files changed since lose their mark, as on GitHub.
     #[serde(default)]
     pub(super) viewed_head: Option<String>,
+    /// `space` presses GitHub hasn't confirmed yet, each with the head it
+    /// was made at: sent once GitHub is reachable, at that head only.
+    #[serde(default)]
+    pub(super) unsynced: std::collections::BTreeMap<String, UnsyncedMark>,
+}
+
+/// A viewed mark pressed but not yet on GitHub.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct UnsyncedMark {
+    pub(super) viewed: bool,
+    /// The head shown when it was pressed.
+    pub(super) head: String,
 }
 
 impl ReviewDraft {
@@ -86,13 +101,29 @@ impl ReviewDraft {
 
     /// The file's next contents: `None` when there's nothing left to keep.
     fn contents(&self) -> Result<Option<Vec<u8>>, String> {
-        if self.comments.is_empty() && self.viewed.is_empty() {
+        if self.comments.is_empty() && self.viewed.is_empty() && self.unsynced.is_empty() {
             return Ok(None);
         }
         serde_json::to_vec_pretty(self)
             .map(Some)
             .map_err(|err| err.to_string())
     }
+}
+
+/// Sequence numbers for review mode's background loads, from one counter for
+/// the whole run: an answer from an earlier review session never matches.
+fn next_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// A viewed mark GitHub took: laid over loads started before it did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfirmedMark {
+    viewed: bool,
+    /// The newest viewed-marks load when GitHub took it; a load started
+    /// later already has it.
+    at: u64,
 }
 
 /// Writes or removes a draft file.
@@ -115,6 +146,24 @@ pub(super) enum SinceReview {
     /// Working it out failed for another reason; the next open retries.
     Failed(String),
 }
+
+/// Where the viewed marks come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ViewedSync {
+    /// Not asked (tests).
+    Idle,
+    Loading,
+    /// GitHub's own per-user marks; `space` changes them there too.
+    GitHub {
+        pr_id: String,
+    },
+    /// GitHub couldn't be reached: the marks are this computer's only.
+    Offline,
+}
+
+/// A viewed press as tests read it: path, viewed, confirmed by GitHub.
+#[cfg(test)]
+pub(super) type ViewedPressForTest = (String, bool, bool);
 
 /// The pull request being reviewed and where the review is.
 pub(super) struct ReviewMode {
@@ -163,6 +212,25 @@ pub(super) struct ReviewMode {
     /// answer that isn't the newest is dropped.
     last_review_seq: u64,
     since_seq: u64,
+    pub(super) viewed_sync: ViewedSync,
+    viewed_seq: u64,
+    /// Files you viewed on GitHub that changed since: not viewed any more.
+    pub(super) dismissed: std::collections::BTreeSet<String>,
+    /// Marks GitHub took this session, for loads still on their way.
+    confirmed: std::collections::BTreeMap<String, ConfirmedMark>,
+    /// Files dismissed before their unsynced press, to restore if GitHub
+    /// refuses it.
+    was_dismissed: std::collections::BTreeSet<String>,
+    /// One viewed mutation at a time, so they land in order.
+    viewed_pushing: bool,
+    /// Per file, the head-side line ranges of the pull request's own diff:
+    /// where a comment can go while `L` shows the changes since your review.
+    /// Good for `hunk_key`'s (merge base, head) only.
+    hunk_ranges: rustc_hash::FxHashMap<String, SinceLines>,
+    hunk_ranges_loading: rustc_hash::FxHashSet<String>,
+    hunk_key: Option<(String, String)>,
+    /// The diff base a reopen was asked for, so a render asks only once.
+    reopened_for: Option<String>,
 }
 
 impl ReviewMode {
@@ -184,6 +252,95 @@ impl ReviewMode {
             .iter()
             .filter(|thread| thread.path == path && thread.line.is_some())
             .count()
+    }
+
+    /// Lays GitHub's viewed marks (the answer to load `seq`) over this
+    /// review: GitHub's viewed set replaces the one here, then the presses it
+    /// doesn't have yet go on top. An unsynced press made at another head is
+    /// dropped: the file may have changed since, and GitHub's own dismissal
+    /// covers that. Returns whether marks here differed from GitHub's, beyond
+    /// those presses.
+    fn merge_viewed_states(&mut self, states: &crate::github::ViewedStates, seq: u64) -> bool {
+        use crate::github::ViewedState;
+        let head = self.draft.head_oid.clone();
+        self.draft.unsynced.retain(|_, mark| mark.head == head);
+        let unsynced = &self.draft.unsynced;
+        self.was_dismissed
+            .retain(|path| unsynced.contains_key(path));
+        self.confirmed.retain(|_, mark| mark.at >= seq);
+        let having = |wanted: ViewedState| -> std::collections::BTreeSet<String> {
+            states
+                .files
+                .iter()
+                .filter(|(_, state)| **state == wanted)
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        let viewed = having(ViewedState::Viewed);
+        let pressed =
+            |path: &&String| unsynced.contains_key(*path) || self.confirmed.contains_key(*path);
+        let differed = self
+            .draft
+            .viewed
+            .iter()
+            .filter(|path| !pressed(path))
+            .ne(viewed.iter().filter(|path| !pressed(path)));
+        self.draft.viewed = viewed;
+        self.dismissed = having(ViewedState::Dismissed);
+        let presses = self
+            .confirmed
+            .iter()
+            .map(|(path, mark)| (path, mark.viewed))
+            .chain(
+                self.draft
+                    .unsynced
+                    .iter()
+                    .map(|(path, mark)| (path, mark.viewed)),
+            );
+        for (path, viewed) in presses {
+            self.dismissed.remove(path);
+            if viewed {
+                self.draft.viewed.insert(path.clone());
+            } else {
+                self.draft.viewed.remove(path);
+            }
+        }
+        // Kept in step, so the local fallback starts from GitHub's marks.
+        self.draft.viewed_head = Some(head);
+        differed
+    }
+
+    /// Whether `comment` is a reply to an outdated conversation, whose line
+    /// counts in the commit that conversation was written on.
+    pub(super) fn replies_to_outdated(&self, comment: &ReviewComment) -> bool {
+        comment.reply_to.as_ref().is_some_and(|to| {
+            self.outdated_threads()
+                .any(|thread| thread.root_id == to.id)
+        })
+    }
+
+    /// Threads whose lines changed since they were written, in file order.
+    pub(super) fn outdated_threads(&self) -> impl Iterator<Item = &ReviewThread> {
+        self.threads.iter().filter(|thread| thread.outdated())
+    }
+
+    pub(super) fn outdated_on(&self, path: &str) -> usize {
+        self.outdated_threads()
+            .filter(|thread| thread.path == path)
+            .count()
+    }
+
+    /// With `L` on and what changed known: your last review's commit, which
+    /// the diff starts from instead of the merge base.
+    pub(super) fn since_base(&self) -> Option<&str> {
+        if !self.only_changed || !matches!(self.since_review, Some(SinceReview::Changed(_))) {
+            return None;
+        }
+        self.last_review
+            .ready()?
+            .as_ref()
+            .map(|last| last.commit_id.as_str())
+            .filter(|commit| !commit.is_empty())
     }
 
     /// Whether `path` changed since your last review.
@@ -265,7 +422,7 @@ impl GitCometView {
     /// Whether the diff on screen is the review's current file at the head
     /// its comments are pinned to: only then do cursor rows match a comment's
     /// file and lines.
-    fn review_diff_shown(&self) -> bool {
+    pub(super) fn review_diff_shown(&self) -> bool {
         let Some(review) = self.active_review() else {
             return false;
         };
@@ -278,10 +435,31 @@ impl GitCometView {
                 DiffTarget::CommitRange {
                     to_commit_id: Some(head),
                     path: Some(shown),
-                    ..
-                } => head.as_ref() == review.draft.head_oid && shown == std::path::Path::new(path),
+                    from_commit_id,
+                } => {
+                    head.as_ref() == review.draft.head_oid
+                        && shown == std::path::Path::new(path)
+                        && self
+                            .review_diff_base(review.repo_id, review.number)
+                            .is_none_or(|base| from_commit_id.as_ref() == base)
+                }
                 _ => false,
             })
+    }
+
+    /// Where the review's diff starts: your last review's commit while `L`
+    /// shows the changes since it, else the pull request's merge base.
+    /// `None` while neither is known.
+    pub(super) fn review_diff_base(&self, repo_id: RepoId, number: u64) -> Option<String> {
+        let review = self.review_of(repo_id, number)?;
+        match review.since_base() {
+            Some(base) => Some(base.to_string()),
+            None => self
+                .pull_requests
+                .repo(repo_id)
+                .and_then(|prs| prs.diff_base.ready())
+                .cloned(),
+        }
     }
 
     /// `r` on the Pull requests tab: reviews the selected pull request,
@@ -336,6 +514,9 @@ impl GitCometView {
         if draft.viewed_head.is_none() {
             draft.viewed_head = Some(draft.head_oid.clone());
         }
+        // Opening the first file moves an older draft to the head, which
+        // checks the viewed marks itself.
+        let head_moves = draft.head_oid != detail.head_oid;
         let files: Vec<String> = detail.files.iter().map(|file| file.path.clone()).collect();
         let file_ix = files
             .iter()
@@ -365,13 +546,26 @@ impl GitCometView {
             viewed_syncing_to: None,
             last_review_seq: 0,
             since_seq: 0,
+            viewed_sync: ViewedSync::Idle,
+            viewed_seq: 0,
+            dismissed: Default::default(),
+            confirmed: Default::default(),
+            was_dismissed: Default::default(),
+            viewed_pushing: false,
+            hunk_ranges: Default::default(),
+            hunk_ranges_loading: Default::default(),
+            hunk_key: None,
+            reopened_for: None,
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
             cx.notify();
         });
         self.review_open_file(file_ix, cx);
-        self.review_sync_viewed(cx);
+        if !head_moves {
+            self.review_sync_viewed(cx);
+            self.load_viewed_states(cx);
+        }
         self.load_review_threads(cx);
         self.load_last_review(cx);
         self.diff_return_panel = FocusPanel::Sidebar;
@@ -403,8 +597,16 @@ impl GitCometView {
             review.suggestions.clear();
             review.suggestion_generation += 1;
         }
+        // A base merged in moves the merge base too; the hunk ranges follow
+        // it through their key.
+        let repo_id = self.review.as_ref().map(|review| review.repo_id);
+        if let Some(repo_id) = repo_id {
+            self.reset_pull_request_diff_base(repo_id);
+        }
         self.save_review(cx);
         self.review_sync_viewed(cx);
+        // GitHub works out which viewed files the new commits dismissed.
+        self.load_viewed_states(cx);
         self.review_load_changes_since(cx);
         if had_comments {
             self.push_toast(
@@ -525,6 +727,7 @@ impl GitCometView {
         review.pending_jump = None;
         review.needs_cursor = true;
         self.review_follow_head(cx);
+        self.review_load_hunk_ranges(cx);
         self.sync_review_marks(cx);
         self.open_pull_request_diff(Some(ix), cx);
         self.notify_pull_request_panes(cx);
@@ -544,8 +747,9 @@ impl GitCometView {
         }
     }
 
-    /// `L`: the file list keeps to the files changed since your last review,
-    /// or shows them all again. The diff stays the whole pull request's.
+    /// `L`: GitHub's "Changes since your last review". The file list keeps to
+    /// the files changed since it and the diff starts at its commit; `L` again
+    /// is the whole pull request.
     fn review_toggle_only_changed(&mut self, cx: &mut gpui::Context<Self>) {
         use super::pull_requests::PrLoad;
         let Some(review) = self.review.as_mut() else {
@@ -553,7 +757,9 @@ impl GitCometView {
         };
         if review.only_changed {
             review.only_changed = false;
-            self.notify_pull_request_panes(cx);
+            let ix = review.file_ix;
+            // Whole again: the diff starts at the merge base.
+            self.review_open_file(ix, cx);
             return;
         }
         let refusal = match (&review.last_review, &review.since_review) {
@@ -578,13 +784,12 @@ impl GitCometView {
             return;
         }
         review.only_changed = true;
-        let first = (!review.file_listed(review.file_ix))
+        let ix = (!review.file_listed(review.file_ix))
             .then(|| (0..review.files.len()).find(|ix| review.file_listed(*ix)))
-            .flatten();
-        match first {
-            Some(ix) => self.review_open_file(ix, cx),
-            None => self.notify_pull_request_panes(cx),
-        }
+            .flatten()
+            .unwrap_or(review.file_ix);
+        // Reopened either way: the diff now starts at your last review.
+        self.review_open_file(ix, cx);
     }
 
     /// `space`: marks the shown file viewed (or not) and, when marking, goes on
@@ -600,6 +805,25 @@ impl GitCometView {
         if !now_viewed {
             review.draft.viewed.remove(&path);
         }
+        // Shown at once and kept in the draft until GitHub has it: laid over
+        // any viewed-marks load on its way, and sent when GitHub is reachable.
+        if !review.draft.unsynced.contains_key(&path) && review.dismissed.contains(&path) {
+            review.was_dismissed.insert(path.clone());
+        }
+        review.dismissed.remove(&path);
+        review.confirmed.remove(&path);
+        let head = review.draft.head_oid.clone();
+        review.draft.unsynced.insert(
+            path.clone(),
+            UnsyncedMark {
+                viewed: now_viewed,
+                head,
+            },
+        );
+        self.review_push_viewed(cx);
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
         let next = now_viewed
             .then(|| {
                 let from = review.file_ix;
@@ -744,8 +968,12 @@ impl GitCometView {
             return;
         };
         let Some(seq) = self.review.as_mut().map(|review| {
-            review.last_review = super::pull_requests::PrLoad::Loading;
-            review.last_review_seq += 1;
+            // A reload keeps the review it has until the new one lands, so
+            // the diff `L` shows keeps its base meanwhile.
+            if review.last_review.ready().is_none() {
+                review.last_review = super::pull_requests::PrLoad::Loading;
+            }
+            review.last_review_seq = next_seq();
             review.last_review_seq
         }) else {
             return;
@@ -763,10 +991,12 @@ impl GitCometView {
                 }) else {
                     return;
                 };
-                review.last_review = match result {
-                    Ok(last) => super::pull_requests::PrLoad::Ready(last),
-                    Err(err) => super::pull_requests::PrLoad::Failed(err),
-                };
+                match result {
+                    Ok(last) => review.last_review = super::pull_requests::PrLoad::Ready(last),
+                    // A failed reload keeps the review already known.
+                    Err(_) if review.last_review.ready().is_some() => {}
+                    Err(err) => review.last_review = super::pull_requests::PrLoad::Failed(err),
+                }
                 this.review_load_changes_since(cx);
                 this.notify_pull_request_panes(cx);
             });
@@ -787,17 +1017,21 @@ impl GitCometView {
             .and_then(Option::as_ref)
             .map(|last| last.commit_id.clone())
             .filter(|old| !old.is_empty());
-        review.since_review = None;
-        review.since_seq += 1;
+        // What's known stays until the new answer lands: the diff `L` shows
+        // keeps its base meanwhile.
+        review.since_seq = next_seq();
         let seq = review.since_seq;
         let Some(old) = old else {
+            review.since_review = None;
             review.only_changed = false;
+            self.review_refresh(cx);
             return;
         };
         let head = review.draft.head_oid.clone();
         if old == head {
             review.since_review = Some(SinceReview::Changed(Default::default()));
             review.only_changed = false;
+            self.review_refresh(cx);
             return;
         }
         if cfg!(test) {
@@ -832,18 +1066,54 @@ impl GitCometView {
                 review.since_review = Some(since);
                 // `L` with nothing left to show would be an empty list.
                 review.only_changed &= review.files_changed_since_review() > 0;
-                this.notify_pull_request_panes(cx);
+                this.review_refresh(cx);
             });
         })
         .detach();
     }
 
+    /// After your last review, what changed since it or `L` changed: the
+    /// marks and where comments may go follow at once. A diff that now
+    /// starts elsewhere reopens from `review_after_render`.
+    fn review_refresh(&mut self, cx: &mut gpui::Context<Self>) {
+        self.sync_review_marks(cx);
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// The base the review's diff should start at, when the diff on screen
+    /// is the review's file at its head but starts somewhere else.
+    fn review_base_moved(&self) -> Option<String> {
+        let review = self.active_review()?;
+        let path = review.current_path()?;
+        let base = self.review_diff_base(review.repo_id, review.number)?;
+        let shown = self
+            .active_repo()
+            .and_then(|repo| repo.diff_state.diff_target.as_ref())?;
+        match shown {
+            DiffTarget::CommitRange {
+                from_commit_id,
+                to_commit_id: Some(head),
+                path: Some(shown),
+            } if head.as_ref() == review.draft.head_oid
+                && shown == std::path::Path::new(path)
+                && from_commit_id.as_ref() != base =>
+            {
+                Some(base)
+            }
+            _ => None,
+        }
+    }
+
     /// Viewed marks made on an older head: the files changed since lose
-    /// theirs, worked out off the UI thread.
+    /// theirs, worked out off the UI thread. GitHub works that out itself
+    /// once it holds the marks.
     fn review_sync_viewed(&mut self, cx: &mut gpui::Context<Self>) {
         let Some(review) = self.review.as_mut() else {
             return;
         };
+        if matches!(review.viewed_sync, ViewedSync::GitHub { .. }) {
+            return;
+        }
         let head = review.draft.head_oid.clone();
         let Some(from) = review
             .draft
@@ -944,6 +1214,353 @@ impl GitCometView {
         self.notify_pull_request_panes(cx);
     }
 
+    /// Loads your viewed marks from GitHub, which keeps them per user and
+    /// pull request. Tests never run gh; they seed the answer.
+    pub(super) fn load_viewed_states(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(target) = self
+            .review
+            .as_ref()
+            .and_then(|review| self.github_target_for(review.repo_id))
+        else {
+            return;
+        };
+        let Some((repo_id, number, seq)) = self.review.as_mut().map(|review| {
+            if matches!(review.viewed_sync, ViewedSync::Idle | ViewedSync::Offline) {
+                review.viewed_sync = ViewedSync::Loading;
+            }
+            review.viewed_seq = next_seq();
+            (review.repo_id, review.number, review.viewed_seq)
+        }) else {
+            return;
+        };
+        if cfg!(test) {
+            return;
+        }
+        let task = cx.background_spawn(async move {
+            crate::github::viewed_states(&target.workdir, &target.slug, number)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.review_apply_viewed_states(repo_id, number, seq, result, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// GitHub's viewed marks, once loaded, are the truth: a file viewed there
+    /// is viewed, a dismissed one (viewed, then changed) isn't. `space`
+    /// presses it doesn't have yet (kept in the draft, across sessions) stay
+    /// on top and go up to it, but only those made at the head shown. When
+    /// GitHub can't be reached the marks on this computer stay, and say so.
+    fn review_apply_viewed_states(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        seq: u64,
+        result: Result<crate::github::ViewedStates, crate::github::PrError>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self.review.as_mut().filter(|review| {
+            review.repo_id == repo_id && review.number == number && review.viewed_seq == seq
+        }) else {
+            return;
+        };
+        let states = match result {
+            Ok(states) => states,
+            // A passing failure after GitHub answered once keeps its marks.
+            Err(_) if matches!(review.viewed_sync, ViewedSync::GitHub { .. }) => return,
+            Err(_) => {
+                review.viewed_sync = ViewedSync::Offline;
+                self.notify_pull_request_panes(cx);
+                return;
+            }
+        };
+        let first_answer = !matches!(review.viewed_sync, ViewedSync::GitHub { .. });
+        let differed = review.merge_viewed_states(&states, seq);
+        review.viewed_sync = ViewedSync::GitHub {
+            pr_id: states.pr_id,
+        };
+        self.save_review(cx);
+        self.review_push_viewed(cx);
+        if first_answer && differed {
+            self.push_toast(
+                components::ToastKind::Success,
+                "Viewed marks now come from GitHub.".to_string(),
+                cx,
+            );
+        }
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// Sends the next `space` GitHub hasn't had yet, one at a time so they
+    /// land in order; each answer sends the next. Only presses made at the
+    /// head shown go.
+    fn review_push_viewed(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let ViewedSync::GitHub { pr_id } = &review.viewed_sync else {
+            return;
+        };
+        if review.viewed_pushing {
+            return;
+        }
+        let head = &review.draft.head_oid;
+        let Some((path, viewed)) = review
+            .draft
+            .unsynced
+            .iter()
+            .find(|(_, mark)| mark.head == *head)
+            .map(|(path, mark)| (path.clone(), mark.viewed))
+        else {
+            return;
+        };
+        if cfg!(test) {
+            return;
+        }
+        let (repo_id, number, pr_id) = (review.repo_id, review.number, pr_id.clone());
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        if let Some(review) = self.review.as_mut() {
+            review.viewed_pushing = true;
+        }
+        let task = {
+            let path = path.clone();
+            cx.background_spawn(async move {
+                crate::github::set_file_viewed(&target.workdir, &pr_id, &path, viewed)
+            })
+        };
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.review_viewed_pushed(repo_id, number, &path, viewed, result, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// GitHub's answer to one viewed mark. Taken: it leaves the unsynced
+    /// presses, and stays laid over loads already on their way. Refused:
+    /// that one mark, and its dismissed state, go back to what they were,
+    /// unless it was pressed again since.
+    pub(super) fn review_viewed_pushed(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        path: &str,
+        viewed: bool,
+        result: Result<(), crate::github::PrError>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self
+            .review
+            .as_mut()
+            .filter(|review| review.repo_id == repo_id && review.number == number)
+        else {
+            return;
+        };
+        review.viewed_pushing = false;
+        let still_wanted = review
+            .draft
+            .unsynced
+            .get(path)
+            .is_some_and(|mark| mark.viewed == viewed);
+        match result {
+            Ok(()) if still_wanted => {
+                review.draft.unsynced.remove(path);
+                review.was_dismissed.remove(path);
+                let at = review.viewed_seq;
+                review
+                    .confirmed
+                    .insert(path.to_string(), ConfirmedMark { viewed, at });
+                self.save_review(cx);
+            }
+            Err(err) if still_wanted => {
+                review.draft.unsynced.remove(path);
+                if review.draft.viewed.contains(path) == viewed {
+                    if viewed {
+                        review.draft.viewed.remove(path);
+                    } else {
+                        review.draft.viewed.insert(path.to_string());
+                    }
+                }
+                if review.was_dismissed.remove(path) && !review.draft.viewed.contains(path) {
+                    review.dismissed.insert(path.to_string());
+                }
+                self.save_review(cx);
+                let what = if viewed { "viewed" } else { "not viewed" };
+                self.push_toast(
+                    components::ToastKind::Error,
+                    format!("Couldn't mark {path} {what} on GitHub: {err}"),
+                    cx,
+                );
+            }
+            // Pressed again since: the newer press goes up next.
+            _ => {}
+        }
+        self.review_push_viewed(cx);
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// With `L` on, the shown file's head-side hunk ranges in the pull
+    /// request's own diff, once per file, merge base and head: GitHub takes
+    /// comments only inside them.
+    fn review_load_hunk_ranges(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let (Some(path), true) = (review.current_path(), review.since_base().is_some()) else {
+            return;
+        };
+        let (repo_id, number, path, head) = (
+            review.repo_id,
+            review.number,
+            path.to_string(),
+            review.draft.head_oid.clone(),
+        );
+        let Some(merge_base) = self
+            .pull_requests
+            .repo(repo_id)
+            .and_then(|prs| prs.diff_base.ready())
+            .cloned()
+        else {
+            return;
+        };
+        let key = (merge_base.clone(), head.clone());
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        if review.hunk_key.as_ref() != Some(&key) {
+            let had = review.hunk_key.is_some();
+            review.hunk_ranges.clear();
+            review.hunk_ranges_loading.clear();
+            review.hunk_key = Some(key.clone());
+            if had {
+                self.sync_review_marks(cx);
+            }
+        }
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        if cfg!(test)
+            || review.hunk_ranges.contains_key(&path)
+            || review.hunk_ranges_loading.contains(&path)
+        {
+            return;
+        }
+        review.hunk_ranges_loading.insert(path.clone());
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let task = {
+            let path = path.clone();
+            cx.background_spawn(async move {
+                crate::github::pr_hunk_ranges(&target.workdir, &merge_base, &head, &path)
+            })
+        };
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let Some(review) = this
+                    .review
+                    .as_mut()
+                    .filter(|review| review.repo_id == repo_id && review.number == number)
+                else {
+                    return;
+                };
+                if review.hunk_key.as_ref() != Some(&key) {
+                    // Worked out for an older head or merge base: again.
+                    this.review_load_hunk_ranges(cx);
+                    return;
+                }
+                review.hunk_ranges_loading.remove(&path);
+                let lines = match result {
+                    Ok(ranges) => SinceLines::Ranges(ranges),
+                    Err(err) => {
+                        this.push_toast(
+                            components::ToastKind::Warning,
+                            format!("Couldn't work out which lines of {path} the pull request changed: {err}"),
+                            cx,
+                        );
+                        SinceLines::Failed
+                    }
+                };
+                if let Some(review) = this.review.as_mut() {
+                    review.hunk_ranges.insert(path, lines);
+                }
+                this.sync_review_marks(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// GitHub's viewed marks as gh would load them (or its failure), as the
+    /// answer to the load numbered `seq`.
+    #[cfg(test)]
+    pub(super) fn seed_viewed_states_for_test(
+        &mut self,
+        seq: u64,
+        result: Result<crate::github::ViewedStates, crate::github::PrError>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some((repo_id, number)) = self
+            .review
+            .as_ref()
+            .map(|review| (review.repo_id, review.number))
+        else {
+            return;
+        };
+        self.review_apply_viewed_states(repo_id, number, seq, result, cx);
+    }
+
+    /// The newest viewed-marks load, and each press as (path, viewed,
+    /// confirmed by GitHub).
+    #[cfg(test)]
+    pub(super) fn viewed_load_for_test(&self) -> Option<(u64, Vec<ViewedPressForTest>)> {
+        let review = self.review.as_ref()?;
+        let unsynced = review
+            .draft
+            .unsynced
+            .iter()
+            .map(|(path, mark)| (path.clone(), (mark.viewed, false)));
+        let confirmed = review
+            .confirmed
+            .iter()
+            .map(|(path, mark)| (path.clone(), (mark.viewed, true)));
+        let marks: std::collections::BTreeMap<_, _> = confirmed.chain(unsynced).collect();
+        Some((
+            review.viewed_seq,
+            marks
+                .into_iter()
+                .map(|(path, (viewed, confirmed))| (path, viewed, confirmed))
+                .collect(),
+        ))
+    }
+
+    /// The review threads already on GitHub, and a file's hunk ranges, as gh
+    /// and git would load them.
+    #[cfg(test)]
+    pub(super) fn seed_review_threads_for_test(
+        &mut self,
+        threads: Vec<ReviewThread>,
+        hunk_ranges: Vec<(String, Vec<(u32, u32)>)>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(review) = self.review.as_mut() {
+            review.threads = threads;
+            review.threads_loading = false;
+            review.hunk_ranges.extend(
+                hunk_ranges
+                    .into_iter()
+                    .map(|(path, ranges)| (path, SinceLines::Ranges(ranges))),
+            );
+        }
+        self.sync_review_marks(cx);
+        self.notify_pull_request_panes(cx);
+    }
+
     /// The threads already on GitHub on the line under the cursor, oldest
     /// first. Two reviewers often start one each on the same line.
     pub(super) fn review_threads_at_cursor(&self, cx: &App) -> Vec<&ReviewThread> {
@@ -956,7 +1573,10 @@ impl GitCometView {
         let Some(row) = self.main_pane.read(cx).review_cursor_row() else {
             return Vec::new();
         };
-        threads_on_row(&review.threads, path, row.old_line, row.new_line)
+        // Since your last review the old side is that review's version, not
+        // the base the threads' old lines count in.
+        let old_line = row.old_line.filter(|_| review.since_base().is_none());
+        threads_on_row(&review.threads, path, old_line, row.new_line)
     }
 
     /// Codex's suggestions on the line under the cursor, with their indices.
@@ -970,6 +1590,7 @@ impl GitCometView {
         let Some(row) = self.main_pane.read(cx).review_cursor_row() else {
             return Vec::new();
         };
+        let since = review.since_base().is_some();
         review
             .suggestions
             .iter()
@@ -977,7 +1598,7 @@ impl GitCometView {
             .filter(|(_, suggestion)| {
                 suggestion.anchor.path == path
                     && match suggestion.anchor.side {
-                        ReviewSide::Left => row.old_line == Some(suggestion.anchor.line),
+                        ReviewSide::Left => !since && row.old_line == Some(suggestion.anchor.line),
                         ReviewSide::Right => row.new_line == Some(suggestion.anchor.line),
                     }
             })
@@ -1096,6 +1717,8 @@ impl GitCometView {
                     .filter(|suggestion| suggestion.anchor.path == path)
                     .map(|suggestion| (suggestion.anchor.side, suggestion.anchor.line)),
             )
+            // Since your last review, old-side lines count in another version.
+            .filter(|(side, _)| review.since_base().is_none() || *side == ReviewSide::Right)
             .collect();
         if targets.is_empty() {
             let message = if review.threads_loading {
@@ -1165,59 +1788,111 @@ impl GitCometView {
         );
     }
 
-    /// The shown file's pending comment lines and thread lines, for the
-    /// diff's gutter marks.
-    fn sync_review_marks(&mut self, cx: &mut gpui::Context<Self>) {
-        let threads: rustc_hash::FxHashSet<(ReviewSide, u32)> = self
-            .review
-            .as_ref()
-            .and_then(|review| {
-                let path = review.current_path()?;
-                Some(
-                    review
-                        .threads
-                        .iter()
-                        .filter(|thread| thread.path == path)
-                        .filter_map(|thread| Some((thread.side, thread.line?)))
-                        .collect(),
-                )
-            })
-            .unwrap_or_default();
-        let marks: rustc_hash::FxHashSet<(ReviewSide, u32)> = self
-            .review
-            .as_ref()
-            .and_then(|review| {
-                let path = review.current_path()?;
-                Some(
-                    review
-                        .draft
+    /// `r` on an outdated conversation in Your review: a reply to it, which
+    /// waits with the rest of the review like any other.
+    fn review_reply_to_outdated(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let picked = self.active_review().and_then(|review| {
+            let ix = review
+                .selected_comment?
+                .checked_sub(review.draft.comments.len())?;
+            let thread = review.outdated_threads().nth(ix)?;
+            Some((
+                review.repo_id,
+                review.number,
+                ReviewAnchor {
+                    path: thread.path.clone(),
+                    side: thread.side,
+                    line: thread.original_line?,
+                    start: None,
+                },
+                ReplyTarget {
+                    id: thread.root_id,
+                    author: thread
                         .comments
-                        .iter()
-                        .filter(|comment| comment.anchor.path == path)
-                        .map(|comment| (comment.anchor.side, comment.anchor.line))
-                        .collect(),
-                )
-            })
-            .unwrap_or_default();
-        let suggestions: rustc_hash::FxHashSet<(ReviewSide, u32)> = self
+                        .first()
+                        .map(|comment| comment.author.clone())
+                        .unwrap_or_default(),
+                },
+            ))
+        });
+        let Some((repo_id, number, anchor, reply_to)) = picked else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "Pick an outdated conversation first (j/k); r in the diff replies to the thread on its line.".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.open_review_composer(
+            repo_id,
+            number,
+            anchor,
+            None,
+            Some(reply_to),
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// The shown file's pending comment lines and thread lines, for the
+    /// diff's gutter marks, and where a comment may go.
+    fn sync_review_marks(&mut self, cx: &mut gpui::Context<Self>) {
+        use super::panes::main::ReviewCommentScope;
+        type Marks = rustc_hash::FxHashSet<(ReviewSide, u32)>;
+        let (marks, threads, suggestions, scope) = self
             .review
             .as_ref()
             .and_then(|review| {
                 let path = review.current_path()?;
-                Some(
-                    review
-                        .suggestions
-                        .iter()
-                        .filter(|suggestion| suggestion.anchor.path == path)
-                        .map(|suggestion| (suggestion.anchor.side, suggestion.anchor.line))
-                        .collect(),
-                )
+                let since = review.since_base().is_some();
+                // Since your last review, old-side lines count in another
+                // version: only head-side marks still point at their line.
+                let keep = |key: &(ReviewSide, u32)| !since || key.0 == ReviewSide::Right;
+                // A reply to an outdated conversation sits on a line of an
+                // older commit: nothing in this diff to mark.
+                let marks: Marks = review
+                    .draft
+                    .comments
+                    .iter()
+                    .filter(|comment| comment.anchor.path == path)
+                    .filter(|comment| !review.replies_to_outdated(comment))
+                    .map(|comment| (comment.anchor.side, comment.anchor.line))
+                    .filter(keep)
+                    .collect();
+                let threads: Marks = review
+                    .threads
+                    .iter()
+                    .filter(|thread| thread.path == path)
+                    .filter_map(|thread| Some((thread.side, thread.line?)))
+                    .filter(keep)
+                    .collect();
+                let suggestions: Marks = review
+                    .suggestions
+                    .iter()
+                    .filter(|suggestion| suggestion.anchor.path == path)
+                    .map(|suggestion| (suggestion.anchor.side, suggestion.anchor.line))
+                    .filter(keep)
+                    .collect();
+                let scope = if since {
+                    ReviewCommentScope::Since(
+                        review
+                            .hunk_ranges
+                            .get(path)
+                            .cloned()
+                            .unwrap_or(SinceLines::Loading),
+                    )
+                } else {
+                    ReviewCommentScope::Full
+                };
+                Some((marks, threads, suggestions, scope))
             })
             .unwrap_or_default();
         self.main_pane.update(cx, |pane, cx| {
             pane.review_marks = marks;
             pane.review_thread_marks = threads;
             pane.review_suggestion_marks = suggestions;
+            pane.review_comment_scope = scope;
             cx.notify();
         });
     }
@@ -1351,7 +2026,8 @@ impl GitCometView {
         let Some(review) = self.review.as_mut() else {
             return;
         };
-        let len = review.draft.comments.len();
+        // Your pending comments, then the outdated conversations below them.
+        let len = review.draft.comments.len() + review.outdated_threads().count();
         let next = match (review.selected_comment, direction < 0) {
             (Some(ix), false) => Some(ix + 1).filter(|ix| *ix < len),
             (Some(ix), true) => ix.checked_sub(1),
@@ -1374,15 +2050,24 @@ impl GitCometView {
         let Some(review) = self.review.as_mut() else {
             return;
         };
-        let Some(anchor) = review
-            .draft
-            .comments
-            .get(ix)
-            .map(|comment| comment.anchor.clone())
-        else {
+        let Some(comment) = review.draft.comments.get(ix).cloned() else {
             return;
         };
+        let anchor = comment.anchor.clone();
         review.selected_comment = Some(ix);
+        let refusal = if review.replies_to_outdated(&comment) {
+            Some("This replies to an outdated conversation; its line isn't in this diff.")
+        } else if review.since_base().is_some() && anchor.side == ReviewSide::Left {
+            // The old side shown is your last review's version, not the base.
+            Some("This comment is on an old line of the base; press L for the whole pull request.")
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            self.push_toast(components::ToastKind::Warning, message.to_string(), cx);
+            self.notify_pull_request_panes(cx);
+            return;
+        }
         let Some(file_ix) = review.files.iter().position(|path| *path == anchor.path) else {
             self.push_toast(
                 components::ToastKind::Warning,
@@ -1438,6 +2123,28 @@ impl GitCometView {
                     pane.review_active = active;
                     cx.notify();
                 });
+            });
+        }
+        if let Some(base) = self.review_base_moved()
+            && let Some(review) = self.review.as_mut()
+            && review.reopened_for.as_deref() != Some(base.as_str())
+        {
+            // `L`, your last review or what changed since it moved the base.
+            review.reopened_for = Some(base);
+            let ix = review.file_ix;
+            let view = cx.entity();
+            window.defer(cx, move |_window, cx| {
+                view.update(cx, |this, cx| this.review_open_file(ix, cx));
+            });
+        }
+        if self
+            .active_review()
+            .is_some_and(|review| review.since_base().is_some())
+        {
+            // Once the merge base is known, or after it moved.
+            let view = cx.entity();
+            window.defer(cx, move |_window, cx| {
+                view.update(cx, |this, cx| this.review_load_hunk_ranges(cx));
             });
         }
         let Some(review) = self.active_review() else {
@@ -1504,6 +2211,7 @@ impl GitCometView {
             // History is hidden while reviewing; the diff stays.
             (_, "2", false) if !self.diff_is_open() => {}
             (Some(FocusPanel::Diff), "r", false) => self.review_reply_at_cursor(window, cx),
+            (Some(FocusPanel::Details), "r", false) => self.review_reply_to_outdated(window, cx),
             // Elsewhere `r` does nothing rather than start another review.
             (_, "r", false) => {}
             (Some(FocusPanel::Diff), "t", _) => {
@@ -1590,10 +2298,11 @@ impl GitCometView {
                 }
             }
             (Some(FocusPanel::Details), "d", false) => {
-                let Some(ix) = self
-                    .active_review()
-                    .and_then(|review| review.selected_comment)
-                else {
+                let Some(ix) = self.active_review().and_then(|review| {
+                    review
+                        .selected_comment
+                        .filter(|ix| *ix < review.draft.comments.len())
+                }) else {
                     return Some(true);
                 };
                 if armed == Some(ix) {
@@ -1939,8 +2648,8 @@ mod tests {
         assert!(pending_review_counts_in(dir.path(), "o/r").is_empty());
     }
 
-    #[test]
-    fn the_last_review_line_says_what_changed_since() {
+    /// A review of a.rs, b.rs and c.rs at head `h1`, with nothing loaded.
+    fn test_review() -> ReviewMode {
         let mut review = ReviewMode {
             repo_id: RepoId(1),
             number: 7,
@@ -1965,7 +2674,24 @@ mod tests {
             viewed_syncing_to: None,
             last_review_seq: 0,
             since_seq: 0,
+            viewed_sync: ViewedSync::Idle,
+            viewed_seq: 0,
+            dismissed: Default::default(),
+            confirmed: Default::default(),
+            was_dismissed: Default::default(),
+            viewed_pushing: false,
+            hunk_ranges: Default::default(),
+            hunk_ranges_loading: Default::default(),
+            hunk_key: None,
+            reopened_for: None,
         };
+        review.draft.head_oid = "h1".into();
+        review
+    }
+
+    #[test]
+    fn the_last_review_line_says_what_changed_since() {
+        let mut review = test_review();
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
         assert_eq!(review.last_review_line(now), None);
         review.last_review =
@@ -1990,12 +2716,92 @@ mod tests {
                 "Your last review: Approved · 2 days ago · at abc1234 · 3 commits since · 1 file changed since"
             )
         );
-        // `L` keeps the walk to b.rs.
+        // `L` keeps the walk to b.rs, and the diff starts at the last review.
+        assert_eq!(review.since_base(), None);
         review.only_changed = true;
         assert_eq!(
             (0..3).map(|ix| review.file_listed(ix)).collect::<Vec<_>>(),
             [false, true, false]
         );
+        assert_eq!(review.since_base(), Some("abc1234def"));
+        review.since_review = Some(SinceReview::Gone);
+        assert_eq!(review.since_base(), None);
+    }
+
+    fn github(files: &[(&str, crate::github::ViewedState)]) -> crate::github::ViewedStates {
+        crate::github::ViewedStates {
+            pr_id: "PR_1".into(),
+            files: files
+                .iter()
+                .map(|(path, state)| (path.to_string(), *state))
+                .collect(),
+        }
+    }
+
+    fn unsynced(viewed: bool, head: &str) -> UnsyncedMark {
+        UnsyncedMark {
+            viewed,
+            head: head.into(),
+        }
+    }
+
+    #[test]
+    fn an_offline_unmark_survives_a_new_session_and_goes_up() {
+        use crate::github::ViewedState::*;
+        // Offline, a.rs was un-marked; the draft on disk keeps the press.
+        let mut draft = ReviewDraft {
+            head_oid: "h1".into(),
+            unsynced: [("a.rs".to_string(), unsynced(false, "h1"))].into(),
+            ..Default::default()
+        };
+        draft = serde_json::from_slice(&draft.contents().unwrap().expect("kept")).unwrap();
+        let mut review = test_review();
+        review.draft = draft;
+        // GitHub still has it viewed: the press wins, and waits to be sent.
+        review.merge_viewed_states(&github(&[("a.rs", Viewed), ("b.rs", Viewed)]), 1);
+        assert_eq!(
+            review
+                .draft
+                .viewed
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["b.rs"]
+        );
+        assert_eq!(
+            review.draft.unsynced.get("a.rs"),
+            Some(&unsynced(false, "h1"))
+        );
+    }
+
+    #[test]
+    fn a_mark_made_at_an_older_head_is_not_sent() {
+        use crate::github::ViewedState::*;
+        let mut review = test_review();
+        // Marked offline at h0; the pull request has moved to h1 since.
+        review.draft.viewed = ["a.rs".to_string()].into();
+        review.draft.unsynced = [("a.rs".to_string(), unsynced(true, "h0"))].into();
+        review.merge_viewed_states(&github(&[("a.rs", Unviewed)]), 1);
+        assert!(review.draft.unsynced.is_empty());
+        assert!(review.draft.viewed.is_empty());
+        assert_eq!(review.draft.viewed_head.as_deref(), Some("h1"));
+    }
+
+    #[test]
+    fn a_web_unmark_is_not_overwritten_on_the_next_open() {
+        use crate::github::ViewedState::*;
+        let mut review = test_review();
+        // The last answer had a.rs viewed; it was un-marked on github.com.
+        review.draft.viewed = ["a.rs".to_string()].into();
+        let differed = review.merge_viewed_states(&github(&[("a.rs", Unviewed)]), 1);
+        assert!(differed, "worth saying the marks now come from GitHub");
+        assert!(review.draft.viewed.is_empty());
+        assert!(review.draft.unsynced.is_empty(), "nothing to send");
+        // Dismissed there: not viewed here either.
+        review.draft.viewed = ["b.rs".to_string()].into();
+        review.merge_viewed_states(&github(&[("b.rs", Dismissed)]), 2);
+        assert!(review.draft.viewed.is_empty());
+        assert!(review.dismissed.contains("b.rs"));
     }
 
     #[test]
@@ -2005,6 +2811,7 @@ mod tests {
             path: "a.rs".into(),
             side,
             line,
+            original_line: line,
             comments: vec![ThreadComment {
                 author: "octo".into(),
                 body: "?".into(),

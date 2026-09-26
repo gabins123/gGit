@@ -3268,6 +3268,8 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) review_thread_marks: FxHashSet<(crate::github::ReviewSide, u32)>,
     /// Lines of the shown file with a Codex suggestion waiting to be adopted.
     pub(in crate::view) review_suggestion_marks: FxHashSet<(crate::github::ReviewSide, u32)>,
+    /// Which lines of the shown diff GitHub would take a review comment on.
+    pub(in crate::view) review_comment_scope: ReviewCommentScope,
     pub(in crate::view) diff_text_selecting: bool,
     pub(in crate::view) diff_text_anchor: Option<DiffTextPos>,
     pub(in crate::view) diff_text_head: Option<DiffTextPos>,

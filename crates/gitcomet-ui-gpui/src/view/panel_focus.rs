@@ -471,6 +471,7 @@ impl GitCometView {
                     ("enter", "go to"),
                     ("e", "edit"),
                     ("d d", "delete"),
+                    ("r", "reply outdated"),
                     ("S", "submit"),
                 ],
             };
@@ -532,8 +533,14 @@ impl GitCometView {
             return match panel {
                 FocusPanel::Sidebar => &[
                     ("j / k", "Next / previous file"),
-                    ("space", "Mark viewed, then the next unviewed file"),
-                    ("L", "Only files changed since your last review / all"),
+                    (
+                        "space",
+                        "Mark viewed (on GitHub too), then the next unviewed file",
+                    ),
+                    (
+                        "L",
+                        "Changes since your last review (files and diff) / the whole PR",
+                    ),
                     ("enter", "Go to the diff"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
@@ -550,18 +557,31 @@ impl GitCometView {
                     ("a / x", "Adopt / drop the Codex suggestion on this line"),
                     ("} / {", "Next / previous change"),
                     ("] / [", "Next / previous file"),
-                    ("space", "Mark viewed, then the next unviewed file"),
-                    ("L", "Only files changed since your last review / all"),
+                    (
+                        "space",
+                        "Mark viewed (on GitHub too), then the next unviewed file",
+                    ),
+                    (
+                        "L",
+                        "Changes since your last review (files and diff) / the whole PR",
+                    ),
                     ("esc", "Drop the selection"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
                 ],
                 FocusPanel::Details => &[
-                    ("j / k", "Next / previous pending comment"),
+                    (
+                        "j / k",
+                        "Next / previous pending comment or outdated conversation",
+                    ),
                     ("enter", "Go to its line"),
                     ("e", "Edit it"),
                     ("d d", "Delete it"),
-                    ("L", "Only files changed since your last review / all"),
+                    ("r", "Reply to the picked outdated conversation"),
+                    (
+                        "L",
+                        "Changes since your last review (files and diff) / the whole PR",
+                    ),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
                 ],

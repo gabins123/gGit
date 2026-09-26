@@ -411,6 +411,7 @@ impl MainPaneView {
             review_marks: Default::default(),
             review_thread_marks: Default::default(),
             review_suggestion_marks: Default::default(),
+            review_comment_scope: Default::default(),
             diff_text_selecting: false,
             diff_text_selection_owner: Default::default(),
             diff_text_anchor: None,

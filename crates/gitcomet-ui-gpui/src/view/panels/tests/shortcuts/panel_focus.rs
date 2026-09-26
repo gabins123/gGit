@@ -739,12 +739,8 @@ let x = 1;
     assert_eq!(focused(cx, &view), Some(Sidebar));
 }
 
-#[gpui::test]
-fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpui::TestAppContext) {
-    use crate::view::review::SinceReview;
-
-    let _guard = lock_visual_test();
-    let (view, cx) = fixture(cx);
+/// Pull request #7 with a.rs, b.rs and c.rs, its commits as good as local.
+fn seed_three_file_pull_request(cx: &mut gpui::VisualTestContext, view: &View) {
     let file = |path: &str| crate::github::PullRequestFile {
         path: path.into(),
         additions: 1,
@@ -782,7 +778,48 @@ fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpu
             );
         })
     });
-    apply_state(cx, &view, pull_request_state());
+    apply_state(cx, view, pull_request_state());
+}
+
+#[gpui::test]
+fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpui::TestAppContext) {
+    use crate::view::panes::main::{ReviewCommentScope, SinceLines};
+    use crate::view::review::SinceReview;
+
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    let diff_base = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).review_diff_base(REPO, 7))
+    };
+    // The diff actually asked for: where it starts, and whether the review
+    // takes it as its own (its keys work only then).
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        sync_store_snapshot(cx, &view);
+        cx.update(|_window, app| {
+            let this = view.read(app);
+            let from = match this.main_pane.read(app).state.repos[0]
+                .diff_state
+                .diff_target
+                .as_ref()
+            {
+                Some(DiffTarget::CommitRange { from_commit_id, .. }) => {
+                    Some(from_commit_id.as_ref().to_string())
+                }
+                _ => None,
+            };
+            (from, this.review_diff_shown())
+        })
+    };
+    let scope = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .main_pane
+                .read(app)
+                .review_comment_scope
+                .clone()
+        })
+    };
     let review = |cx: &mut gpui::VisualTestContext| {
         cx.update(|_window, app| {
             view.read(app).active_review().map(|review| {
@@ -836,9 +873,24 @@ fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpu
         ),
         "{line:?}"
     );
-    // On: a.rs didn't change, so the review moves to b.rs.
+    assert_eq!(diff_base(cx), Some("c".repeat(40)));
+    // On: a.rs didn't change, so the review moves to b.rs, and the diff
+    // starts at the last review's commit.
     press(cx, "shift-l");
     assert_eq!(review(cx), Some((1, true, 0)));
+    assert_eq!(diff_base(cx), Some("d".repeat(40)));
+    assert_eq!(shown(cx), (Some("d".repeat(40)), true));
+    // Comments wait for b.rs's lines in the pull request's own diff.
+    assert_eq!(scope(cx), ReviewCommentScope::Since(SinceLines::Loading));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.seed_review_threads_for_test(Vec::new(), vec![("b.rs".into(), vec![(1, 5)])], cx)
+        })
+    });
+    assert_eq!(
+        scope(cx),
+        ReviewCommentScope::Since(SinceLines::Ranges(vec![(1, 5)]))
+    );
     // The Sidebar's j/k and ]/[ walk only b.rs and c.rs.
     press(cx, "1 j");
     assert_eq!(review(cx).map(|(file, ..)| file), Some(2));
@@ -849,13 +901,199 @@ fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpu
     // Viewed, then on to the next unviewed file among them.
     press(cx, "space");
     assert_eq!(review(cx), Some((2, true, 1)));
-    // Off: every file again.
+    // Off: every file again, and the whole pull request's diff.
     press(cx, "shift-l");
+    assert_eq!(diff_base(cx), Some("c".repeat(40)));
+    assert_eq!(shown(cx), (Some("c".repeat(40)), true));
+    assert_eq!(scope(cx), ReviewCommentScope::Full);
     press(cx, "k k");
     assert_eq!(review(cx), Some((0, false, 1)));
 
     press(cx, "q");
     assert_eq!(review(cx), None);
+}
+
+#[gpui::test]
+fn viewed_marks_follow_github_and_outdated_threads_take_replies(cx: &mut gpui::TestAppContext) {
+    use crate::github::{
+        PrError, ReviewSide, ReviewThread, ThreadComment, ViewedState, ViewedStates,
+    };
+    use crate::view::review::ViewedSync;
+
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    let marks = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app).active_review().map(|review| {
+                (
+                    review.draft.viewed.iter().cloned().collect::<Vec<String>>(),
+                    review.dismissed.iter().cloned().collect::<Vec<String>>(),
+                    review.viewed_sync.clone(),
+                )
+            })
+        })
+    };
+    let seed_states =
+        |cx: &mut gpui::VisualTestContext, seq: u64, result: Result<ViewedStates, PrError>| {
+            cx.update(|_window, app| {
+                view.update(app, |this, cx| {
+                    this.seed_viewed_states_for_test(seq, result, cx)
+                })
+            });
+        };
+    // The newest load's number, and the presses GitHub hasn't confirmed.
+    let pending = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).viewed_load_for_test())
+            .expect("reviewing")
+    };
+    let reload = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.update(app, |this, cx| this.load_viewed_states(cx)));
+        pending(cx).0
+    };
+    let pushed = |cx: &mut gpui::VisualTestContext, path: &str, viewed, result| {
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.review_viewed_pushed(REPO, 7, path, viewed, result, cx)
+            })
+        });
+    };
+    let states = |files: [(&str, ViewedState); 3]| {
+        Ok(ViewedStates {
+            pr_id: "PR_kw1".into(),
+            files: files
+                .into_iter()
+                .map(|(path, state)| (path.to_string(), state))
+                .collect(),
+        })
+    };
+    use ViewedState::*;
+
+    press(cx, "1 r");
+    let first = pending(cx).0;
+    assert_eq!(marks(cx), Some((vec![], vec![], ViewedSync::Loading)));
+    // space while GitHub's marks are still loading: shown at once, kept.
+    press(cx, "1 space");
+    assert_eq!(pending(cx).1, [("a.rs".to_string(), true, false)]);
+    // An answer to an older load is dropped.
+    let second = reload(cx);
+    seed_states(
+        cx,
+        first,
+        states([("a.rs", Viewed), ("b.rs", Viewed), ("c.rs", Viewed)]),
+    );
+    assert_eq!(marks(cx).map(|(.., sync)| sync), Some(ViewedSync::Loading));
+    // GitHub couldn't be reached: the marks here stay, and Your review says so.
+    seed_states(cx, second, Err(PrError::Failed("offline".into())));
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into()], vec![], ViewedSync::Offline))
+    );
+    // GitHub answers without the press: it stays on top, waiting to go up.
+    // b.rs was viewed there, then changed.
+    let third = reload(cx);
+    seed_states(
+        cx,
+        third,
+        states([("a.rs", Unviewed), ("b.rs", Dismissed), ("c.rs", Unviewed)]),
+    );
+    let github = ViewedSync::GitHub {
+        pr_id: "PR_kw1".into(),
+    };
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into()], vec!["b.rs".into()], github.clone()))
+    );
+    // GitHub takes it; a load started after that has it and the press goes.
+    pushed(cx, "a.rs", true, Ok(()));
+    assert_eq!(pending(cx).1, [("a.rs".to_string(), true, true)]);
+    let fourth = reload(cx);
+    seed_states(
+        cx,
+        fourth,
+        states([("a.rs", Viewed), ("b.rs", Dismissed), ("c.rs", Unviewed)]),
+    );
+    assert_eq!(pending(cx).1, []);
+    // space on b.rs marks it at once; GitHub refusing puts it back, dismissed.
+    press(cx, "1 space");
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into(), "b.rs".into()], vec![], github.clone()))
+    );
+    pushed(cx, "b.rs", true, Err(PrError::Failed("no".into())));
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into()], vec!["b.rs".into()], github))
+    );
+
+    // An outdated thread: listed after your pending comments, and r replies.
+    let outdated = ReviewThread {
+        root_id: 5,
+        path: "a.rs".into(),
+        side: ReviewSide::Right,
+        line: None,
+        original_line: Some(12),
+        comments: vec![ThreadComment {
+            author: "octo".into(),
+            body: "Old point\nmore".into(),
+            at: String::new(),
+        }],
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.seed_review_threads_for_test(vec![outdated], Vec::new(), cx)
+        })
+    });
+    // A pending comment first, so the outdated one sits after it.
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.add_review_comment(
+                REPO,
+                7,
+                crate::github::ReviewAnchor {
+                    path: "b.rs".into(),
+                    side: ReviewSide::Right,
+                    line: 1,
+                    start: None,
+                },
+                "Nit".into(),
+                None,
+                None,
+                cx,
+            );
+        })
+    });
+    press(cx, "4 j j r");
+    assert!(popover_is_open(cx, &view));
+    press(cx, "o k secondary-enter");
+    let replies = cx.update(|_window, app| {
+        view.read(app)
+            .active_review()
+            .map(|review| {
+                review
+                    .draft
+                    .comments
+                    .iter()
+                    .map(|comment| {
+                        (
+                            comment.body.clone(),
+                            comment.anchor.line,
+                            comment.reply_to.as_ref().map(|to| to.id),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        replies,
+        [
+            ("Nit".to_string(), 1, None),
+            ("ok".to_string(), 12, Some(5))
+        ]
+    );
+
+    press(cx, "q");
 }
 
 /// The open diff's file and lane, after syncing the store's latest snapshot.
