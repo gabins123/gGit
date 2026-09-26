@@ -331,6 +331,8 @@ use panels::{
     ActionBarView, BottomStatusBarView, PopoverHost, PopoverHostInit, RepoTabsBarView,
     action_bar_density, action_bar_height,
 };
+#[cfg(test)]
+use panes::ChangesFilter;
 pub(crate) use panes::MainPaneView;
 use panes::{
     CollapsedSidebarSection, DetailsPaneInit, DetailsPaneView, HistoryPrimarySelection,

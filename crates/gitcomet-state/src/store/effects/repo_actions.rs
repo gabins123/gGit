@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use super::super::{RepoId, executor::TaskExecutor, worker_channel::StoreWorkerSender};
 use super::util::{
-    GitOperationTask, RepoMap, message_subject, missing_repo_error, path_context, paths_context,
-    send_or_log, short_commit_id, single_line_context, spawn_with_repo, spawn_with_repo_or_else,
+    GitOperationTask, RepoMap, catch_panic, message_subject, missing_repo_error, path_context,
+    paths_context, send_or_log, short_commit_id, single_line_context, spawn_with_repo_maybe_serial,
 };
 
 /// Runs a repo action against the repo's handle, or finishes it at once when
@@ -26,7 +26,7 @@ fn spawn_repo_action(
     action: RepoActionKind,
     task: impl FnOnce(Arc<dyn GitRepository>, StoreWorkerSender) + Send + 'static,
 ) {
-    spawn_with_repo_or_else(executor, repos, repo_id, msg_tx, task, move |msg_tx| {
+    let on_missing = move |msg_tx: StoreWorkerSender| {
         send_or_log(
             &msg_tx,
             Msg::Internal(InternalMsg::RepoActionFinished {
@@ -35,7 +35,57 @@ fn spawn_repo_action(
                 result: Err(missing_repo_error(repo_id)),
             }),
         );
-    });
+    };
+    // Index writers run FIFO per repo: they would race on `.git/index.lock`,
+    // and the reducer retires optimistic stage/unstage rows in request order.
+    // Ordered together on one queue: these actions, commit/amend
+    // (`schedule_repo_action_with_result`) and the index-writing commands in
+    // `repo_commands::schedule_repo_command_with_context`. Branch/tag ref edits
+    // and DropStash never touch the index and stay concurrent.
+    let writes_index = matches!(
+        action,
+        RepoActionKind::StagePath
+            | RepoActionKind::StagePaths
+            | RepoActionKind::UnstagePath
+            | RepoActionKind::UnstagePaths
+            | RepoActionKind::DiscardWorktreeChangesPath
+            | RepoActionKind::DiscardWorktreeChangesPaths
+            | RepoActionKind::CheckoutBranch
+            | RepoActionKind::CheckoutRemoteBranch
+            | RepoActionKind::CheckoutCommit
+            | RepoActionKind::CreateBranchAndCheckout
+            | RepoActionKind::CherryPickCommit
+            | RepoActionKind::Stash
+            | RepoActionKind::ApplyStash
+            | RepoActionKind::PopStash
+    );
+    // Most callers already catch panics around their git call; this covers
+    // the hand-written tasks so a finish is always sent.
+    let task = move |repo, msg_tx: StoreWorkerSender| {
+        let finish_tx = msg_tx.clone();
+        if let Err(err) = catch_panic(|| {
+            task(repo, msg_tx);
+            Ok(())
+        }) {
+            send_or_log(
+                &finish_tx,
+                Msg::Internal(InternalMsg::RepoActionFinished {
+                    repo_id,
+                    action,
+                    result: Err(err),
+                }),
+            );
+        }
+    };
+    spawn_with_repo_maybe_serial(
+        executor,
+        repos,
+        repo_id,
+        msg_tx,
+        writes_index,
+        task,
+        on_missing,
+    );
 }
 
 fn schedule_repo_action_with_hook<F, H, M>(
@@ -64,7 +114,7 @@ fn schedule_repo_action_with_hook<F, H, M>(
                 GitOperationTask::start(repo_id, action.hook_activity_label(), context, &msg_tx);
             let result = {
                 let _scope = operation.attach();
-                run(repo)
+                catch_panic(|| run(repo))
             };
             hook(&msg_tx, repo_id, &result);
             let outcome = GitOperationTask::outcome(&result);
@@ -98,16 +148,19 @@ fn schedule_repo_action_with_result<T, F, M>(
         }
         return;
     }
-    spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, msg_tx| {
+    // Only commit and amend use this; they queue behind pending stage/unstage
+    // so a commit made right after staging includes the file.
+    let task = move |repo: Arc<dyn GitRepository>, msg_tx: StoreWorkerSender| {
         let operation = GitOperationTask::start(repo_id, label, context, &msg_tx);
         let result = {
             let _scope = operation.attach();
-            run(repo)
+            catch_panic(|| run(repo))
         };
         let outcome = GitOperationTask::outcome(&result);
         let message = finish(repo_id, result);
         operation.finish(outcome, message);
-    });
+    };
+    spawn_with_repo_maybe_serial(executor, repos, repo_id, msg_tx, true, task, |_| {});
 }
 
 fn repo_action_finished(

@@ -2420,6 +2420,7 @@ pub(super) fn status_loaded(
             Ok(next) => {
                 // Also restore individual lanes after a partial-load error.
                 // The setter preserves revisions for unchanged payloads.
+                let next = repo_state.overlay_pending_index_ops(next);
                 repo_state.set_status(Loadable::Ready(Arc::new(next)));
                 clear_resolved_conflict_context(repo_state);
             }
@@ -2453,6 +2454,7 @@ pub(super) fn worktree_status_loaded(
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         match result {
             Ok(next) => {
+                let next = repo_state.overlay_pending_index_ops_lane(next, false);
                 let status_unchanged = matches!(&repo_state.worktree_status, Loadable::Ready(prev) if prev.as_slice() == next.as_slice());
                 if !status_unchanged {
                     repo_state.set_worktree_status(Loadable::Ready(next));
@@ -2509,6 +2511,7 @@ pub(super) fn staged_status_loaded(
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         match result {
             Ok(next) => {
+                let next = repo_state.overlay_pending_index_ops_lane(next, true);
                 let status_unchanged = matches!(&repo_state.staged_status, Loadable::Ready(prev) if prev.as_slice() == next.as_slice());
                 if !status_unchanged {
                     repo_state.set_staged_status(Loadable::Ready(next));

@@ -279,6 +279,12 @@ opt-level = 2
 [profile.dev.package.taffy]
 opt-level = 2
 
+# gix status and object hashing are several times slower unoptimised, which
+# made staging feel laggy in debug builds. Dependencies build once; workspace
+# crates are not matched by "*" and stay at opt-level 0 for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.test]
 opt-level = 1
 split-debuginfo = "packed"
@@ -291,6 +297,9 @@ opt-level = 1
 opt-level = 1
 
 [profile.test.package.taffy]
+opt-level = 1
+
+[profile.test.package."*"]
 opt-level = 1
 
 # CI avoids generating and packaging debugger symbols on ephemeral runners.
@@ -316,6 +325,10 @@ opt-level = 1
 opt-level = 1
 
 [profile.ci-test.package.taffy]
+opt-level = 1
+
+# Inherited from dev otherwise; keep CI dependencies at the profile's level.
+[profile.ci-test.package."*"]
 opt-level = 1
 
 # Compile/link coverage only. Actual performance measurements still use bench,

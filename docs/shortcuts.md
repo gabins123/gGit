@@ -70,8 +70,8 @@ Single keys for everyday Git work, lazygit-style. Each one runs the same action 
 | Pull / push | `p` / `Shift+P` | Any panel | The main Pull and Push buttons: the default pull mode, and a set-upstream dialog for a branch without one. |
 | Fetch all remotes | `f` | Any panel | |
 | Stash the changes | `s` | Any panel | Opens the stash dialog. Apply, pop and drop are in the command palette. |
-| Stage / unstage the open file, then the next | `Space` | Details, Diff | The diff's existing `Space`, reachable from Details too. |
-| Stage everything, or unstage it all | `a` | Details | Stages all changes; with nothing left to stage, unstages everything. |
+| Stage / unstage the open file | `Space` | Details, Diff | In the Changes list the file keeps its place and its status letters flip. In the sectioned views it moves to the other section, and the next file opens. |
+| Stage everything, or unstage it all | `a` | Details | Stages all changes; with nothing left to stage, unstages everything. In the Changes list, a filter narrows it to the files shown. |
 | Discard the open file's changes | `d` | Details, Diff | Always confirms. Not for conflicted files. |
 | The selection's context menu | `m` | Any panel | Sidebar: the branch. History: the commit. Details and Diff: the open file. |
 | Check out the branch | `Space` | Sidebar | A remote branch asks for the local branch name. |
@@ -80,13 +80,30 @@ Single keys for everyday Git work, lazygit-style. Each one runs the same action 
 | Merge it into the current branch | `Shift+M` twice | Sidebar | The first press asks for the second. |
 | Rebase the current branch onto it | `Shift+R` | Sidebar | Confirms first. |
 | Open a pull request on GitHub | `o` | Sidebar | lazygit's key: GitHub's new pull request page for the branch, in the browser, against the default branch. The branch must already be on GitHub. |
-| Set up a pull request from the branch | `Shift+O` | Sidebar | The New pull request dialog for that branch (base, title, body, draft). `Ctrl+Enter` creates it through gh; `Alt+O` opens GitHub's page with the chosen base instead. |
+| Set up a pull request from the branch | `Shift+O` | Sidebar | The New pull request dialog for that branch; see `n` under Pull requests tab. |
+| New pull request from the current branch | `Shift+N` | Any panel | The same dialog, for the checked-out branch. |
 | Cherry-pick the commit | `Shift+C` | History | Confirms first. Not the HEAD commit. |
 | Revert the commit | `t` | History | Confirms first. |
 | Reset to the commit | `g` | History | A mixed reset, after confirming. Soft and hard resets are in the commit's menu (`m`). |
 | Tag the commit | `Shift+T` | History | |
 
 On the Pull requests tab, its own keys (`n`, `r`, `o`, `Shift+R`) take precedence. While the conflict resolver is open, `a`–`d` (with or without `Shift`) stay its picks.
+
+### Changes list
+
+Details lists every changed file once, staged or not, the way lazygit does. Two status letters lead each row: what is staged (left, green) and what is not (right, red); `??` is untracked, `UU` conflicted. So `M ` is fully staged, ` M` not at all, and `MM` both; `D?` is a file removed from the index (`git rm --cached`) but still on disk, where staging it undoes the removal. A file's diff opens on what is still unstaged, and on the staged change once nothing else is. The header's menu switches back to the sectioned views (Unstaged / Staged, with or without a separate Untracked block); the choice is saved.
+
+| Action | Key | Notes |
+| --- | --- | --- |
+| Next / previous file | `j` / `k` | Details. Opens its diff; `F1` / `F4` and the diff's arrows do the same. A file the filter no longer shows (say, just staged under Unstaged) steps on from where it sat. |
+| Stage / unstage the open file | `Space` | Details or Diff. Stages what is unstaged, or unstages a fully staged file. The row stays where it is. The list updates as soon as the key is pressed; git catches up behind it. |
+| Stage or unstage everything shown | `a` | Stages what the list shows; when none of it is unstaged, unstages it. Unfiltered, that is every change. |
+| Stage or unstage the open file's folder | `Shift+Space` | Details. The same rule over the folder's shown files; also a folder row's hover button in the tree. |
+| Stage / unstage only | `Ctrl+S` / `Ctrl+U` | Diff. One direction of `Space`, whichever side of the file the diff shows. |
+| Filter | `Shift+F` | Cycles All, Unstaged, Staged, Untracked, like lazygit's file filter. The chips above the list show each count and switch on click. |
+| Tree or flat list | `` ` `` | lazygit's key. A folder's hover button stages it, or unstages it once it is all staged. |
+| Sort | `o` | Path, file type or size of the change. |
+| Discard, menu, commit | `d`, `m`, `c` | As in Git actions above. |
 
 ### Pull requests tab
 
@@ -97,7 +114,7 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Next / previous pull request | `j` / `k` | Sidebar. Selecting one shows it in Details. |
 | Next / previous changed file | `j` / `k` | Details, while it shows a pull request. Moves the diff along once one is open. |
 | Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. Pull requests over 100 files or 20,000 changed lines are left to GitHub. |
-| New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, `Alt+O` opens GitHub's page for it instead, and `Ctrl+Enter` (`Cmd+Enter`) creates. From another branch: `Shift+O` on it in the Branches tab. |
+| New pull request | `n` | From the checked-out branch (`Shift+N` from any panel; `Shift+O` on another branch in the Branches tab). The dialog fills itself in the way `gh pr create --fill` would: the base is the remote's default branch (`origin/HEAD`), and the title and description come from the branch's commits (one commit: its subject and body; several: the branch name and a list of their subjects). Fields you type into first are left alone. `Alt+B` steps the base through the remote's branches, and matching ones are offered as you type. A branch GitHub doesn't have, or doesn't have all of, is pushed first, and the dialog names where (`git push --set-upstream` for a new one: to `origin` when that is on GitHub, as on a fork); `Alt+P` turns that off. A branch that tracks another name (say `origin/main`, after `git switch -c feat origin/main`) is pushed as a new branch of its own name, never onto the one it tracks. The push runs git directly with terminal prompts off, so it needs a credential helper or an SSH agent; failing that, push with `Shift+P` first. `Alt+D` toggles draft; `Alt+O` opens GitHub's page instead, or the pull request already open from the branch (matched by owner and branch, so a fork's `main` isn't yours), which the dialog also warns about and won't create a second of. `Ctrl+Enter` (`Cmd+Enter`) pushes if needed and creates. |
 | Review | `r` | Opens review mode for the pull request (below), picking up a pending review of it where it was left. |
 | Your review queue | | The list leads with the pull requests waiting for your review, then the ones with a review of yours pending on this computer (with its count), then the rest; `j` / `k` follow that order. |
 | Quick review | `Shift+S` | Just a verdict and a summary, no line comments. `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |

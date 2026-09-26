@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use super::super::{RepoId, executor::TaskExecutor, worker_channel::StoreWorkerSender};
 use super::util::{
-    GitOperationTask, RepoMap, message_subject, missing_repo_error, send_or_log, short_commit_id,
-    single_line_context, spawn_with_repo, spawn_with_repo_or_else,
+    GitOperationTask, RepoMap, catch_panic, message_subject, missing_repo_error, send_or_log,
+    short_commit_id, single_line_context, spawn_with_repo, spawn_with_repo_maybe_serial,
 };
 
 const GITIGNORE_FILE_NAME: &str = gitcomet_core::gitignore::FILE_NAME;
@@ -196,16 +196,38 @@ fn schedule_repo_command_with_context<F>(
     // The reducer counted the command in flight and only its completion
     // releases that count, so a missing handle must still finish it.
     let missing = command.clone();
-    spawn_with_repo_or_else(
+    // Index writers share the per-repo FIFO with stage/unstage, commit and
+    // checkout (see `spawn_repo_action`). Network commands (pull, push, fetch)
+    // stay concurrent so a slow remote never stalls staging.
+    let writes_index = matches!(
+        command,
+        RepoCommandKind::StageHunk
+            | RepoCommandKind::UnstageHunk
+            | RepoCommandKind::ApplyWorktreePatch { .. }
+            | RepoCommandKind::Reset { .. }
+            | RepoCommandKind::SaveWorktreeFile { stage: true, .. }
+            | RepoCommandKind::CheckoutConflict { .. }
+            | RepoCommandKind::CheckoutConflictBase { .. }
+            | RepoCommandKind::AcceptConflictDeletion { .. }
+            | RepoCommandKind::MergeRef { .. }
+            | RepoCommandKind::SquashRef { .. }
+            | RepoCommandKind::CherryPick { .. }
+            | RepoCommandKind::Revert { .. }
+            | RepoCommandKind::RebaseContinue
+            | RepoCommandKind::RebaseAbort
+            | RepoCommandKind::MergeAbort
+    );
+    spawn_with_repo_maybe_serial(
         executor,
         repos,
         repo_id,
         msg_tx,
+        writes_index,
         move |repo, msg_tx| {
             let operation = GitOperationTask::start(repo_id, label, context, &msg_tx);
             let result = {
                 let _scope = operation.attach();
-                run(repo)
+                catch_panic(|| run(repo))
             };
             let outcome = GitOperationTask::outcome(&result);
             operation.finish(

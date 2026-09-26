@@ -376,6 +376,8 @@ pub(in super::super) struct PopoverHost {
     pull_request_body_input: Entity<components::TextInput>,
     pull_request_body_scroll: ScrollHandle,
     pull_request_draft: bool,
+    /// Push the branch before creating, when GitHub doesn't have all of it.
+    pull_request_push_first: bool,
     pull_request_delete_branch: bool,
     pull_request_merge_focus_handle: FocusHandle,
     remote_add_focus: DialogFocus,

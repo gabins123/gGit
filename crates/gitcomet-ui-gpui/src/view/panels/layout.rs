@@ -2193,7 +2193,7 @@ impl DetailsPaneView {
     }
 
     /// Layout toggle + sort menu, the pair every changed-file list carries.
-    fn file_list_controls(
+    pub(in crate::view) fn file_list_controls(
         &mut self,
         list: crate::view::rows::FileListId,
         repo_id: RepoId,
@@ -2725,6 +2725,10 @@ impl DetailsPaneView {
                         .child(body),
                 )
                 .into_any_element();
+        }
+
+        if self.change_tracking_view == ChangeTrackingView::Unified {
+            return self.changes_view(cx);
         }
 
         let local_actions_in_flight = self

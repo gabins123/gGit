@@ -6,6 +6,9 @@ use gitcomet_state::model::{AuthRetryOperation, CommandLogEntry};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 
+mod changes;
+pub(in crate::view) use changes::{ChangeLanes, ChangesFilter};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingCommitAmend {
     repo_id: RepoId,
@@ -197,6 +200,9 @@ pub(in super::super) struct DetailsPaneView {
     pub(in super::super) range_files_path_alignment_group: components::PathTruncationAlignmentGroup,
     pub(in super::super) worktree_files_path_alignment_group:
         components::PathTruncationAlignmentGroup,
+    /// The one-list view's caches, and what its filter shows.
+    changes: changes::ChangesCache,
+    pub(in crate::view) changes_filter: ChangesFilter,
 }
 
 pub(in super::super) struct DetailsPaneInit {
@@ -589,6 +595,8 @@ impl DetailsPaneView {
             range_files_path_alignment_group: components::PathTruncationAlignmentGroup::default(),
             worktree_files_path_alignment_group: components::PathTruncationAlignmentGroup::default(
             ),
+            changes: Default::default(),
+            changes_filter: ChangesFilter::default(),
         };
         pane.sync_scaled_section_heights_from_design();
         pane.set_theme(theme, cx);

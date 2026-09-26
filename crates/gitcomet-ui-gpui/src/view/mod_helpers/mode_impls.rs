@@ -1231,31 +1231,53 @@ impl FileListLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChangeTrackingView {
-    #[default]
+    /// One list, lazygit style: every changed file once, staged or not.
+    Unified,
+    /// Staged apart; untracked files inside the Unstaged section.
     Combined,
+    /// Staged apart, with an Untracked block above Unstaged.
     SplitUntracked,
+}
+
+impl Default for ChangeTrackingView {
+    fn default() -> Self {
+        // ponytail: the app opens on the one list, while the test suite keeps
+        // defaulting to the sectioned views it was written against; tests of
+        // the one list select it explicitly.
+        if cfg!(test) {
+            Self::Combined
+        } else {
+            Self::Unified
+        }
+    }
 }
 
 impl ChangeTrackingView {
     pub(crate) const fn key(self) -> &'static str {
         match self {
-            Self::Combined => "combined",
-            Self::SplitUntracked => "split_untracked",
+            Self::Unified => "unified",
+            Self::Combined => "sections",
+            Self::SplitUntracked => "sections_split_untracked",
         }
     }
 
     pub(crate) fn from_key(raw: &str) -> Option<Self> {
         match raw {
-            "combined" => Some(Self::Combined),
-            "split_untracked" => Some(Self::SplitUntracked),
+            // Saved before the one list existed, when the sections were all
+            // there was: those choices were about untracked files, not a vote
+            // for the sections, so they open on the one list once.
+            "unified" | "combined" | "split_untracked" => Some(Self::Unified),
+            "sections" => Some(Self::Combined),
+            "sections_split_untracked" => Some(Self::SplitUntracked),
             _ => None,
         }
     }
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::Unified => "One list",
             Self::Combined => "Combined with Unstaged",
             Self::SplitUntracked => "Separate section",
         }
@@ -1263,15 +1285,17 @@ impl ChangeTrackingView {
 
     pub(crate) const fn menu_label(self) -> &'static str {
         match self {
-            Self::Combined => "Combine with Unstaged",
-            Self::SplitUntracked => "Show separate Untracked block",
+            Self::Unified => "One list: staged and unstaged together",
+            Self::Combined => "Sections: untracked with Unstaged",
+            Self::SplitUntracked => "Sections: separate Untracked block",
         }
     }
 
     pub(crate) const fn settings_label(self) -> &'static str {
         match self {
-            Self::Combined => "Combined",
-            Self::SplitUntracked => "Separate section",
+            Self::Unified => "One list",
+            Self::Combined => "Sections, untracked combined",
+            Self::SplitUntracked => "Sections, untracked separate",
         }
     }
 }

@@ -1137,6 +1137,7 @@ mod markdown_document;
 mod markdown_flow_text;
 pub(in crate::view) mod sidebar;
 mod status;
+pub(in crate::view) use status::{STATUS_ROW_HEIGHT_PX, STATUS_ROW_LINE_HEIGHT_PX};
 
 #[cfg(feature = "benchmarks")]
 pub(crate) mod benchmarks;

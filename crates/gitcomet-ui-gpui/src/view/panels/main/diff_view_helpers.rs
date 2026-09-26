@@ -382,6 +382,12 @@ impl MainPaneView {
         let inline_neighbors = self.inline_diff_file_neighbors(repo_id, cx);
         let (has_prev, has_next) = if let Some((prev_ix, next_ix)) = inline_neighbors {
             (prev_ix.is_some(), next_ix.is_some())
+        } else if let Some(path) = self.open_change_path(cx) {
+            // The one list: the same neighbours `j`/`k` step to.
+            (
+                self.changes_neighbor(repo_id, &path, -1, cx).is_some(),
+                self.changes_neighbor(repo_id, &path, 1, cx).is_some(),
+            )
         } else {
             let commit_file_source_indices = self
                 .root_view

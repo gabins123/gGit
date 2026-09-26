@@ -261,6 +261,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
                     title: "Keyboard nav".into(),
                     author: "someone".into(),
                     head: "feat".into(),
+                    head_owner: "someone".into(),
                     base: "main".into(),
                     is_draft: false,
                     review: None,
@@ -736,4 +737,222 @@ let x = 1;
     press(cx, "q");
     assert_eq!(review(cx), None);
     assert_eq!(focused(cx, &view), Some(Sidebar));
+}
+
+/// The open diff's file and lane, after syncing the store's latest snapshot.
+fn diff_file(
+    cx: &mut gpui::VisualTestContext,
+    view: &View,
+) -> Option<(std::path::PathBuf, DiffArea)> {
+    sync_store_snapshot(cx, view);
+    cx.update(|_window, app| {
+        match view.read(app).main_pane.read(app).state.repos[0]
+            .diff_state
+            .diff_target
+            .as_ref()
+        {
+            Some(DiffTarget::WorkingTree { path, area }) => Some((path.clone(), *area)),
+            _ => None,
+        }
+    })
+}
+
+#[gpui::test]
+fn the_changes_list_walks_every_file_once_and_flips_them_in_place(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    let file = |path: &str, kind| gitcomet_core::domain::FileStatus {
+        path: path.into(),
+        kind,
+        conflict: None,
+    };
+    // a.rs is partly staged, b.rs not at all, c.rs only staged, new.rs untracked.
+    repo.worktree_status = Loadable::Ready(Arc::new(vec![
+        file("a.rs", FileStatusKind::Modified),
+        file("b.rs", FileStatusKind::Modified),
+        file("new.rs", FileStatusKind::Untracked),
+    ]));
+    repo.staged_status = Loadable::Ready(Arc::new(vec![
+        file("a.rs", FileStatusKind::Modified),
+        file("c.rs", FileStatusKind::Added),
+    ]));
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_change_tracking_view(crate::view::ChangeTrackingView::Unified, cx)
+        })
+    });
+    draw_and_drain_test_window(cx);
+    let letters = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .details_pane
+                .read(app)
+                .changes_drawn(REPO)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, lanes)| {
+                    let [staged, unstaged] = lanes.letters();
+                    format!("{staged}{unstaged} {}", path.display())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(letters(cx), ["MM a.rs", " M b.rs", "A  c.rs", "?? new.rs"]);
+
+    press(cx, "4");
+    let walk = [
+        ("a.rs", DiffArea::Unstaged),
+        ("b.rs", DiffArea::Unstaged),
+        ("c.rs", DiffArea::Staged),
+        ("new.rs", DiffArea::Unstaged),
+    ];
+    for (path, area) in walk {
+        press(cx, "j");
+        wait_until(cx, "the next file to open", |cx| {
+            diff_file(cx, &view) == Some((path.into(), area))
+        });
+    }
+    // One at a time: each step reads where the last one landed.
+    press(cx, "k");
+    wait_until(cx, "c.rs again", |cx| {
+        diff_file(cx, &view) == Some(("c.rs".into(), DiffArea::Staged))
+    });
+    press(cx, "k");
+    wait_until(cx, "b.rs again", |cx| {
+        diff_file(cx, &view) == Some(("b.rs".into(), DiffArea::Unstaged))
+    });
+
+    // Shift+F narrows the list: Unstaged leaves out what's only staged, and
+    // the untracked file.
+    press(cx, "shift-f");
+    let filter = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).details_pane.read(app).changes_filter)
+    };
+    assert_eq!(filter(cx), crate::view::ChangesFilter::Unstaged);
+    assert_eq!(letters(cx), ["MM a.rs", " M b.rs"]);
+    press(cx, "shift-f shift-f shift-f");
+    assert_eq!(filter(cx), crate::view::ChangesFilter::All);
+
+    // `space` stages b.rs where it stands: the diff follows it to the staged
+    // side and focus stays in Details.
+    press(cx, "space");
+    wait_until(cx, "b.rs's staged diff", |cx| {
+        diff_file(cx, &view) == Some(("b.rs".into(), DiffArea::Staged))
+    });
+    assert_eq!(focused(cx, &view), Some(Details));
+}
+
+#[gpui::test]
+fn shift_n_sets_up_a_pull_request_from_anywhere(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+        name: "origin".into(),
+        url: Some("https://github.com/owner/repo.git".into()),
+    }]));
+    repo.remotes_rev = 1;
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    press(cx, "4");
+    assert_key_opens(
+        cx,
+        &view,
+        "shift-n",
+        PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: None,
+        },
+        Details,
+    );
+}
+
+#[gpui::test]
+fn the_create_dialog_steps_the_base_toggles_the_push_and_guards_submit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    repo.head_branch = Loadable::Ready("feature".into());
+    repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+        name: "origin".into(),
+        url: Some("https://github.com/owner/repo.git".into()),
+    }]));
+    repo.remotes_rev = 1;
+    let target = CommitId("7337337337337337".into());
+    let remote_branch = |name: &str| gitcomet_core::domain::RemoteBranch {
+        remote: "origin".into(),
+        name: name.into(),
+        target: target.clone(),
+    };
+    repo.remote_branches = Loadable::Ready(Arc::new(vec![
+        remote_branch("main"),
+        remote_branch("dev"),
+        remote_branch("feature-old"),
+    ]));
+    repo.remote_branches_rev = 2;
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    press(cx, "4 shift-n");
+    assert!(popover_open(
+        cx,
+        &view,
+        &PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: None,
+        }
+    ));
+    let form = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            let host = view.read(app).popover_host.clone();
+            host.update(app, |host, cx| host.create_pull_request_form_for_test(cx))
+        })
+    };
+    // Focus starts in the title; `feature` isn't on GitHub, so it's pushed
+    // first by default.
+    press(cx, "h i");
+    assert_eq!(form(cx), (String::new(), true, true));
+
+    // Alt+B walks the remote's branches, default-like names first.
+    press(cx, "alt-b");
+    assert_eq!(form(cx).0, "dev");
+    press(cx, "alt-b");
+    assert_eq!(form(cx).0, "main");
+
+    // Without the push, GitHub has no branch to open it from.
+    press(cx, "alt-p");
+    assert_eq!(form(cx), ("main".into(), false, false));
+    press(cx, "alt-p");
+    assert_eq!(form(cx), ("main".into(), true, true));
+
+    // An open pull request from this very branch (same owner) blocks a
+    // second one; a stranger's same-named branch doesn't.
+    let seed = |cx: &mut gpui::VisualTestContext, owner: &str| {
+        cx.update(|_window, app| {
+            view.update(app, |this, _| {
+                this.seed_pull_requests_for_test(
+                    REPO,
+                    vec![crate::github::PullRequestSummary {
+                        number: 9,
+                        title: "Earlier".into(),
+                        author: owner.into(),
+                        head: "feature".into(),
+                        head_owner: owner.into(),
+                        base: "main".into(),
+                        is_draft: false,
+                        review: None,
+                        checks: Default::default(),
+                        review_requested: false,
+                    }],
+                    None,
+                );
+            })
+        });
+        draw_and_drain_test_window(cx);
+    };
+    seed(cx, "stranger");
+    assert!(form(cx).2);
+    seed(cx, "owner");
+    assert!(!form(cx).2);
 }

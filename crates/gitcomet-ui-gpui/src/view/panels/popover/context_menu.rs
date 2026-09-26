@@ -1215,6 +1215,19 @@ impl PopoverHost {
                         repo_id,
                         paths: paths.into(),
                     });
+                } else if self.change_tracking_view == ChangeTrackingView::Unified {
+                    // The one list keeps the row; the diff follows the file.
+                    self.store.dispatch(Msg::StagePath {
+                        repo_id,
+                        path: path.clone(),
+                    });
+                    self.store.dispatch(Msg::SelectDiff {
+                        repo_id,
+                        target: DiffTarget::WorkingTree {
+                            path,
+                            area: DiffArea::Staged,
+                        },
+                    });
                 } else {
                     self.store.dispatch(Msg::SelectDiff {
                         repo_id,
@@ -1238,6 +1251,18 @@ impl PopoverHost {
                     self.store.dispatch(Msg::UnstagePaths {
                         repo_id,
                         paths: paths.into(),
+                    });
+                } else if self.change_tracking_view == ChangeTrackingView::Unified {
+                    self.store.dispatch(Msg::UnstagePath {
+                        repo_id,
+                        path: path.clone(),
+                    });
+                    self.store.dispatch(Msg::SelectDiff {
+                        repo_id,
+                        target: DiffTarget::WorkingTree {
+                            path,
+                            area: DiffArea::Unstaged,
+                        },
                     });
                 } else {
                     self.store.dispatch(Msg::SelectDiff {

@@ -63,6 +63,19 @@ pub(super) fn upstream_prompt_submission(
 }
 
 impl PopoverHost {
+    /// The create dialog's base, push-first switch and whether it can submit.
+    #[cfg(test)]
+    pub(in crate::view) fn create_pull_request_form_for_test(
+        &self,
+        cx: &mut gpui::Context<Self>,
+    ) -> (String, bool, bool) {
+        (
+            self.pull_request_base_input.read(cx).text().to_string(),
+            self.pull_request_push_first,
+            self.can_submit_create_pull_request(cx),
+        )
+    }
+
     #[cfg(test)]
     pub(in crate::view) fn create_branch_input_focus_handle_for_test(
         &self,
@@ -1041,6 +1054,7 @@ impl PopoverHost {
             pull_request_body_input,
             pull_request_body_scroll,
             pull_request_draft: false,
+            pull_request_push_first: true,
             pull_request_delete_branch: false,
             pull_request_merge_focus_handle: cx.focus_handle().tab_index(0).tab_stop(true),
             remote_add_focus,
@@ -2060,25 +2074,125 @@ impl PopoverHost {
                     .read_with(cx, |input, _| !input.text().trim().is_empty()))
     }
 
-    /// The open create dialog's head, when it can head a pull request.
-    fn create_pull_request_head(&self) -> Option<(RepoId, String)> {
+    /// The open create dialog's branch, where it stands on GitHub.
+    fn create_pull_request_state(
+        &self,
+    ) -> Option<(RepoId, super::create_pull_request_prompt::HeadState)> {
         let Some(PopoverKind::CreatePullRequest { repo_id, branch }) = &self.popover else {
             return None;
         };
         let repo = self.state.repos.iter().find(|repo| repo.id == *repo_id)?;
-        crate::view::pull_requests::pull_request_head(repo, branch.as_deref())
-            .ok()
-            .map(|head| (*repo_id, head))
+        super::create_pull_request_prompt::head_state(repo, branch.as_deref())
+            .map(|state| (*repo_id, state))
     }
 
-    /// Alt+O in the create dialog: GitHub's own page for the same pull
-    /// request, with the base typed so far.
+    /// The open pull request already coming from the dialog's branch.
+    pub(super) fn existing_pull_request(&self, cx: &mut gpui::Context<Self>) -> Option<u64> {
+        let (repo_id, state) = self.create_pull_request_state()?;
+        let owner = self
+            .state
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .and_then(|repo| repo.remotes.ready())
+            .and_then(|remotes| crate::view::permalink::github_remote(remotes))
+            .and_then(|(_, slug)| slug.split('/').next().map(str::to_string))?;
+        self.open_pull_request_state(cx, |prs| {
+            prs.list.ready().and_then(|list| {
+                list.iter()
+                    .find(|pr| {
+                        super::create_pull_request_prompt::opened_from(pr, &state.head, &owner)
+                    })
+                    .map(|pr| pr.number)
+            })
+        })
+        .flatten()
+    }
+
+    /// The base typed so far, when it names the branch itself.
+    pub(super) fn pull_request_base_is_head(&self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some((_, state)) = self.create_pull_request_state() else {
+            return false;
+        };
+        self.pull_request_base_input
+            .read_with(cx, |input, _| state.base_is_head(input.text().trim()))
+    }
+
+    pub(super) fn toggle_pull_request_push_first(&mut self, cx: &mut gpui::Context<Self>) {
+        if matches!(self.popover, Some(PopoverKind::CreatePullRequest { .. })) {
+            self.pull_request_push_first = !self.pull_request_push_first;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn set_pull_request_base(&mut self, base: String, cx: &mut gpui::Context<Self>) {
+        self.pull_request_base_input
+            .update(cx, |input, cx| input.set_text(base, cx));
+        cx.notify();
+    }
+
+    /// Alt+B: the next of the remote's branches after the one typed.
+    pub(super) fn next_pull_request_base(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(PopoverKind::CreatePullRequest { repo_id, .. }) = &self.popover else {
+            return;
+        };
+        let Some(repo) = self.state.repos.iter().find(|repo| repo.id == *repo_id) else {
+            return;
+        };
+        let candidates = super::create_pull_request_prompt::base_candidates(repo);
+        let current = self
+            .pull_request_base_input
+            .read_with(cx, |input, _| input.text().trim().to_string());
+        let next = candidates
+            .iter()
+            .position(|name| *name == current)
+            .map_or(0, |ix| (ix + 1) % candidates.len());
+        if let Some(base) = candidates.get(next).cloned() {
+            self.set_pull_request_base(base, cx);
+        }
+    }
+
+    /// Fills the create dialog from the branch's commits, leaving alone any
+    /// field typed into first.
+    pub(in crate::view) fn prefill_create_pull_request(
+        &mut self,
+        repo_id: RepoId,
+        branch: Option<String>,
+        defaults: crate::github::NewPullRequestDefaults,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // Keyed on the branch too: a dialog for another branch opened while
+        // git was reading this one's commits must not get them.
+        if !matches!(
+            &self.popover,
+            Some(PopoverKind::CreatePullRequest { repo_id: open, branch: open_branch })
+                if *open == repo_id && *open_branch == branch
+        ) {
+            return;
+        }
+        let fill =
+            |input: Entity<components::TextInput>, text: String, cx: &mut gpui::Context<Self>| {
+                if !text.is_empty() && input.read(cx).text().trim().is_empty() {
+                    input.update(cx, |input, cx| input.set_text(text, cx));
+                }
+            };
+        if let Some(base) = defaults.base {
+            fill(self.pull_request_base_input.clone(), base, cx);
+        }
+        fill(self.pull_request_title_input.clone(), defaults.title, cx);
+        fill(self.pull_request_body_input.clone(), defaults.body, cx);
+        cx.notify();
+    }
+
+    /// Alt+O in the create dialog: the pull request already open from the
+    /// branch, or else GitHub's own page for this one, with the base typed so
+    /// far.
     pub(super) fn open_pull_request_compare_from_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some((repo_id, head)) = self.create_pull_request_head() else {
+        let Some((repo_id, state)) = self.create_pull_request_state() else {
             return;
         };
         let slug = self
@@ -2092,23 +2206,48 @@ impl PopoverHost {
         let Some(slug) = slug else {
             return;
         };
-        let base = self
-            .pull_request_base_input
-            .read_with(cx, |input, _| input.text().trim().to_string());
-        let url = crate::view::permalink::github_compare_url(
-            &slug,
-            Some(base.as_str()).filter(|base| !base.is_empty()),
-            &head,
-        );
+        let url = match self.existing_pull_request(cx) {
+            Some(number) => format!("https://github.com/{slug}/pull/{number}"),
+            None => {
+                let base = self
+                    .pull_request_base_input
+                    .read_with(cx, |input, _| input.text().trim().to_string());
+                crate::view::permalink::github_compare_url(
+                    &slug,
+                    Some(base.as_str()).filter(|base| !base.is_empty()),
+                    &state.head,
+                )
+            }
+        };
         let _ = self
             .root_view
             .update(cx, |root, cx| root.open_in_browser(url, cx));
         self.close_popover_and_restore_focus(window, cx);
     }
 
+    /// What submitting would run: the head, and the push before it when
+    /// "push first" is on. `None` while it can't run at all.
+    fn create_pull_request_plan(
+        &self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<(RepoId, String, Option<crate::github::BranchPush>)> {
+        let (repo_id, state) = self.create_pull_request_state()?;
+        let push = if self.pull_request_push_first {
+            state.push
+        } else {
+            // Without the push, a branch GitHub has never seen can't head it.
+            state.unpushed?;
+            None
+        };
+        if self.existing_pull_request(cx).is_some() || self.pull_request_base_is_head(cx) {
+            return None;
+        }
+        Some((repo_id, state.head, push))
+    }
+
     pub(super) fn can_submit_create_pull_request(&self, cx: &mut gpui::Context<Self>) -> bool {
         !self.pull_request_submitting(cx)
-            && self.create_pull_request_head().is_some()
+            && self.create_pull_request_plan(cx).is_some()
             && self
                 .pull_request_title_input
                 .read_with(cx, |input, _| !input.text().trim().is_empty())
@@ -2148,27 +2287,25 @@ impl PopoverHost {
             }
             Some(PopoverKind::CreatePullRequest { repo_id, .. }) => {
                 cx.notify();
-                if self.can_submit_create_pull_request(cx) {
-                    let head = self.create_pull_request_head().map(|(_, head)| head);
-                    if let Some(head) = head {
-                        let read =
-                            |input: &Entity<components::TextInput>,
-                             cx: &mut gpui::Context<Self>| {
-                                input.read_with(cx, |input, _| input.text().trim().to_string())
-                            };
-                        let pr = crate::github::NewPullRequest {
-                            base: read(&self.pull_request_base_input, cx),
-                            head,
-                            title: read(&self.pull_request_title_input, cx),
-                            body: self
-                                .pull_request_body_input
-                                .read_with(cx, |input, _| input.text().to_string()),
-                            draft: self.pull_request_draft,
-                        };
-                        let _ = self
-                            .root_view
-                            .update(cx, |root, cx| root.submit_new_pull_request(repo_id, pr, cx));
-                    }
+                if self.can_submit_create_pull_request(cx)
+                    && let Some((_, head, push)) = self.create_pull_request_plan(cx)
+                {
+                    let read = |input: &Entity<components::TextInput>,
+                                cx: &mut gpui::Context<Self>| {
+                        input.read_with(cx, |input, _| input.text().trim().to_string())
+                    };
+                    let pr = crate::github::NewPullRequest {
+                        base: read(&self.pull_request_base_input, cx),
+                        head,
+                        title: read(&self.pull_request_title_input, cx),
+                        body: self
+                            .pull_request_body_input
+                            .read_with(cx, |input, _| input.text().to_string()),
+                        draft: self.pull_request_draft,
+                    };
+                    let _ = self.root_view.update(cx, |root, cx| {
+                        root.submit_new_pull_request(repo_id, pr, push, cx)
+                    });
                 }
                 true
             }
@@ -3360,6 +3497,7 @@ impl PopoverHost {
                 }
                 PopoverKind::CreatePullRequest { .. } => {
                     self.pull_request_draft = false;
+                    self.pull_request_push_first = true;
                     self.reset_pull_request_inputs(
                         &[
                             &self.pull_request_title_input.clone(),

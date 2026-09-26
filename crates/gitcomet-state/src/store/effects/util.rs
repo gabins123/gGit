@@ -21,6 +21,18 @@ pub(super) fn missing_repo_error(repo_id: RepoId) -> Error {
     )))
 }
 
+/// Runs `f`, turning a panic into an error. Actions and commands must always
+/// send their finish message: the reducer counts them in flight and retires
+/// optimistic stage/unstage rows one per finish.
+pub(super) fn catch_panic<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        Err(Error::new(ErrorKind::Backend(format!(
+            "git operation panicked: {}",
+            super::super::send_diagnostics::panic_payload_to_string(payload.as_ref())
+        ))))
+    })
+}
+
 /// Keeps operation context safe for a one-line UI subtitle. Git permits odd
 /// characters in paths and user-authored messages, so never let those create
 /// extra layout rows or carry terminal controls into the activity view.
@@ -179,9 +191,23 @@ pub(super) fn spawn_with_repo_or_else(
     task: impl FnOnce(Arc<dyn GitRepository>, StoreWorkerSender) + Send + 'static,
     on_missing: impl FnOnce(StoreWorkerSender) + Send + 'static,
 ) -> bool {
+    spawn_with_repo_maybe_serial(executor, repos, repo_id, msg_tx, false, task, on_missing)
+}
+
+/// With `serial`, runs FIFO and one at a time per repo: concurrent index
+/// writers race on `.git/index.lock`.
+pub(super) fn spawn_with_repo_maybe_serial(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    repo_id: RepoId,
+    msg_tx: StoreWorkerSender,
+    serial: bool,
+    task: impl FnOnce(Arc<dyn GitRepository>, StoreWorkerSender) + Send + 'static,
+    on_missing: impl FnOnce(StoreWorkerSender) + Send + 'static,
+) -> bool {
     if let Some(repo) = repos.get(&repo_id).cloned() {
         repo_load_trace::trace!("queue_repo_task repo_id={:?}", repo_id);
-        executor.spawn(move || {
+        let run = move || {
             if msg_tx.is_cancelled() {
                 repo_load_trace::trace!(
                     "skip_repo_task_cancelled_before_start repo_id={:?}",
@@ -192,7 +218,12 @@ pub(super) fn spawn_with_repo_or_else(
             repo_load_trace::trace!("start_repo_task repo_id={:?}", repo_id);
             task(repo, msg_tx);
             repo_load_trace::trace!("finish_repo_task repo_id={:?}", repo_id);
-        });
+        };
+        if serial {
+            executor.spawn_serial(repo_id, run);
+        } else {
+            executor.spawn(run);
+        }
         true
     } else {
         if msg_tx.is_cancelled() {
@@ -290,5 +321,13 @@ mod hook_activity_context_tests {
         let context = paths_context(&paths, "files").expect("path context");
         assert!(context.starts_with("10 files: src/file-0.rs"));
         assert!(context.contains("…and 2 more"));
+    }
+
+    #[test]
+    fn catch_panic_turns_a_panic_into_an_error() {
+        // The panic hook prints this deliberate panic to stderr.
+        let err = catch_panic::<()>(|| panic!("boom")).unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert_eq!(catch_panic(|| Ok(7)).unwrap(), 7);
     }
 }

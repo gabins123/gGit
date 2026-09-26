@@ -1,6 +1,9 @@
 use super::send_diagnostics::{SendFailureKind, panic_payload_to_string, send_or_log};
+use crate::model::RepoId;
 use gitcomet_core::mergetool_trace;
+use rustc_hash::FxHashMap;
 use std::any::Any;
+use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
@@ -63,6 +66,9 @@ pub(super) enum StoreExecutorPool {
 pub(super) struct TaskExecutor {
     tx: mpsc::Sender<Task>,
     _threads: Vec<thread::JoinHandle<()>>,
+    /// Per-repo FIFO queues for [`Self::spawn_serial`]. A key is present
+    /// exactly while a runner is draining that repo's queue.
+    serial: Arc<std::sync::Mutex<FxHashMap<RepoId, VecDeque<Task>>>>,
 }
 
 /// A panicking task must not take its worker thread with it. These pools are
@@ -159,6 +165,7 @@ impl TaskExecutor {
         Self {
             tx,
             _threads: worker_threads,
+            serial: Arc::default(),
         }
     }
 
@@ -212,11 +219,56 @@ impl TaskExecutor {
         Self {
             tx,
             _threads: Vec::new(),
+            serial: Arc::default(),
         }
     }
 
     pub(super) fn spawn(&self, task: impl FnOnce() + Send + 'static) {
         self.try_spawn(task);
+    }
+
+    /// Runs `task` after every earlier `spawn_serial` task for `key`, one at a
+    /// time. Queued tasks wait in memory, not on a worker: one runner per key
+    /// drains the queue and exits when it is empty.
+    pub(super) fn spawn_serial(&self, key: RepoId, task: impl FnOnce() + Send + 'static) {
+        let context = mergetool_trace::current_capture_context();
+        let task: Task = Box::new(move || {
+            let _trace = context.as_ref().map(mergetool_trace::attach_capture);
+            task();
+        });
+        {
+            let mut queues = self.serial.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(queue) = queues.get_mut(&key) {
+                queue.push_back(task);
+                return;
+            }
+            queues.insert(key, VecDeque::new());
+        }
+        let serial = Arc::clone(&self.serial);
+        let sent = self.try_spawn(move || {
+            let mut task = task;
+            loop {
+                // The runner outlives a panicking task, or the queue would stall.
+                if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(task)) {
+                    record_worker_task_panic(payload.as_ref());
+                }
+                let mut queues = serial.lock().unwrap_or_else(|e| e.into_inner());
+                match queues.get_mut(&key).and_then(VecDeque::pop_front) {
+                    Some(next) => task = next,
+                    None => {
+                        queues.remove(&key);
+                        return;
+                    }
+                }
+            }
+        });
+        if !sent {
+            // Disconnected pool: nothing will ever drain this key.
+            self.serial
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
     }
 
     /// `false` when the worker queue is disconnected (the failure is recorded).
@@ -264,6 +316,29 @@ mod tests {
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 99);
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 100);
         assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    fn serial_tasks_run_fifo_one_at_a_time_per_key() {
+        let executor = TaskExecutor::new(4);
+        let running = Arc::new(AtomicU64::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+        for value in 0..20 {
+            let (running, tx) = (Arc::clone(&running), done_tx.clone());
+            executor.spawn_serial(RepoId(1), move || {
+                assert_eq!(running.fetch_add(1, Ordering::SeqCst), 0, "overlap");
+                thread::sleep(Duration::from_millis(1));
+                running.fetch_sub(1, Ordering::SeqCst);
+                tx.send(value).unwrap();
+            });
+        }
+        let order: Vec<_> = (0..20)
+            .map(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(order, (0..20).collect::<Vec<_>>());
+        // The drained key is released, so a later task starts a new runner.
+        executor.spawn_serial(RepoId(1), move || done_tx.send(20).unwrap());
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 20);
     }
 
     #[test]

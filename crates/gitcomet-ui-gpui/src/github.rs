@@ -161,6 +161,8 @@ struct RawSummary {
     #[serde(default)]
     author: Author,
     head_ref_name: String,
+    #[serde(default)]
+    head_repository_owner: Author,
     base_ref_name: String,
     #[serde(default)]
     is_draft: bool,
@@ -177,6 +179,9 @@ pub(crate) struct PullRequestSummary {
     pub(crate) title: String,
     pub(crate) author: String,
     pub(crate) head: String,
+    /// The head repository's owner; a fork's pull request shares branch
+    /// names like `main` with everyone else's.
+    pub(crate) head_owner: String,
     pub(crate) base: String,
     pub(crate) is_draft: bool,
     pub(crate) review: Option<ReviewDecision>,
@@ -192,6 +197,7 @@ impl From<RawSummary> for PullRequestSummary {
             title: raw.title,
             author: raw.author.login,
             head: raw.head_ref_name,
+            head_owner: raw.head_repository_owner.login,
             base: raw.base_ref_name,
             is_draft: raw.is_draft,
             review: ReviewDecision::parse(&raw.review_decision),
@@ -767,7 +773,7 @@ pub(crate) fn list_open(
         &repo_flag(repo),
         "--state=open",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,baseRefName,isDraft,reviewDecision,statusCheckRollup",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup",
     ]);
     let raw: Vec<RawSummary> = parse_json(&run(command, None)?)?;
     let mut list: Vec<PullRequestSummary> = raw.into_iter().map(Into::into).collect();
@@ -781,7 +787,7 @@ pub(crate) fn list_open(
         "--state=open",
         "--search=review-requested:@me",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,baseRefName,isDraft,reviewDecision,statusCheckRollup",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup",
     ]);
     let requested = run(requested, None).and_then(|out| parse_json::<Vec<RawSummary>>(&out));
     let known = requested.is_ok();
@@ -1064,6 +1070,141 @@ pub(crate) fn create(workdir: &Path, repo: &str, pr: &NewPullRequest) -> Result<
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
+/// A local branch pushed ahead of opening its pull request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BranchPush {
+    pub(crate) remote: String,
+    pub(crate) local: String,
+    pub(crate) remote_branch: String,
+    /// Records the pushed branch as the local one's upstream: for a branch
+    /// GitHub has never seen.
+    pub(crate) set_upstream: bool,
+}
+
+/// Pushes a branch for a pull request. Runs only from the create dialog's
+/// explicit "push and create", with the branch and remote it names.
+pub(crate) fn push_branch(workdir: &Path, push: &BranchPush) -> Result<(), PrError> {
+    let mut command = git(workdir);
+    command.arg("push");
+    if push.set_upstream {
+        command.arg("--set-upstream");
+    }
+    command.args([
+        "--",
+        &push.remote,
+        &format!(
+            "refs/heads/{}:refs/heads/{}",
+            push.local, push.remote_branch
+        ),
+    ]);
+    run_git(command)
+        .map(|_| ())
+        .map_err(|err| PrError::Failed(format!("git push failed: {err}")))
+}
+
+/// What `gh pr create --fill` would put in the form, worked out from local
+/// git: the remote's default branch as the base, a title and body from the
+/// branch's own commits.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NewPullRequestDefaults {
+    pub(crate) base: Option<String>,
+    pub(crate) title: String,
+    pub(crate) body: String,
+}
+
+pub(crate) fn new_pull_request_defaults(
+    workdir: &Path,
+    remote: &str,
+    branch: &str,
+) -> NewPullRequestDefaults {
+    let base = default_branch(workdir, remote);
+    let commits = base
+        .as_deref()
+        .map(|base| branch_commits(workdir, remote, base, branch))
+        .unwrap_or_default();
+    let (title, body) = fill_from_commits(&commits, branch);
+    NewPullRequestDefaults { base, title, body }
+}
+
+/// `refs/remotes/<remote>/HEAD`, as clone sets it; else main or master.
+fn default_branch(workdir: &Path, remote: &str) -> Option<String> {
+    let mut command = git(workdir);
+    command.args([
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        &format!("refs/remotes/{remote}/HEAD"),
+    ]);
+    if let Ok(out) = run_git(command) {
+        let target = String::from_utf8_lossy(&out).trim().to_string();
+        if let Some(base) = target.strip_prefix(&format!("{remote}/"))
+            && !base.is_empty()
+        {
+            return Some(base.to_string());
+        }
+    }
+    ["main", "master"]
+        .into_iter()
+        .find(|name| {
+            let mut command = git(workdir);
+            command.args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote}/{name}"),
+            ]);
+            run_git(command).is_ok()
+        })
+        .map(str::to_string)
+}
+
+/// The branch's own commits over the base, oldest first: subject and body.
+fn branch_commits(workdir: &Path, remote: &str, base: &str, branch: &str) -> Vec<(String, String)> {
+    let mut command = git(workdir);
+    command.args([
+        "log",
+        "--no-merges",
+        "--reverse",
+        "--max-count=50",
+        "--format=%s%x1f%b%x1e",
+        &format!("refs/remotes/{remote}/{base}..refs/heads/{branch}"),
+    ]);
+    let Ok(out) = run_git(command) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out)
+        .split('\u{1e}')
+        .filter_map(|record| {
+            let (subject, body) = record.trim_start_matches('\n').split_once('\u{1f}')?;
+            Some((subject.trim().to_string(), body.trim().to_string()))
+        })
+        .collect()
+}
+
+/// gh's `--fill`: one commit gives its own subject and body; several give the
+/// branch's name as the title and their subjects as the body.
+fn fill_from_commits(commits: &[(String, String)], branch: &str) -> (String, String) {
+    if let [(subject, body)] = commits {
+        return (subject.clone(), body.clone());
+    }
+    let name = branch
+        .rsplit('/')
+        .next()
+        .unwrap_or(branch)
+        .replace(['-', '_'], " ");
+    let mut chars = name.trim().chars();
+    let title = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
+    let body = commits
+        .iter()
+        .map(|(subject, _)| format!("- {subject}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (title, body)
+}
+
 /// A full hex object id, so a value from GitHub can never reach git as an
 /// option or a revision expression.
 fn is_object_id(value: &str) -> bool {
@@ -1141,6 +1282,27 @@ pub(crate) fn prepare_diff_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fill_takes_one_commit_whole_and_names_several_by_branch() {
+        let one = vec![("Fix the thing".to_string(), "Because.".to_string())];
+        assert_eq!(
+            fill_from_commits(&one, "feat/x"),
+            ("Fix the thing".to_string(), "Because.".to_string())
+        );
+        let two = vec![
+            ("First".to_string(), String::new()),
+            ("Second".to_string(), "body".to_string()),
+        ];
+        assert_eq!(
+            fill_from_commits(&two, "feat/pr-actions_v2"),
+            ("Pr actions v2".to_string(), "- First\n- Second".to_string())
+        );
+        assert_eq!(
+            fill_from_commits(&[], "dev"),
+            ("Dev".to_string(), String::new())
+        );
+    }
+
     use super::*;
 
     #[test]

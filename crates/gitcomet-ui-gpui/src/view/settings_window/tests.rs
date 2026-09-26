@@ -1971,7 +1971,9 @@ fn change_tracking_setting_defers_main_window_update(cx: &mut gpui::TestAppConte
             .expect("settings window should be readable");
         match current {
             ChangeTrackingView::Combined => ChangeTrackingView::SplitUntracked,
-            ChangeTrackingView::SplitUntracked => ChangeTrackingView::Combined,
+            ChangeTrackingView::SplitUntracked | ChangeTrackingView::Unified => {
+                ChangeTrackingView::Combined
+            }
         }
     });
 

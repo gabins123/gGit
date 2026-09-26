@@ -162,6 +162,7 @@ const PANEL_KEYS_HELP: &[(&str, &str)] = &[
     ("p / P", "Pull / push"),
     ("f", "Fetch all remotes"),
     ("s", "Stash the changes"),
+    ("N", "New pull request from the current branch"),
     ("0", "Codex panel"),
     ("i", "Codex actions"),
     ("?", "This list"),
@@ -493,6 +494,28 @@ impl GitCometView {
                 _ => {}
             }
         }
+        if self.changes_list_shown() {
+            match panel {
+                FocusPanel::Details => {
+                    return &[
+                        ("j/k", "file"),
+                        ("space", "stage"),
+                        ("a", "all"),
+                        ("F", "filter"),
+                        ("c", "commit"),
+                    ];
+                }
+                FocusPanel::Diff => {
+                    return &[
+                        ("j/k", "change"),
+                        ("space", "stage"),
+                        ("F1/F4", "file"),
+                        ("esc", "back"),
+                    ];
+                }
+                _ => {}
+            }
+        }
         panel.status_hints()
     }
 
@@ -566,7 +589,46 @@ impl GitCometView {
                 _ => {}
             }
         }
+        if self.changes_list_shown() {
+            match panel {
+                FocusPanel::Details => {
+                    return &[
+                        ("j / k", "Next / previous file, opening its diff"),
+                        ("enter", "Go to the file's diff"),
+                        ("space", "Stage / unstage the open file; it keeps its place"),
+                        ("a", "Stage what the list shows, or unstage it all"),
+                        ("shift+space", "Stage / unstage the open file's folder"),
+                        ("F", "Filter: all, unstaged, staged, untracked"),
+                        ("`", "Tree or flat list"),
+                        ("o", "Sort the list"),
+                        ("d", "Discard the open file's changes"),
+                        ("m", "The open file's menu"),
+                    ];
+                }
+                FocusPanel::Diff => {
+                    return &[
+                        ("j / k", "Next / previous change"),
+                        ("space", "Stage / unstage the file; it keeps its place"),
+                        ("F1 / F4", "Previous / next file"),
+                        ("d", "Discard the file's changes"),
+                        ("m", "The file's menu"),
+                        ("esc", "Close the diff and go back"),
+                    ];
+                }
+                _ => {}
+            }
+        }
         panel.help()
+    }
+
+    /// Details shows the one Changes list rather than sections, a pull
+    /// request or a commit.
+    fn changes_list_shown(&self) -> bool {
+        self.change_tracking_view == ChangeTrackingView::Unified
+            && !self.pull_request_details_active()
+            && self
+                .active_repo()
+                .is_some_and(|repo| repo.history_state.selected_commit.is_none())
     }
 
     /// Opens a dialog or menu from a key; dismissing it hands focus back to
@@ -663,6 +725,15 @@ impl GitCometView {
     }
 
     fn stage_or_unstage_all(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.change_tracking_view == ChangeTrackingView::Unified {
+            // Deferred: staging may raise the conflict-markers dialog, which
+            // needs the root this key handler is still inside.
+            self.defer_pane_action(self.details_pane.clone(), cx, |pane, window, cx| {
+                pane.toggle_all_changes(None, window, cx);
+                true
+            });
+            return;
+        }
         let unstaged = self
             .active_repo()
             .and_then(|repo| repo.worktree_status_entries())
@@ -832,19 +903,8 @@ impl GitCometView {
                 return;
             }
             ("O", BranchMenuTarget::Local { name }) => {
-                if self.github_target().is_none() {
-                    self.push_toast(
-                        components::ToastKind::Warning,
-                        "Pull requests need a github.com remote.".to_string(),
-                        cx,
-                    );
-                    return;
-                }
-                self.clear_pull_request_submit_error();
-                Some(PopoverKind::CreatePullRequest {
-                    repo_id,
-                    branch: Some(name.clone()),
-                })
+                self.open_create_pull_request(repo_id, Some(name.clone()), window, cx);
+                return;
             }
             _ => None,
         };
@@ -926,6 +986,8 @@ impl GitCometView {
             (_, "P") => self.execute_command("push", Some(window), cx),
             (_, "f") => self.execute_command("fetch-all", Some(window), cx),
             (_, "s") => self.open_popover_from_key(PopoverKind::StashPrompt, window, cx),
+            // From anywhere: the current branch's pull request, set up here.
+            (_, "N") => self.open_create_pull_request(repo_id, None, window, cx),
             (_, "c") if status_shown => self.focus_commit_message(repo_id, window, cx),
             (_, "A") if status_shown => {
                 // Like the menu: turning amend off is always allowed.
@@ -938,6 +1000,33 @@ impl GitCometView {
             (Some(panel), "m") => self.open_selection_menu(panel, repo_id, window, cx),
             (Some(FocusPanel::Details), "a") if worktree_shown => {
                 self.stage_or_unstage_all(window, cx)
+            }
+            (Some(FocusPanel::Details), "SPACE")
+                if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>
+            {
+                // Deferred: staging may raise the conflict-markers dialog.
+                self.defer_pane_action(self.details_pane.clone(), cx, |pane, window, cx| {
+                    pane.toggle_open_change_folder(window, cx);
+                    true
+                });
+            }
+            (Some(FocusPanel::Details), "F" | "`" | "o")
+                if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>
+            {
+                let list = crate::view::rows::FileListId::Changes;
+                match key.as_str() {
+                    "F" => self
+                        .details_pane
+                        .update(cx, |pane, cx| pane.cycle_changes_filter(cx)),
+                    "`" => self.details_pane.update(cx, |pane, cx| {
+                        pane.toggle_file_list_layout(repo_id, list, cx)
+                    }),
+                    _ => self.open_popover_from_key(
+                        PopoverKind::CommitFileSortMenu { list },
+                        window,
+                        cx,
+                    ),
+                }
             }
             (Some(FocusPanel::Details | FocusPanel::Diff), "d") if worktree_shown => {
                 if let Some((area, path)) = self
@@ -1056,22 +1145,7 @@ impl GitCometView {
                 Some(true)
             }
             (_, "n") => {
-                if self.github_target().is_none() {
-                    self.push_toast(
-                        components::ToastKind::Warning,
-                        "Pull requests need a github.com remote.".to_string(),
-                        cx,
-                    );
-                } else {
-                    self.open_pull_request_prompt(
-                        PopoverKind::CreatePullRequest {
-                            repo_id,
-                            branch: None,
-                        },
-                        window,
-                        cx,
-                    );
-                }
+                self.open_create_pull_request(repo_id, None, window, cx);
                 Some(true)
             }
             (_, "r") => {

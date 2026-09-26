@@ -842,6 +842,16 @@ fn finish_repo_action(
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         repo_state.local_actions_in_flight = repo_state.local_actions_in_flight.saturating_sub(1);
         repo_state.bump_ops_rev();
+        if matches!(
+            action,
+            RepoActionKind::StagePath
+                | RepoActionKind::StagePaths
+                | RepoActionKind::UnstagePath
+                | RepoActionKind::UnstagePaths
+        ) {
+            // The optimistic rows stay until the reload issued below lands.
+            repo_state.finish_pending_index_op();
+        }
         if action.writes_worktree() {
             repo_state.bump_local_worktree_write_rev();
         }

@@ -58,7 +58,7 @@ pub(super) struct RepoPullRequests {
 pub(super) enum HeadProblem {
     Detached,
     /// The branch has no upstream on GitHub: GitHub has never seen it.
-    NotPushed(String),
+    NotPushed,
 }
 
 /// The branch a new pull request comes from, as `gh pr create --head` and
@@ -79,17 +79,20 @@ pub(super) fn pull_request_head(
         .ready()
         .and_then(|branches| branches.iter().find(|candidate| candidate.name == name))
         .and_then(|branch| branch.upstream.clone());
-    // Configured isn't pushed: the remote-tracking ref has to exist.
+    // Configured isn't pushed: the remote-tracking ref has to exist. And only
+    // a same-named upstream is the branch's own; `git switch -c feat
+    // origin/main` tracks main, which is the base, not the head.
     let live = upstream.as_ref().is_some_and(|upstream| {
-        repo.remote_branches.ready().is_some_and(|remote_branches| {
-            remote_branches.iter().any(|candidate| {
-                candidate.remote == upstream.remote && candidate.name == upstream.branch
+        upstream.branch == name
+            && repo.remote_branches.ready().is_some_and(|remote_branches| {
+                remote_branches.iter().any(|candidate| {
+                    candidate.remote == upstream.remote && candidate.name == upstream.branch
+                })
             })
-        })
     });
     match upstream {
         Some(upstream) if live => Ok(remote_branch_head(repo, &upstream.remote, &upstream.branch)),
-        _ => Err(HeadProblem::NotPushed(name)),
+        _ => Err(HeadProblem::NotPushed),
     }
 }
 
@@ -978,12 +981,68 @@ impl GitCometView {
         .detach();
     }
 
-    /// Opens a pull request. Runs only from the create dialog's explicit
-    /// submit, and never pushes.
+    /// Opens the create dialog for `branch` (default: the checked-out one),
+    /// then fills in the base, title and body from its commits once git has
+    /// read them. Fields typed into by then are left alone.
+    pub(super) fn open_create_pull_request(
+        &mut self,
+        repo_id: RepoId,
+        branch: Option<String>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "Pull requests need a github.com remote.".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.open_pull_request_prompt(
+            PopoverKind::CreatePullRequest {
+                repo_id,
+                branch: branch.clone(),
+            },
+            window,
+            cx,
+        );
+        let prefill_branch = branch.clone();
+        let head = match (
+            branch,
+            self.state.repos.iter().find(|repo| repo.id == repo_id),
+        ) {
+            (Some(branch), _) => branch,
+            (None, Some(repo)) => match &repo.head_branch {
+                Loadable::Ready(head) if head != "HEAD" => head.clone(),
+                _ => return,
+            },
+            (None, None) => return,
+        };
+        // Tests have no repository on disk for git to read.
+        if cfg!(test) {
+            return;
+        }
+        let host = self.popover_host.clone();
+        let task = cx.background_spawn(async move {
+            github::new_pull_request_defaults(&target.workdir, &target.remote, &head)
+        });
+        cx.spawn(async move |_view, cx| {
+            let defaults = task.await;
+            host.update(cx, |host, cx| {
+                host.prefill_create_pull_request(repo_id, prefill_branch, defaults, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// Opens a pull request, pushing its branch first when the dialog says
+    /// so. Runs only from the create dialog's explicit submit.
     pub(super) fn submit_new_pull_request(
         &mut self,
         repo_id: RepoId,
         pr: NewPullRequest,
+        push: Option<github::BranchPush>,
         cx: &mut gpui::Context<Self>,
     ) {
         let Some(target) = self.github_target_for(repo_id) else {
@@ -996,13 +1055,22 @@ impl GitCometView {
         }
         entry.submitting = true;
         entry.submit_error = None;
-        let task =
-            cx.background_spawn(async move { github::create(&target.workdir, &target.slug, &pr) });
+        let pushes = push.is_some();
+        let task = cx.background_spawn(async move {
+            if let Some(push) = &push {
+                github::push_branch(&target.workdir, push)?;
+            }
+            github::create(&target.workdir, &target.slug, &pr)
+        });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
                 let entry = this.pull_requests.repo_mut(repo_id);
                 entry.submitting = false;
+                if pushes {
+                    // The branch and its upstream moved under the store.
+                    this.store.dispatch(Msg::RefreshBranches { repo_id });
+                }
                 match result {
                     Ok(url) => {
                         this.close_pull_request_prompt(repo_id, PrDialog::Create, cx);
@@ -1098,6 +1166,7 @@ mod tests {
             title: String::new(),
             author: String::new(),
             head: String::new(),
+            head_owner: String::new(),
             base: String::new(),
             is_draft: false,
             review: None,
