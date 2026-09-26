@@ -644,6 +644,58 @@ impl MainPaneView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // A range selected in the Changes list is what the key acts on.
+        let selection = self
+            .root_view
+            .update(cx, |root, cx| {
+                root.details_pane.read(cx).changes_selection(repo_id)
+            })
+            .ok()
+            .flatten();
+        if let Some(selection) = selection {
+            // Conflicts are resolved one at a time, never by a bulk stage.
+            let files = selection
+                .iter()
+                .filter(|(_, lanes)| !lanes.conflicted())
+                .map(|(path, lanes)| (path.as_path(), *lanes));
+            let Some((stage, paths)) = crate::view::panes::toggle_plan(files, want, false) else {
+                return;
+            };
+            let next_area = if stage {
+                if self.confirm_stage_conflict_markers(
+                    repo_id,
+                    DiffArea::Unstaged,
+                    paths.clone(),
+                    false,
+                    window,
+                    cx,
+                ) {
+                    return;
+                }
+                self.store.dispatch(Msg::StagePaths {
+                    repo_id,
+                    paths: paths.clone().into(),
+                });
+                DiffArea::Staged
+            } else {
+                self.store.dispatch(Msg::UnstagePaths {
+                    repo_id,
+                    paths: paths.clone().into(),
+                });
+                DiffArea::Unstaged
+            };
+            if next_area != area && paths.contains(&path) {
+                self.store.dispatch(Msg::SelectDiff {
+                    repo_id,
+                    target: DiffTarget::WorkingTree {
+                        path,
+                        area: next_area,
+                    },
+                });
+            }
+            self.rebuild_diff_cache(cx);
+            return;
+        }
         let Some(lanes) = self
             .active_repo()
             .map(|repo| crate::view::panes::ChangeLanes::of(repo, &path))
@@ -690,6 +742,30 @@ impl MainPaneView {
         self.rebuild_diff_cache(cx);
     }
 
+    /// Shift+J/K: grows or shrinks the selected range, the open file being
+    /// the end that moves; the first press anchors it at the open file.
+    pub(in crate::view) fn extend_changes_selection(
+        &mut self,
+        repo_id: RepoId,
+        direction: i8,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(path) = self.open_change_path(cx) else {
+            return false;
+        };
+        let Some((next, lanes)) = self.changes_neighbor(repo_id, &path, direction, cx) else {
+            return false;
+        };
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.details_pane.update(cx, |pane, cx| {
+                pane.extend_changes_range(repo_id, path, next.clone(), cx)
+            });
+        });
+        self.open_change(repo_id, next, lanes, cx);
+        true
+    }
+
     /// `j`/`k` and F1/F4 over the Changes list. `None` when the list isn't
     /// what's showing, or the open diff isn't one of the working tree's.
     fn step_changes(
@@ -716,6 +792,11 @@ impl MainPaneView {
             window.focus(&self.diff_panel_focus_handle, cx);
         }
         self.clear_status_multi_selection(repo_id, cx);
+        // A plain step drops the range selection.
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.details_pane
+                .update(cx, |pane, cx| pane.clear_changes_range(cx));
+        });
         self.open_change(repo_id, path, lanes, cx);
         Some(true)
     }

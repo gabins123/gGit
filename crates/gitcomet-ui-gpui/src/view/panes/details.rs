@@ -7,7 +7,7 @@ use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 
 mod changes;
-pub(in crate::view) use changes::{ChangeLanes, ChangesFilter};
+pub(in crate::view) use changes::{ChangeLanes, ChangesFilter, toggle_plan};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingCommitAmend {
@@ -210,6 +210,8 @@ pub(in super::super) struct DetailsPaneView {
     changes_query: changes::ChangesQuery,
     changes_query_open: bool,
     changes_query_focus_pending: bool,
+    /// The Changes list's range selection.
+    changes_range: Option<changes::ChangesRange>,
 }
 
 pub(in super::super) struct DetailsPaneInit {
@@ -625,6 +627,7 @@ impl DetailsPaneView {
             changes_query: Default::default(),
             changes_query_open: false,
             changes_query_focus_pending: false,
+            changes_range: None,
         };
         pane.sync_scaled_section_heights_from_design();
         pane.set_theme(theme, cx);
@@ -2474,10 +2477,32 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (comments, selected, head_moved, thread, suggested) = {
+        let (comments, selected, head_moved, thread, suggested, last_review) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
+            };
+            let last_review = {
+                use super::super::pull_requests::PrLoad;
+                use super::super::review::SinceReview;
+                // GitHub text: plain, and only its first few lines.
+                let body = review
+                    .last_review
+                    .ready()
+                    .and_then(Option::as_ref)
+                    .map(|last| last.body.lines().take(3).collect::<Vec<_>>().join("\n"))
+                    .filter(|body| !body.trim().is_empty());
+                let line = match &review.last_review {
+                    PrLoad::Idle => None,
+                    PrLoad::Loading => Some("Loading your last review…".to_string()),
+                    PrLoad::Failed(err) => Some(format!("Couldn't load your last review: {err}")),
+                    PrLoad::Ready(None) => {
+                        Some("You haven't reviewed this pull request before.".to_string())
+                    }
+                    PrLoad::Ready(Some(_)) => review.last_review_line(std::time::SystemTime::now()),
+                };
+                let gone = review.since_review == Some(SinceReview::Gone);
+                (line, body, gone)
             };
             (
                 review.draft.comments.clone(),
@@ -2491,8 +2516,10 @@ impl DetailsPaneView {
                     .into_iter()
                     .map(|(_, suggestion)| suggestion.body.clone())
                     .collect::<Vec<_>>(),
+                last_review,
             )
         };
+        let (last_line, last_body, last_gone) = last_review;
         let count = comments.len();
         let rows = comments.into_iter().enumerate().map(|(ix, comment)| {
             let file = comment
@@ -2572,6 +2599,34 @@ impl DetailsPaneView {
                             .child(format!("{count} pending")),
                     ),
             )
+            .when_some(last_line, |panel, line| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(secondary)
+                        .child(line)
+                        .when(last_gone, |block| {
+                            block.child(div().text_color(warning).child(
+                                "Your last review's commit is gone; showing everything.",
+                            ))
+                        })
+                        .when_some(last_body, |block, body| {
+                            block.child(
+                                div()
+                                    .max_h(px(64.0))
+                                    .overflow_hidden()
+                                    .text_size(theme.ui_text(12.5))
+                                    .text_color(theme.colors.foreground.primary)
+                                    .child(body),
+                            )
+                        }),
+                )
+            })
             .when(head_moved, |panel| {
                 panel.child(
                     div()

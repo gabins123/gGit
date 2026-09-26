@@ -308,7 +308,7 @@ impl ChangesList {
 /// when none of it is, unstage it all. `all` is the unfiltered list acting on
 /// everything, which the backend spells as no paths at all. `None` when there
 /// is nothing to do.
-fn toggle_plan<'a>(
+pub(in crate::view) fn toggle_plan<'a>(
     shown: impl Iterator<Item = (&'a Path, ChangeLanes)> + Clone,
     stage: Option<bool>,
     all: bool,
@@ -342,13 +342,28 @@ fn changes_step(drawn: &[&Path], path: &Path, direction: i8) -> Option<usize> {
     }
 }
 
+/// A range selected in the Changes list: from `anchor` to `head`, the end
+/// Shift+J/K and shift-click last moved. It holds only while `head` is the
+/// open file in the same repo, so anything else that opens a file (another
+/// repo, a closed diff, `j`) leaves it lapsed rather than reviving it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) struct ChangesRange {
+    repo_id: RepoId,
+    anchor: PathBuf,
+    head: PathBuf,
+}
+
+/// A `/` filter's mask over the list (`None` keeps everything), keyed by
+/// what it was worked out from.
+type MatchedSlot = Option<(u64, Option<Arc<[bool]>>)>;
+
 /// The list, its filtered and sorted order, and its rows, each built once per
 /// change to what feeds it.
 #[derive(Default)]
 pub(super) struct ChangesCache {
     list: std::cell::RefCell<Option<(u64, Arc<ChangesList>)>>,
     /// What the `/` filter keeps, keyed by the list and the query.
-    matched: std::cell::RefCell<Option<(u64, Option<Arc<[bool]>>)>>,
+    matched: std::cell::RefCell<MatchedSlot>,
     /// The kind-filtered list sorted, without the `/` filter: a keystroke
     /// only masks this, it never sorts again.
     sorted: std::cell::RefCell<Option<(u64, Arc<[usize]>)>>,
@@ -738,6 +753,87 @@ impl DetailsPaneView {
             Some((false, paths)) => self.unstage_changes(repo_id, paths, cx),
             None => {}
         }
+    }
+
+    /// Moves the range's moving end from `open` to `to`. A range still held
+    /// at `open` keeps its anchor; otherwise a new one starts at `open`.
+    pub(in crate::view) fn extend_changes_range(
+        &mut self,
+        repo_id: RepoId,
+        open: PathBuf,
+        to: PathBuf,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let anchor = match &self.changes_range {
+            Some(range) if range.repo_id == repo_id && range.head == open => range.anchor.clone(),
+            _ => open,
+        };
+        self.changes_range = Some(ChangesRange {
+            repo_id,
+            anchor,
+            head: to,
+        });
+        cx.notify();
+    }
+
+    pub(in crate::view) fn clear_changes_range(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.changes_range.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The selected range's ends as drawn positions, low first: from the
+    /// anchor to the open file. `None` without a range of two or more, or
+    /// when either end is filtered out of sight.
+    fn changes_span(&self, repo: &RepoState, rows: &ChangesRows) -> Option<(usize, usize)> {
+        let range = self
+            .changes_range
+            .as_ref()
+            .filter(|range| range.repo_id == repo.id)?;
+        let DiffTarget::WorkingTree { path: open, .. } = repo.diff_state.diff_target.as_ref()?
+        else {
+            return None;
+        };
+        if *open != range.head {
+            return None;
+        }
+        let anchor = range.anchor.as_path();
+        let drawn = rows.drawn();
+        let position = |path: &Path| {
+            drawn
+                .iter()
+                .position(|ix| rows.list.entries[*ix].path == path)
+        };
+        let (from, to) = (position(anchor)?, position(open)?);
+        (from != to).then(|| (from.min(to), from.max(to)))
+    }
+
+    /// The selected range's files in drawn order, for `space`, Ctrl+S/U and
+    /// `d`; `None` without a range.
+    pub(in crate::view) fn changes_selection(
+        &self,
+        repo_id: RepoId,
+    ) -> Option<Vec<(PathBuf, ChangeLanes)>> {
+        let repo = self.active_repo().filter(|repo| repo.id == repo_id)?;
+        let rows = self.changes_rows(repo)?;
+        let (from, to) = self.changes_span(repo, &rows)?;
+        // A file inside a collapsed folder is between the ends but out of
+        // sight: acting on it would be a surprise, so it isn't selected.
+        let mut projection = vec![usize::MAX; rows.list.entries.len()];
+        for (position, ix) in rows.order.iter().enumerate() {
+            projection[*ix] = position;
+        }
+        Some(
+            rows.drawn()[from..=to]
+                .iter()
+                .filter(|ix| {
+                    rows.plan
+                        .row_ix_for_ordinal(FileOrdinal(projection[**ix]))
+                        .is_some()
+                })
+                .map(|ix| (rows.list.entries[*ix].path.clone(), rows.list.lanes[*ix]))
+                .collect(),
+        )
     }
 
     /// Whether the `/` filter narrows the list.
@@ -1206,6 +1302,7 @@ impl DetailsPaneView {
             Some(DiffTarget::WorkingTree { path, .. }) => Some(path.clone()),
             _ => None,
         };
+        let span = this.changes_span(repo, &rows);
         let is_tree = rows.plan.is_tree();
         let theme = this.theme;
         let ui_scale = this.ui_scale();
@@ -1327,7 +1424,9 @@ impl DetailsPaneView {
                     } else {
                         this.cached_path_display(&entry.path)
                     };
-                    let selected = open.as_deref() == Some(entry.path.as_path());
+                    let position = rows.plan.display_position(ordinal).unwrap_or(ordinal.0);
+                    let selected = open.as_deref() == Some(entry.path.as_path())
+                        || span.is_some_and(|(from, to)| (from..=to).contains(&position));
                     out.push(changes_row(
                         ChangesRowCtx {
                             theme,
@@ -1562,17 +1661,26 @@ fn changes_row(
             cx.listener(move |this, e: &ClickEvent, window, cx| {
                 window.focus(&this.panel_focus_handle, cx);
                 let path = (*path_for_row).clone();
-                let open = this
+                let open_path = this
                     .active_repo()
                     .filter(|repo| repo.id == repo_id)
-                    .and_then(|repo| repo.diff_state.diff_target.as_ref())
-                    .is_some_and(|target| {
-                        matches!(target, DiffTarget::WorkingTree { path: open, .. } if *open == path)
+                    .and_then(|repo| match repo.diff_state.diff_target.as_ref() {
+                        Some(DiffTarget::WorkingTree { path, .. }) => Some(path.clone()),
+                        _ => None,
                     });
-                if e.standard_click() && open {
+                let open = open_path.as_ref() == Some(&path);
+                // Shift-click selects from the open file (or the range's
+                // anchor) to this one; a plain click drops the range.
+                let extend = e.modifiers().shift && open_path.is_some() && !open;
+                match open_path.filter(|_| extend) {
+                    Some(from) => this.extend_changes_range(repo_id, from, path.clone(), cx),
+                    None => this.clear_changes_range(cx),
+                }
+                if e.standard_click() && open && !extend {
                     this.store.dispatch(Msg::ClearDiffSelection { repo_id });
                 } else if conflicted && area == DiffArea::Unstaged {
-                    this.store.dispatch(Msg::SelectConflictDiff { repo_id, path });
+                    this.store
+                        .dispatch(Msg::SelectConflictDiff { repo_id, path });
                 } else {
                     this.store.dispatch(Msg::SelectDiff {
                         repo_id,

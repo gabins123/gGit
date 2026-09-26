@@ -991,6 +991,111 @@ pub(crate) fn list_review_threads(
     Ok(review_threads(pages.into_iter().flatten().collect()))
 }
 
+/// A review you submitted on a pull request, as GitHub's REST API lists it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LastReview {
+    /// `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED` or `DISMISSED`.
+    pub(crate) state: String,
+    /// The summary, untrusted plain text.
+    pub(crate) body: String,
+    /// ISO 8601, as GitHub gives it.
+    pub(crate) submitted_at: String,
+    /// The head commit the review was made on; may be empty.
+    pub(crate) commit_id: String,
+}
+
+impl LastReview {
+    pub(crate) fn verdict(&self) -> &'static str {
+        match self.state.as_str() {
+            "APPROVED" => "Approved",
+            "CHANGES_REQUESTED" => "Changes requested",
+            "DISMISSED" => "Dismissed",
+            _ => "Commented",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawRestReview {
+    #[serde(default)]
+    user: Option<Author>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    submitted_at: Option<String>,
+    #[serde(default)]
+    commit_id: Option<String>,
+}
+
+/// `login`'s latest submitted review among the pages; a pending one isn't
+/// submitted, a dismissed one still counts.
+fn latest_review_by(pages: Vec<Vec<RawRestReview>>, login: &str) -> Option<LastReview> {
+    pages
+        .into_iter()
+        .flatten()
+        .filter(|review| {
+            review.state != "PENDING"
+                && review
+                    .user
+                    .as_ref()
+                    .is_some_and(|user| user.login.eq_ignore_ascii_case(login))
+        })
+        .map(|review| LastReview {
+            state: review.state,
+            body: review
+                .body
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .take(MAX_CONVERSATION_BODY_CHARS)
+                .collect(),
+            submitted_at: review.submitted_at.unwrap_or_default(),
+            commit_id: review.commit_id.unwrap_or_default(),
+        })
+        // ISO 8601 in one format sorts as text; a tie keeps the later one.
+        .max_by(|a, b| a.submitted_at.cmp(&b.submitted_at))
+}
+
+/// The signed-in gh account's login. Asked each time rather than cached:
+/// `gh auth switch` changes it under a running app, and this is one small
+/// call per review opened.
+fn viewer_login(workdir: &Path) -> Result<String, PrError> {
+    #[derive(Deserialize)]
+    struct User {
+        login: String,
+    }
+    let mut command = gh(workdir);
+    command.args(["api", "--hostname=github.com", "user"]);
+    let user: User = parse_json(&run(command, None)?)?;
+    Ok(user.login)
+}
+
+/// Your latest submitted review of the pull request, if you ever reviewed it.
+pub(crate) fn last_review(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+) -> Result<Option<LastReview>, PrError> {
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
+    let login = viewer_login(workdir)?;
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "--hostname=github.com",
+        &format!("repos/{repo}/pulls/{number}/reviews?per_page=100"),
+        "--paginate",
+        "--slurp",
+    ]);
+    let pages: Vec<Vec<RawRestReview>> = parse_json(&run(command, None)?)?;
+    Ok(latest_review_by(pages, &login))
+}
+
 /// `gh api --method=POST` with a JSON body on stdin. A refusal reports the
 /// API's own explanation, which gh prints as JSON on stdout.
 fn api_post(workdir: &Path, path: &str, payload: &str) -> Result<(), PrError> {
@@ -1236,6 +1341,110 @@ fn has_commit(workdir: &Path, oid: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Fetches whichever of `oids` aren't local, by object id only, so no ref,
+/// branch, FETCH_HEAD or working-tree file changes.
+fn fetch_missing(workdir: &Path, remote: &str, oids: &[&str]) -> Result<(), PrError> {
+    let missing: Vec<&str> = oids
+        .iter()
+        .copied()
+        .filter(|oid| !has_commit(workdir, oid))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut command = git(workdir);
+    command.args([
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--",
+        remote,
+    ]);
+    command.args(&missing);
+    run_git(command).map(drop)
+}
+
+/// What changed from one head of a pull request to a later one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChangesSince {
+    /// Paths changed between the two commits, whole-repository.
+    pub(crate) files: std::collections::BTreeSet<String>,
+    /// Commits on the new head that the old one lacks.
+    pub(crate) commits: usize,
+}
+
+/// Why the changes since a commit couldn't be worked out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SinceFailure {
+    /// GitHub no longer has the old commit: a force push dropped it.
+    Gone,
+    /// Anything else (network, a locked key, git itself); worth retrying.
+    Failed(String),
+}
+
+/// The files changed from `old_oid` to `new_oid`, fetching either by object id
+/// when it isn't local.
+pub(crate) fn changes_since(
+    workdir: &Path,
+    remote: &str,
+    old_oid: &str,
+    new_oid: &str,
+) -> Result<ChangesSince, SinceFailure> {
+    let failed = |err: PrError| SinceFailure::Failed(err.to_string());
+    if !is_object_id(old_oid) || !is_object_id(new_oid) {
+        return Err(SinceFailure::Failed(
+            "GitHub returned an unexpected commit id".to_string(),
+        ));
+    }
+    if let Err(err) = fetch_missing(workdir, remote, &[old_oid, new_oid]) {
+        // Only GitHub refusing the object means it's gone; a failed
+        // connection says nothing about it.
+        let message = err.to_string().to_lowercase();
+        let refused = [
+            "not our ref",
+            "unadvertised object",
+            "couldn't find remote ref",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason));
+        return Err(if refused && !has_commit(workdir, old_oid) {
+            SinceFailure::Gone
+        } else {
+            failed(err)
+        });
+    }
+    let run_git = |command| run_git(command).map_err(failed);
+    let mut command = git(workdir);
+    command.args([
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "-z",
+        old_oid,
+        new_oid,
+        "--",
+    ]);
+    let files = parse_name_list(&run_git(command)?);
+    let mut command = git(workdir);
+    command.args(["rev-list", "--count", &format!("{old_oid}..{new_oid}")]);
+    let commits = String::from_utf8_lossy(&run_git(command)?)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    Ok(ChangesSince { files, commits })
+}
+
+/// `git diff --name-only -z` output as paths.
+fn parse_name_list(stdout: &[u8]) -> std::collections::BTreeSet<String> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
 /// Makes the PR's base and head commits available locally and returns their
 /// merge base, which is what GitHub diffs a PR against. Fetches by object id
 /// only, so no ref, branch, FETCH_HEAD or working-tree file changes.
@@ -1250,23 +1459,7 @@ pub(crate) fn prepare_diff_range(
             "GitHub returned an unexpected commit id".to_string(),
         ));
     }
-    let missing: Vec<&str> = [base_oid, head_oid]
-        .into_iter()
-        .filter(|oid| !has_commit(workdir, oid))
-        .collect();
-    if !missing.is_empty() {
-        let mut command = git(workdir);
-        command.args([
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--",
-            remote,
-        ]);
-        command.args(&missing);
-        run_git(command)?;
-    }
+    fetch_missing(workdir, remote, &[base_oid, head_oid])?;
     let mut command = git(workdir);
     command.args(["merge-base", base_oid, head_oid]);
     // With no common ancestor git exits 1 and says nothing.
@@ -1282,6 +1475,47 @@ pub(crate) fn prepare_diff_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn your_last_review_is_your_latest_submitted_one() {
+        let pages: Vec<Vec<super::RawRestReview>> = serde_json::from_str(
+            r#"[[
+              {"user": {"login": "Me"}, "state": "APPROVED", "body": " ok ", "submitted_at": "2026-01-02T00:00:00Z", "commit_id": "a"},
+              {"user": {"login": "other"}, "state": "COMMENTED", "body": "", "submitted_at": "2026-03-01T00:00:00Z", "commit_id": "b"},
+              {"user": null, "state": "COMMENTED", "body": null, "submitted_at": null, "commit_id": null}
+            ], [
+              {"user": {"login": "me"}, "state": "DISMISSED", "body": "old", "submitted_at": "2026-02-01T00:00:00Z", "commit_id": "c"},
+              {"user": {"login": "me"}, "state": "PENDING", "body": "draft", "commit_id": "d"}
+            ]]"#,
+        )
+        .expect("pages");
+        let last = super::latest_review_by(pages, "me").expect("a review");
+        assert_eq!(
+            (
+                last.state.as_str(),
+                last.body.as_str(),
+                last.commit_id.as_str()
+            ),
+            ("DISMISSED", "old", "c")
+        );
+        assert_eq!(last.verdict(), "Dismissed");
+        assert_eq!(super::latest_review_by(Vec::new(), "me"), None);
+        let only_pending: Vec<Vec<super::RawRestReview>> = serde_json::from_str(
+            r#"[[{"user": {"login": "me"}, "state": "PENDING", "body": ""}]]"#,
+        )
+        .expect("pages");
+        assert_eq!(super::latest_review_by(only_pending, "me"), None);
+    }
+
+    #[test]
+    fn changed_paths_read_nul_separated() {
+        let files = super::parse_name_list(b"a.rs\0dir/b c.rs\0\0");
+        assert_eq!(
+            files.into_iter().collect::<Vec<_>>(),
+            ["a.rs".to_string(), "dir/b c.rs".to_string()]
+        );
+        assert!(super::parse_name_list(b"").is_empty());
+    }
+
     #[test]
     fn fill_takes_one_commit_whole_and_names_several_by_branch() {
         let one = vec![("Fix the thing".to_string(), "Because.".to_string())];

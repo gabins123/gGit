@@ -117,8 +117,8 @@ fn number_keys_focus_panels_and_open_collapsed_ones(cx: &mut gpui::TestAppContex
         press(cx, key);
         assert_eq!(focused(cx, &view), Some(panel), "after {key}");
     }
-    // No diff is open, so there is nothing for 3 to focus.
-    press(cx, "3");
+    // 3 is Details as well: its number now that History and the diff share 2.
+    press(cx, "2 3");
     assert_eq!(focused(cx, &view), Some(Details));
 
     cx.update(|_window, app| view.update(app, |this, cx| this.set_sidebar_collapsed(true, cx)));
@@ -739,6 +739,125 @@ let x = 1;
     assert_eq!(focused(cx, &view), Some(Sidebar));
 }
 
+#[gpui::test]
+fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpui::TestAppContext) {
+    use crate::view::review::SinceReview;
+
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let file = |path: &str| crate::github::PullRequestFile {
+        path: path.into(),
+        additions: 1,
+        deletions: 0,
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_pull_requests_for_test(REPO, vec![], Some(7));
+            this.seed_pull_request_detail_for_test(
+                REPO,
+                crate::github::PullRequestDetail {
+                    number: 7,
+                    title: "Keyboard nav".into(),
+                    body: String::new(),
+                    url: String::new(),
+                    author: "someone".into(),
+                    head: "feat".into(),
+                    head_oid: "a".repeat(40),
+                    base: "main".into(),
+                    base_oid: "b".repeat(40),
+                    is_draft: false,
+                    is_cross_repository: false,
+                    state: "OPEN".into(),
+                    review: None,
+                    mergeable: None,
+                    additions: 3,
+                    deletions: 0,
+                    changed_files: 3,
+                    files: vec![file("a.rs"), file("b.rs"), file("c.rs")],
+                    checks: Default::default(),
+                    check_runs: vec![],
+                    conversation: vec![],
+                },
+                "c".repeat(40),
+            );
+        })
+    });
+    apply_state(cx, &view, pull_request_state());
+    let review = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app).active_review().map(|review| {
+                (
+                    review.file_ix,
+                    review.only_changed,
+                    review.draft.viewed.len(),
+                )
+            })
+        })
+    };
+    let seed = |cx: &mut gpui::VisualTestContext,
+                last: Option<crate::github::LastReview>,
+                since: Option<SinceReview>| {
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.seed_last_review_for_test(last, since, cx)
+            })
+        });
+    };
+
+    press(cx, "1 r");
+    assert_eq!(review(cx), Some((0, false, 0)));
+    // Never reviewed: nothing to narrow to.
+    seed(cx, None, None);
+    press(cx, "shift-l");
+    assert_eq!(review(cx), Some((0, false, 0)));
+
+    seed(
+        cx,
+        Some(crate::github::LastReview {
+            state: "CHANGES_REQUESTED".into(),
+            body: "Please split this.".into(),
+            submitted_at: "2026-01-01T00:00:00Z".into(),
+            commit_id: "d".repeat(40),
+        }),
+        Some(SinceReview::Changed(crate::github::ChangesSince {
+            files: ["b.rs".to_string(), "c.rs".to_string()].into(),
+            commits: 2,
+        })),
+    );
+    let line = cx.update(|_window, app| {
+        view.read(app)
+            .active_review()
+            .and_then(|review| review.last_review_line(std::time::SystemTime::now()))
+    });
+    assert!(
+        line.as_deref().is_some_and(
+            |line| line.starts_with("Your last review: Changes requested")
+                && line.ends_with("at ddddddd · 2 commits since · 2 files changed since")
+        ),
+        "{line:?}"
+    );
+    // On: a.rs didn't change, so the review moves to b.rs.
+    press(cx, "shift-l");
+    assert_eq!(review(cx), Some((1, true, 0)));
+    // The Sidebar's j/k and ]/[ walk only b.rs and c.rs.
+    press(cx, "1 j");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(2));
+    press(cx, "j");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(2));
+    press(cx, "[ [");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(1));
+    // Viewed, then on to the next unviewed file among them.
+    press(cx, "space");
+    assert_eq!(review(cx), Some((2, true, 1)));
+    // Off: every file again.
+    press(cx, "shift-l");
+    press(cx, "k k");
+    assert_eq!(review(cx), Some((0, false, 1)));
+
+    press(cx, "q");
+    assert_eq!(review(cx), None);
+}
+
 /// The open diff's file and lane, after syncing the store's latest snapshot.
 fn diff_file(
     cx: &mut gpui::VisualTestContext,
@@ -1022,4 +1141,118 @@ fn slash_filters_the_changes_list_fuzzily_and_by_file_type(cx: &mut gpui::TestAp
     assert_eq!(shown(cx), ["src/pane.rs", "src/panel.rs"]);
     press(cx, "escape");
     assert_eq!(shown(cx).len(), 3);
+}
+
+#[gpui::test]
+fn shift_j_and_k_select_a_range_of_changes_and_esc_drops_it(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    let file = |path: &str| gitcomet_core::domain::FileStatus {
+        path: path.into(),
+        kind: FileStatusKind::Modified,
+        conflict: None,
+    };
+    repo.worktree_status = Loadable::Ready(Arc::new(vec![
+        file("a.rs"),
+        file("b.rs"),
+        file("c.rs"),
+        file("d.rs"),
+    ]));
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_change_tracking_view(crate::view::ChangeTrackingView::Unified, cx)
+        })
+    });
+    draw_and_drain_test_window(cx);
+    let selection = |cx: &mut gpui::VisualTestContext| {
+        sync_store_snapshot(cx, &view);
+        cx.update(|_window, app| {
+            view.read(app)
+                .details_pane
+                .read(app)
+                .changes_selection(REPO)
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|(path, _)| path.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+        })
+    };
+
+    // One step at a time: each reads where the last one landed.
+    press(cx, "3 j");
+    wait_until(cx, "a.rs to open", |cx| {
+        diff_path(cx, &view).as_deref() == Some(Path::new("a.rs"))
+    });
+    press(cx, "j");
+    wait_until(cx, "b.rs to open", |cx| {
+        diff_path(cx, &view).as_deref() == Some(Path::new("b.rs"))
+    });
+    assert_eq!(selection(cx), None);
+    // Each Shift+J steps the open file on and widens the range behind it.
+    for (open, range) in [
+        ("c.rs", vec!["b.rs", "c.rs"]),
+        ("d.rs", vec!["b.rs", "c.rs", "d.rs"]),
+    ] {
+        press(cx, "shift-j");
+        wait_until(cx, "the range to grow", |cx| {
+            diff_path(cx, &view).as_deref() == Some(Path::new(open))
+        });
+        assert_eq!(
+            selection(cx),
+            Some(range.into_iter().map(String::from).collect())
+        );
+    }
+    // Back over the anchor: the range flips to the other side of it.
+    for (open, range) in [
+        ("c.rs", vec!["b.rs", "c.rs"]),
+        ("b.rs", vec![]),
+        ("a.rs", vec!["a.rs", "b.rs"]),
+    ] {
+        press(cx, "shift-k");
+        wait_until(cx, "the range to move", |cx| {
+            diff_path(cx, &view).as_deref() == Some(Path::new(open))
+        });
+        let expected = (!range.is_empty()).then(|| range.into_iter().map(String::from).collect());
+        assert_eq!(selection(cx), expected);
+    }
+    press(cx, "escape");
+    assert_eq!(selection(cx), None);
+    assert_eq!(focused(cx, &view), Some(Details));
+
+    // A plain step drops the range too.
+    press(cx, "shift-j");
+    wait_until(cx, "a range again", |cx| selection(cx).is_some());
+    press(cx, "j");
+    wait_until(cx, "the range to go", |cx| selection(cx).is_none());
+}
+
+#[gpui::test]
+fn two_is_the_middle_and_esc_leaves_a_commit_for_your_changes(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    // `2` is History while no diff is open; with one open, it's the diff.
+    press(cx, "2");
+    assert_eq!(focused(cx, &view), Some(History));
+    press(cx, "3 j");
+    wait_until(cx, "a file to open", |cx| diff_path(cx, &view).is_some());
+    press(cx, "2");
+    assert_eq!(focused(cx, &view), Some(Diff));
+    press(cx, "escape");
+    wait_until(cx, "the diff to close", |cx| diff_path(cx, &view).is_none());
+
+    // A commit selected in History fills Details; esc hands it back to your
+    // changes.
+    press(cx, "2 j");
+    wait_until(cx, "a commit to be selected", |cx| {
+        selected_commit(cx, &view).is_some()
+    });
+    press(cx, "escape");
+    wait_until(cx, "the commit to be dropped", |cx| {
+        selected_commit(cx, &view).is_none()
+    });
+    assert_eq!(focused(cx, &view), Some(History));
 }

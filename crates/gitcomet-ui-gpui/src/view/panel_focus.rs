@@ -24,11 +24,15 @@ pub(super) enum FocusPanel {
 impl FocusPanel {
     const ORDER: [Self; 4] = [Self::Sidebar, Self::History, Self::Diff, Self::Details];
 
+    /// `2` names the middle area; which of History and the diff that is
+    /// depends on what's open, so the caller settles it.
     fn from_digit_key(key: &str) -> Option<Self> {
         match key {
             "1" => Some(Self::Sidebar),
             "2" => Some(Self::History),
-            "3" => Some(Self::Diff),
+            "3" => Some(Self::Details),
+            // Details' number before the middle area became one: old habits
+            // still land.
             "4" => Some(Self::Details),
             _ => None,
         }
@@ -121,6 +125,7 @@ impl FocusPanel {
                 ("g", "Reset to it (mixed; soft or hard in the menu)"),
                 ("T", "Tag it"),
                 ("m", "The commit's menu"),
+                ("esc", "Back to your changes in Details"),
             ],
             Self::Diff => &[
                 ("j / k", "Next / previous change"),
@@ -137,6 +142,7 @@ impl FocusPanel {
                 ("a", "Stage everything, or unstage it all"),
                 ("d", "Discard the open file's changes"),
                 ("m", "The open file's menu"),
+                ("esc", "From a commit's files back to your changes"),
             ],
         }
     }
@@ -144,7 +150,7 @@ impl FocusPanel {
 
 /// Status bar hints shown after the focused panel's own.
 pub(super) const PANEL_STATUS_HINTS: &[(&str, &str)] = &[
-    ("1-4", "panels"),
+    ("1-3", "panels"),
     ("p/P", "pull/push"),
     ("i", "codex"),
     ("?", "keys"),
@@ -153,8 +159,8 @@ pub(super) const PANEL_STATUS_HINTS: &[(&str, &str)] = &[
 /// Keys that work the same in every panel, as the `?` list shows them.
 const PANEL_KEYS_HELP: &[(&str, &str)] = &[
     (
-        "1 2 3 4",
-        "Sidebar, History, Diff, Details; opens a collapsed one",
+        "1 2 3",
+        "Sidebar; the middle (History, or the diff when one is open); Details. Opens a collapsed one",
     ),
     ("h / l", "Previous / next panel"),
     ("c", "Write the commit message"),
@@ -442,6 +448,7 @@ impl GitCometView {
                 FocusPanel::Sidebar => &[
                     ("j/k", "file"),
                     ("space", "viewed"),
+                    ("L", "changed since"),
                     ("enter", "diff"),
                     ("S", "submit"),
                     ("q", "leave"),
@@ -456,6 +463,7 @@ impl GitCometView {
                     ("}/{", "change"),
                     ("]/[", "file"),
                     ("space", "viewed"),
+                    ("L", "changed since"),
                     ("S", "submit"),
                 ],
                 FocusPanel::Details => &[
@@ -499,10 +507,10 @@ impl GitCometView {
                 FocusPanel::Details => {
                     return &[
                         ("j/k", "file"),
+                        ("J/K", "select"),
                         ("space", "stage"),
                         ("a", "all"),
                         ("/", "filter"),
-                        ("F", "kind"),
                     ];
                 }
                 FocusPanel::Diff => {
@@ -525,6 +533,7 @@ impl GitCometView {
                 FocusPanel::Sidebar => &[
                     ("j / k", "Next / previous file"),
                     ("space", "Mark viewed, then the next unviewed file"),
+                    ("L", "Only files changed since your last review / all"),
                     ("enter", "Go to the diff"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
@@ -542,6 +551,7 @@ impl GitCometView {
                     ("} / {", "Next / previous change"),
                     ("] / [", "Next / previous file"),
                     ("space", "Mark viewed, then the next unviewed file"),
+                    ("L", "Only files changed since your last review / all"),
                     ("esc", "Drop the selection"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
@@ -551,6 +561,7 @@ impl GitCometView {
                     ("enter", "Go to its line"),
                     ("e", "Edit it"),
                     ("d d", "Delete it"),
+                    ("L", "Only files changed since your last review / all"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
                 ],
@@ -595,18 +606,25 @@ impl GitCometView {
                     return &[
                         ("j / k", "Next / previous file, opening its diff"),
                         ("enter", "Go to the file's diff"),
-                        ("space", "Stage / unstage the open file; it keeps its place"),
+                        (
+                            "J / K",
+                            "Select a range of files from the open one; shift-click too",
+                        ),
+                        (
+                            "space",
+                            "Stage / unstage the open file, or the selected range; they keep their place",
+                        ),
                         ("a", "Stage what the list shows, or unstage it all"),
                         ("shift+space", "Stage / unstage the open file's folder"),
                         (
                             "/",
                             "Filter by path, fuzzy; .rs keeps a file type. Enter keeps it",
                         ),
-                        ("esc", "Clear the / filter"),
+                        ("esc", "Drop the selection, then the / filter"),
                         ("F", "Show all, unstaged, staged or untracked"),
                         ("`", "Tree or flat list"),
                         ("o", "Sort the list"),
-                        ("d", "Discard the open file's changes"),
+                        ("d", "Discard the open file's changes, or the selection's"),
                         ("m", "The open file's menu"),
                     ];
                 }
@@ -624,6 +642,34 @@ impl GitCometView {
             }
         }
         panel.help()
+    }
+
+    /// With a range selected in the Changes list, hands its files with
+    /// worktree changes to the discard dialog, which reads them from the
+    /// status selection. `false` without a range.
+    fn discard_changes_selection(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(selection) = self.details_pane.read(cx).changes_selection(repo_id) else {
+            return false;
+        };
+        let paths: Vec<std::path::PathBuf> = selection
+            .into_iter()
+            .filter(|(_, lanes)| lanes.unstaged.is_some() && !lanes.conflicted())
+            .map(|(path, _)| path)
+            .collect();
+        if paths.is_empty() {
+            return false;
+        }
+        self.details_pane.update(cx, |pane, _| {
+            pane.status_multi_selection.insert(
+                repo_id,
+                StatusMultiSelection {
+                    explicit_section: Some(StatusSection::CombinedUnstaged),
+                    unstaged: paths,
+                    ..Default::default()
+                },
+            );
+        });
+        true
     }
 
     /// Details shows the one Changes list rather than sections, a pull
@@ -1015,6 +1061,18 @@ impl GitCometView {
                 self.details_pane
                     .update(cx, |pane, cx| pane.open_changes_query(cx));
             }
+            // Esc peels one layer: the range selection, then the filter.
+            (Some(FocusPanel::Details), "escape")
+                if self.changes_list_shown()
+                    && self
+                        .details_pane
+                        .read(cx)
+                        .changes_selection(repo_id)
+                        .is_some() =>
+            {
+                self.details_pane
+                    .update(cx, |pane, cx| pane.clear_changes_range(cx));
+            }
             (Some(FocusPanel::Details), "escape")
                 if worktree_shown
                     && self.change_tracking_view == ChangeTrackingView::Unified
@@ -1022,6 +1080,34 @@ impl GitCometView {
             {
                 self.details_pane
                     .update(cx, |pane, cx| pane.clear_changes_query(window, cx));
+            }
+            // Out of a commit's details and back to your changes.
+            (Some(FocusPanel::History | FocusPanel::Details), "escape")
+                if status_shown
+                    && self
+                        .active_repo()
+                        .is_some_and(|repo| repo.history_state.selected_commit.is_some()) =>
+            {
+                // A file of the commit may be open in the diff: it goes too,
+                // or it would stay up with nothing listing it.
+                if matches!(
+                    self.active_repo()
+                        .and_then(|repo| repo.diff_state.diff_target.as_ref()),
+                    Some(DiffTarget::Commit { .. })
+                ) {
+                    self.store.dispatch(Msg::ClearDiffSelection { repo_id });
+                }
+                self.store.dispatch(Msg::ClearCommitSelection { repo_id });
+            }
+            (Some(FocusPanel::Details), "J" | "K" | "DOWN" | "UP") if self.changes_list_shown() => {
+                let direction = if matches!(key.as_str(), "J" | "DOWN") {
+                    1
+                } else {
+                    -1
+                };
+                self.defer_pane_action(self.main_pane.clone(), cx, move |pane, window, cx| {
+                    pane.extend_changes_selection(repo_id, direction, window, cx)
+                });
             }
             (Some(FocusPanel::Details), "SPACE")
                 if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>
@@ -1048,6 +1134,34 @@ impl GitCometView {
                         window,
                         cx,
                     ),
+                }
+            }
+            // With a range selected, `d` is about the range, never quietly
+            // about just the open file.
+            (Some(FocusPanel::Details | FocusPanel::Diff), "d")
+                if self.changes_list_shown()
+                    && self
+                        .details_pane
+                        .read(cx)
+                        .changes_selection(repo_id)
+                        .is_some() =>
+            {
+                if self.discard_changes_selection(repo_id, cx) {
+                    self.open_popover_from_key(
+                        PopoverKind::DiscardChangesConfirm {
+                            repo_id,
+                            area: DiffArea::Unstaged,
+                            path: None,
+                        },
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.push_toast(
+                        components::ToastKind::Warning,
+                        "Nothing selected has working-tree changes to discard.".to_string(),
+                        cx,
+                    );
                 }
             }
             (Some(FocusPanel::Details | FocusPanel::Diff), "d") if worktree_shown => {
@@ -1284,6 +1398,12 @@ impl GitCometView {
             _ => {}
         }
         if let Some(panel) = FocusPanel::from_digit_key(key) {
+            // The middle area shows History or the diff, one at a time.
+            let panel = if panel == FocusPanel::History && self.diff_is_open() {
+                FocusPanel::Diff
+            } else {
+                panel
+            };
             // `3` without a diff has nothing to focus; still consumed so the
             // digit never leaks into anything behind the panels.
             self.focus_panel(panel, window, cx);
@@ -1462,12 +1582,14 @@ mod tests {
             .into_iter()
             .map(FocusPanel::from_digit_key)
             .collect();
+        // `2` is the middle area; the key handler turns it into the diff
+        // while one is open. `4` is Details' old number.
         assert_eq!(
             panels,
             [
                 Some(Sidebar),
                 Some(History),
-                Some(Diff),
+                Some(Details),
                 Some(Details),
                 None,
                 None,

@@ -223,7 +223,7 @@ impl PullRequestsState {
 pub(super) struct GitHubTarget {
     pub(super) repo_id: RepoId,
     pub(super) workdir: std::path::PathBuf,
-    remote: String,
+    pub(super) remote: String,
     pub(super) slug: String,
 }
 

@@ -1341,6 +1341,20 @@ impl PopoverHost {
     }
 
     pub(in crate::view) fn close_popover(&mut self, cx: &mut gpui::Context<Self>) {
+        // The one list's range was copied into the status selection just for
+        // the discard dialog; confirmed or not, it must not outlive it.
+        if self.change_tracking_view == ChangeTrackingView::Unified
+            && let Some(PopoverKind::DiscardChangesConfirm { repo_id, .. }) = &self.popover
+        {
+            let (pane, repo_id) = (self.details_pane.clone(), *repo_id);
+            cx.defer(move |cx| {
+                pane.update(cx, |pane, cx| {
+                    if pane.status_multi_selection.remove(&repo_id).is_some() {
+                        cx.notify();
+                    }
+                });
+            });
+        }
         let dismissing_unsaved_prompt = self.showing_unsaved_file_edits_prompt();
         let dismissing_hook_activity = self.is_hook_activity_workflow_open();
         if dismissing_hook_activity {

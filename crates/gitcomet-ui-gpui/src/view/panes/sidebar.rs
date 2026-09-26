@@ -3150,35 +3150,59 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (number, title, current, rows) = {
+        let (number, title, current, rows, since) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
             };
-            let rows: Vec<(String, bool, usize, usize)> = review
+            let rows: Vec<(usize, String, bool, usize, usize, bool)> = review
                 .files
                 .iter()
-                .map(|path| {
+                .enumerate()
+                .filter(|(ix, _)| review.file_listed(*ix))
+                .map(|(ix, path)| {
                     (
+                        ix,
                         path.clone(),
                         review.draft.viewed.contains(path),
                         review.comments_on(path),
                         review.threads_on(path),
+                        review.changed_since_review(path),
                     )
                 })
                 .collect();
-            (review.number, review.title.clone(), review.file_ix, rows)
+            let changed = review.files_changed_since_review();
+            let since = if review.only_changed {
+                Some(format!(
+                    "Only the {changed} changed since your review · L shows all"
+                ))
+            } else if changed > 0 {
+                Some(format!(
+                    "{changed} changed since your review · L shows only those"
+                ))
+            } else if review.since_review == Some(super::super::review::SinceReview::Gone) {
+                Some("Your last review's commit is gone; showing everything.".to_string())
+            } else {
+                None
+            };
+            (
+                review.number,
+                review.title.clone(),
+                review.file_ix,
+                rows,
+                since,
+            )
         };
-        let viewed = rows.iter().filter(|(_, viewed, ..)| *viewed).count();
+        let viewed = rows.iter().filter(|(_, _, viewed, ..)| *viewed).count();
         let total = rows.len();
         let secondary = theme.colors.foreground.secondary;
         let success = theme.colors.status.success.foreground;
         let warning = theme.colors.status.warning.foreground;
+        let accent = theme.colors.status.info.foreground;
 
         let file_rows =
             rows.into_iter()
-                .enumerate()
-                .map(|(ix, (path, is_viewed, comments, threads))| {
+                .map(|(ix, path, is_viewed, comments, threads, updated)| {
                     let name = path
                         .rsplit_once('/')
                         .map_or(path.as_str(), |(_, name)| name);
@@ -3253,6 +3277,15 @@ impl SidebarPaneView {
                                     )
                                 }),
                         )
+                        .when(updated, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(accent)
+                                    .child("updated since your review"),
+                            )
+                        })
                         .when(threads > 0, |row| {
                             row.child(
                                 div()
@@ -3304,6 +3337,14 @@ impl SidebarPaneView {
                             .text_color(secondary)
                             .child(format!("Reviewing #{number} · {viewed} of {total} viewed")),
                     )
+                    .when_some(since, |header, since| {
+                        header.child(
+                            div()
+                                .text_size(theme.ui_text(11.5))
+                                .text_color(accent)
+                                .child(since),
+                        )
+                    })
                     .child(
                         div()
                             .truncate()
@@ -3327,7 +3368,7 @@ impl SidebarPaneView {
                     .py_2()
                     .text_size(theme.ui_text(11.5))
                     .text_color(secondary)
-                    .child("space viewed · ]/[ file · S submit · q leave"),
+                    .child("space viewed · ]/[ file · L changed since · S submit · q leave"),
             )
             .into_any_element()
     }

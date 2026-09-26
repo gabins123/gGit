@@ -21,6 +21,10 @@ pub(super) struct ReviewDraft {
     /// Paths of the files marked viewed.
     #[serde(default)]
     pub(super) viewed: std::collections::BTreeSet<String>,
+    /// The head the viewed marks were last checked against. When the pull
+    /// request moves on, the files changed since lose their mark, as on GitHub.
+    #[serde(default)]
+    pub(super) viewed_head: Option<String>,
 }
 
 impl ReviewDraft {
@@ -70,6 +74,16 @@ impl ReviewDraft {
         }
     }
 
+    /// The head moved from `viewed_head` to `head`: files in `changed` are no
+    /// longer viewed. `None` (the old head can't be had) un-views them all.
+    fn viewed_moved(&mut self, head: &str, changed: Option<&std::collections::BTreeSet<String>>) {
+        match changed {
+            Some(changed) => self.viewed.retain(|path| !changed.contains(path)),
+            None => self.viewed.clear(),
+        }
+        self.viewed_head = Some(head.to_string());
+    }
+
     /// The file's next contents: `None` when there's nothing left to keep.
     fn contents(&self) -> Result<Option<Vec<u8>>, String> {
         if self.comments.is_empty() && self.viewed.is_empty() {
@@ -90,6 +104,16 @@ fn write_draft(file: &std::path::Path, contents: Option<&[u8]>) -> std::io::Resu
             _ => Ok(()),
         },
     }
+}
+
+/// What changed from your last review's commit to the reviewed head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SinceReview {
+    Changed(crate::github::ChangesSince),
+    /// The last review's commit can't be had (a force push dropped it).
+    Gone,
+    /// Working it out failed for another reason; the next open retries.
+    Failed(String),
 }
 
 /// The pull request being reviewed and where the review is.
@@ -125,6 +149,20 @@ pub(super) struct ReviewMode {
     /// then answers about other lines, and its answer is dropped.
     pub(super) suggestion_generation: u64,
     written_seq: std::sync::Arc<std::sync::Mutex<u64>>,
+    /// Your latest submitted review of the pull request, loaded when review
+    /// mode opens. Ready(None) when you never reviewed it.
+    pub(super) last_review: super::pull_requests::PrLoad<Option<crate::github::LastReview>>,
+    /// What changed since that review; `None` until known.
+    pub(super) since_review: Option<SinceReview>,
+    /// `L`: the file list, and the keys walking it, keep to the files changed
+    /// since your last review.
+    pub(super) only_changed: bool,
+    /// The head a viewed-marks check is running for.
+    viewed_syncing_to: Option<String>,
+    /// Bumped per load of the last review and of what changed since it: an
+    /// answer that isn't the newest is dropped.
+    last_review_seq: u64,
+    since_seq: u64,
 }
 
 impl ReviewMode {
@@ -146,6 +184,54 @@ impl ReviewMode {
             .iter()
             .filter(|thread| thread.path == path && thread.line.is_some())
             .count()
+    }
+
+    /// Whether `path` changed since your last review.
+    pub(super) fn changed_since_review(&self, path: &str) -> bool {
+        matches!(&self.since_review, Some(SinceReview::Changed(changes)) if changes.files.contains(path))
+    }
+
+    /// The pull request's files that changed since your last review.
+    pub(super) fn files_changed_since_review(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|path| self.changed_since_review(path))
+            .count()
+    }
+
+    /// Whether file `ix` is in the list: every file, or with `L` on only the
+    /// ones changed since your last review.
+    pub(super) fn file_listed(&self, ix: usize) -> bool {
+        // While what changed is being worked out, nothing is hidden.
+        let known = matches!(self.since_review, Some(SinceReview::Changed(_)));
+        self.files
+            .get(ix)
+            .is_some_and(|path| !self.only_changed || !known || self.changed_since_review(path))
+    }
+
+    /// "Your last review: Approved · 2 days ago · at abc1234 · 3 commits since
+    /// · 4 files changed since", once the review is known.
+    pub(super) fn last_review_line(&self, now: std::time::SystemTime) -> Option<String> {
+        let last = self.last_review.ready()?.as_ref()?;
+        let mut parts = vec![last.verdict().to_string()];
+        if let Ok(at) = last.submitted_at.parse::<jiff::Timestamp>() {
+            parts.push(super::date_time::format_relative_time(at.as_second(), now));
+        }
+        if !last.commit_id.is_empty() {
+            let short: String = last.commit_id.chars().take(7).collect();
+            parts.push(format!("at {short}"));
+        }
+        if let Some(SinceReview::Changed(changes)) = &self.since_review {
+            let plural = |n: usize| if n == 1 { "" } else { "s" };
+            let files = self.files_changed_since_review();
+            parts.push(format!(
+                "{} commit{} since",
+                changes.commits,
+                plural(changes.commits)
+            ));
+            parts.push(format!("{files} file{} changed since", plural(files)));
+        }
+        Some(format!("Your last review: {}", parts.join(" · ")))
     }
 
     pub(super) fn files_commented(&self) -> usize {
@@ -239,12 +325,17 @@ impl GitCometView {
                 None
             }
         };
-        let draft = draft.unwrap_or_else(|| ReviewDraft {
+        let mut draft = draft.unwrap_or_else(|| ReviewDraft {
             repo: target.slug.clone(),
             number,
             head_oid: detail.head_oid.clone(),
             ..ReviewDraft::default()
         });
+        // A draft from before viewed marks tracked a head: they were made on
+        // the head its comments are pinned to.
+        if draft.viewed_head.is_none() {
+            draft.viewed_head = Some(draft.head_oid.clone());
+        }
         let files: Vec<String> = detail.files.iter().map(|file| file.path.clone()).collect();
         let file_ix = files
             .iter()
@@ -268,13 +359,21 @@ impl GitCometView {
             threads_loading: !cfg!(test),
             suggestions: Vec::new(),
             suggestion_generation: 0,
+            last_review: Default::default(),
+            since_review: None,
+            only_changed: false,
+            viewed_syncing_to: None,
+            last_review_seq: 0,
+            since_seq: 0,
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
             cx.notify();
         });
         self.review_open_file(file_ix, cx);
+        self.review_sync_viewed(cx);
         self.load_review_threads(cx);
+        self.load_last_review(cx);
         self.diff_return_panel = FocusPanel::Sidebar;
         self.focus_diff_when_open = true;
     }
@@ -305,6 +404,8 @@ impl GitCometView {
             review.suggestion_generation += 1;
         }
         self.save_review(cx);
+        self.review_sync_viewed(cx);
+        self.review_load_changes_since(cx);
         if had_comments {
             self.push_toast(
                 components::ToastKind::Warning,
@@ -337,9 +438,9 @@ impl GitCometView {
 
     /// After a submit: exactly the comments and replies that reached GitHub
     /// leave the draft. When the review itself went up and nothing is left,
-    /// the draft goes and review mode closes; replies posted on their own
-    /// leave the review, and its viewed files, as they were. Returns how many
-    /// pending comments remain.
+    /// review mode closes; replies posted on their own leave the review as it
+    /// was. Viewed marks belong to the pull request, not to one review, so
+    /// they stay either way. Returns how many pending comments remain.
     pub(super) fn finish_review(
         &mut self,
         repo_id: RepoId,
@@ -360,9 +461,6 @@ impl GitCometView {
                 && let Ok(Some(mut draft)) = ReviewDraft::load(&repo, number)
             {
                 draft.comments.retain(|comment| !is_submitted(comment));
-                if review_posted && draft.comments.is_empty() {
-                    draft.viewed.clear();
-                }
                 if let (Some(file), Ok(contents)) =
                     (ReviewDraft::file(&repo, number), draft.contents())
                 {
@@ -381,10 +479,13 @@ impl GitCometView {
         if remaining > 0 || !review_posted {
             self.save_review(cx);
             self.sync_review_marks(cx);
+            if review_posted {
+                // The one just posted is now your last review.
+                self.load_last_review(cx);
+            }
             self.notify_pull_request_panes(cx);
             return remaining;
         }
-        review.draft.viewed.clear();
         self.save_review(cx);
         self.review = None;
         self.main_pane.update(cx, |pane, cx| {
@@ -434,12 +535,55 @@ impl GitCometView {
             return;
         };
         let next = if direction < 0 {
-            review.file_ix.checked_sub(1)
+            (0..review.file_ix).rev().find(|ix| review.file_listed(*ix))
         } else {
-            Some(review.file_ix + 1).filter(|ix| *ix < review.files.len())
+            (review.file_ix + 1..review.files.len()).find(|ix| review.file_listed(*ix))
         };
         if let Some(next) = next {
             self.review_open_file(next, cx);
+        }
+    }
+
+    /// `L`: the file list keeps to the files changed since your last review,
+    /// or shows them all again. The diff stays the whole pull request's.
+    fn review_toggle_only_changed(&mut self, cx: &mut gpui::Context<Self>) {
+        use super::pull_requests::PrLoad;
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        if review.only_changed {
+            review.only_changed = false;
+            self.notify_pull_request_panes(cx);
+            return;
+        }
+        let refusal = match (&review.last_review, &review.since_review) {
+            (PrLoad::Ready(None), _) => {
+                Some("You haven't reviewed this pull request before; every file is new to you.")
+            }
+            (_, Some(SinceReview::Gone)) => {
+                Some("Your last review's commit is gone; showing everything.")
+            }
+            (_, Some(SinceReview::Failed(_))) => {
+                Some("Couldn't work out what changed since your last review.")
+            }
+            (_, Some(SinceReview::Changed(_))) if review.files_changed_since_review() == 0 => {
+                Some("None of this pull request's files changed since your last review.")
+            }
+            (_, Some(SinceReview::Changed(_))) => None,
+            (PrLoad::Failed(_), None) => Some("Couldn't load your last review."),
+            _ => Some("Still working out what changed since your last review."),
+        };
+        if let Some(message) = refusal {
+            self.push_toast(components::ToastKind::Warning, message.to_string(), cx);
+            return;
+        }
+        review.only_changed = true;
+        let first = (!review.file_listed(review.file_ix))
+            .then(|| (0..review.files.len()).find(|ix| review.file_listed(*ix)))
+            .flatten();
+        match first {
+            Some(ix) => self.review_open_file(ix, cx),
+            None => self.notify_pull_request_panes(cx),
         }
     }
 
@@ -461,7 +605,9 @@ impl GitCometView {
                 let from = review.file_ix;
                 (1..review.files.len())
                     .map(|step| (from + step) % review.files.len())
-                    .find(|ix| !review.draft.viewed.contains(&review.files[*ix]))
+                    .find(|ix| {
+                        review.file_listed(*ix) && !review.draft.viewed.contains(&review.files[*ix])
+                    })
             })
             .flatten();
         self.save_review(cx);
@@ -579,6 +725,223 @@ impl GitCometView {
             });
         })
         .detach();
+    }
+
+    /// Loads your latest submitted review of the pull request, then what
+    /// changed since it. Tests never run gh; they seed it.
+    fn load_last_review(&mut self, cx: &mut gpui::Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let Some((repo_id, number)) = self
+            .review
+            .as_ref()
+            .map(|review| (review.repo_id, review.number))
+        else {
+            return;
+        };
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let Some(seq) = self.review.as_mut().map(|review| {
+            review.last_review = super::pull_requests::PrLoad::Loading;
+            review.last_review_seq += 1;
+            review.last_review_seq
+        }) else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            crate::github::last_review(&target.workdir, &target.slug, number)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let Some(review) = this.review.as_mut().filter(|review| {
+                    review.repo_id == repo_id
+                        && review.number == number
+                        && review.last_review_seq == seq
+                }) else {
+                    return;
+                };
+                review.last_review = match result {
+                    Ok(last) => super::pull_requests::PrLoad::Ready(last),
+                    Err(err) => super::pull_requests::PrLoad::Failed(err),
+                };
+                this.review_load_changes_since(cx);
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Works out the files changed from your last review's commit to the
+    /// reviewed head, fetching the old commit by id if it isn't local. The
+    /// diff shown stays the whole pull request's, so line comments hold.
+    fn review_load_changes_since(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let old = review
+            .last_review
+            .ready()
+            .and_then(Option::as_ref)
+            .map(|last| last.commit_id.clone())
+            .filter(|old| !old.is_empty());
+        review.since_review = None;
+        review.since_seq += 1;
+        let seq = review.since_seq;
+        let Some(old) = old else {
+            review.only_changed = false;
+            return;
+        };
+        let head = review.draft.head_oid.clone();
+        if old == head {
+            review.since_review = Some(SinceReview::Changed(Default::default()));
+            review.only_changed = false;
+            return;
+        }
+        if cfg!(test) {
+            return;
+        }
+        let (repo_id, number) = (review.repo_id, review.number);
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let task = {
+            let head = head.clone();
+            cx.background_spawn(async move {
+                crate::github::changes_since(&target.workdir, &target.remote, &old, &head)
+            })
+        };
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let Some(review) = this.review.as_mut().filter(|review| {
+                    review.repo_id == repo_id
+                        && review.number == number
+                        && review.draft.head_oid == head
+                        && review.since_seq == seq
+                }) else {
+                    return;
+                };
+                let since = match result {
+                    Ok(changes) => SinceReview::Changed(changes),
+                    Err(crate::github::SinceFailure::Gone) => SinceReview::Gone,
+                    Err(crate::github::SinceFailure::Failed(why)) => SinceReview::Failed(why),
+                };
+                review.since_review = Some(since);
+                // `L` with nothing left to show would be an empty list.
+                review.only_changed &= review.files_changed_since_review() > 0;
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Viewed marks made on an older head: the files changed since lose
+    /// theirs, worked out off the UI thread.
+    fn review_sync_viewed(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let head = review.draft.head_oid.clone();
+        let Some(from) = review
+            .draft
+            .viewed_head
+            .clone()
+            .filter(|from| *from != head)
+        else {
+            return;
+        };
+        if review.draft.viewed.is_empty() {
+            // Nothing to un-view; the next save writes it.
+            review.draft.viewed_head = Some(head);
+            return;
+        }
+        if cfg!(test) || review.viewed_syncing_to.as_deref() == Some(head.as_str()) {
+            return;
+        }
+        review.viewed_syncing_to = Some(head.clone());
+        let (repo_id, number) = (review.repo_id, review.number);
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let task = {
+            let (from, head) = (from.clone(), head.clone());
+            cx.background_spawn(async move {
+                crate::github::changes_since(&target.workdir, &target.remote, &from, &head)
+            })
+        };
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| match result {
+                Ok(changes) => {
+                    this.review_viewed_moved(repo_id, number, &from, &head, Some(changes.files), cx)
+                }
+                // The old head is gone: nothing can say which marks still
+                // hold, so they all go.
+                Err(crate::github::SinceFailure::Gone) => {
+                    this.review_viewed_moved(repo_id, number, &from, &head, None, cx)
+                }
+                // A passing failure leaves every mark as it was; the next
+                // open tries again.
+                Err(crate::github::SinceFailure::Failed(_)) => {
+                    if let Some(review) = this.review.as_mut()
+                        && review.viewed_syncing_to.as_deref() == Some(head.as_str())
+                    {
+                        review.viewed_syncing_to = None;
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The viewed marks' head moved from `from` to `head`, changing `changed`
+    /// (`None`: the old head is gone, so every mark goes).
+    fn review_viewed_moved(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        from: &str,
+        head: &str,
+        changed: Option<std::collections::BTreeSet<String>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self
+            .review
+            .as_mut()
+            .filter(|review| review.repo_id == repo_id && review.number == number)
+        else {
+            return;
+        };
+        if review.viewed_syncing_to.as_deref() == Some(head) {
+            review.viewed_syncing_to = None;
+        }
+        if review.draft.viewed_head.as_deref() != Some(from) || review.draft.head_oid != head {
+            return;
+        }
+        // ponytail: a file marked while this ran and changed by the move
+        // loses the fresh mark too; track marks per head if that ever bites.
+        review.draft.viewed_moved(head, changed.as_ref());
+        self.save_review(cx);
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// Your last review and what changed since it, as gh and git would load
+    /// them, so tests run neither.
+    #[cfg(test)]
+    pub(super) fn seed_last_review_for_test(
+        &mut self,
+        last: Option<crate::github::LastReview>,
+        since: Option<SinceReview>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(review) = self.review.as_mut() {
+            review.last_review = super::pull_requests::PrLoad::Ready(last);
+            review.since_review = since;
+        }
+        self.notify_pull_request_panes(cx);
     }
 
     /// The threads already on GitHub on the line under the cursor, oldest
@@ -1139,13 +1502,14 @@ impl GitCometView {
             (_, "q", false) => self.leave_review(window, cx),
             (_, "s", true) => self.open_review_submit(window, cx),
             // History is hidden while reviewing; the diff stays.
-            (_, "2", false) => {}
+            (_, "2", false) if !self.diff_is_open() => {}
             (Some(FocusPanel::Diff), "r", false) => self.review_reply_at_cursor(window, cx),
             // Elsewhere `r` does nothing rather than start another review.
             (_, "r", false) => {}
             (Some(FocusPanel::Diff), "t", _) => {
                 self.review_step_thread(if shift { -1 } else { 1 }, cx)
             }
+            (_, "l", true) => self.review_toggle_only_changed(cx),
             (_, "]", false) => self.review_step_file(1, cx),
             (_, "[", false) => self.review_step_file(-1, cx),
             // After the jump the range is gone; collapsing it back onto the
@@ -1510,7 +1874,7 @@ mod tests {
                         reply_to: None,
                     })
                     .collect(),
-                viewed: Default::default(),
+                ..Default::default()
             };
             std::fs::write(dir.path().join(name), serde_json::to_vec(&draft).unwrap()).unwrap();
         };
@@ -1525,6 +1889,113 @@ mod tests {
         assert_eq!(counts.get(&7), Some(&2));
         // Counting never moves an unreadable file aside.
         assert!(dir.path().join("o~r~11.json").exists());
+    }
+
+    #[test]
+    fn viewed_marks_drop_on_files_changed_since_and_old_drafts_still_load() {
+        // A draft written before viewed marks tracked a head.
+        let old: ReviewDraft = serde_json::from_str(
+            r#"{"repo": "o/r", "number": 7, "head_oid": "a", "comments": [], "viewed": ["a.rs", "b.rs", "c.rs"]}"#,
+        )
+        .expect("an old draft loads");
+        assert_eq!(old.viewed_head, None);
+        let mut draft = old.clone();
+        let changed: std::collections::BTreeSet<String> =
+            ["b.rs".to_string(), "elsewhere.rs".to_string()].into();
+        draft.viewed_moved("b", Some(&changed));
+        assert_eq!(
+            draft.viewed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["a.rs", "c.rs"]
+        );
+        assert_eq!(draft.viewed_head.as_deref(), Some("b"));
+        // The old head is gone: nothing can be trusted as viewed.
+        let mut gone = old;
+        gone.viewed_moved("b", None);
+        assert!(gone.viewed.is_empty());
+        // Viewed marks alone keep the draft file.
+        let marks_only = ReviewDraft {
+            viewed: ["a.rs".to_string()].into(),
+            ..Default::default()
+        };
+        assert!(marks_only.contents().expect("serializes").is_some());
+    }
+
+    #[test]
+    fn saved_viewed_marks_alone_are_not_a_pending_review() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let draft = ReviewDraft {
+            repo: "o/r".into(),
+            number: 3,
+            head_oid: "a".repeat(40),
+            viewed: ["a.rs".to_string()].into(),
+            viewed_head: Some("a".repeat(40)),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("o~r~3.json"),
+            serde_json::to_vec(&draft).unwrap(),
+        )
+        .unwrap();
+        assert!(pending_review_counts_in(dir.path(), "o/r").is_empty());
+    }
+
+    #[test]
+    fn the_last_review_line_says_what_changed_since() {
+        let mut review = ReviewMode {
+            repo_id: RepoId(1),
+            number: 7,
+            title: String::new(),
+            files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+            file_ix: 0,
+            draft: ReviewDraft::default(),
+            selected_comment: None,
+            head_moved: false,
+            pending_jump: None,
+            needs_cursor: false,
+            armed_delete: None,
+            write_seq: 0,
+            threads: Vec::new(),
+            threads_loading: false,
+            suggestions: Vec::new(),
+            suggestion_generation: 0,
+            written_seq: Default::default(),
+            last_review: Default::default(),
+            since_review: None,
+            only_changed: false,
+            viewed_syncing_to: None,
+            last_review_seq: 0,
+            since_seq: 0,
+        };
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        assert_eq!(review.last_review_line(now), None);
+        review.last_review =
+            super::super::pull_requests::PrLoad::Ready(Some(crate::github::LastReview {
+                state: "APPROVED".into(),
+                body: String::new(),
+                // Two days before `now`.
+                submitted_at: "2001-09-07T01:46:40Z".into(),
+                commit_id: "abc1234def".into(),
+            }));
+        assert_eq!(
+            review.last_review_line(now).as_deref(),
+            Some("Your last review: Approved · 2 days ago · at abc1234")
+        );
+        review.since_review = Some(SinceReview::Changed(crate::github::ChangesSince {
+            files: ["b.rs".to_string(), "not-in-pr.rs".to_string()].into(),
+            commits: 3,
+        }));
+        assert_eq!(
+            review.last_review_line(now).as_deref(),
+            Some(
+                "Your last review: Approved · 2 days ago · at abc1234 · 3 commits since · 1 file changed since"
+            )
+        );
+        // `L` keeps the walk to b.rs.
+        review.only_changed = true;
+        assert_eq!(
+            (0..3).map(|ix| review.file_listed(ix)).collect::<Vec<_>>(),
+            [false, true, false]
+        );
     }
 
     #[test]

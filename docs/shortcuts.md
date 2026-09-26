@@ -43,17 +43,18 @@ macOS-only window-management shortcuts:
 
 ## Panel navigation
 
-Lazygit-style keyboard focus across the four main panels. The focused panel carries an outline.
+Lazygit-style keyboard focus across the main panels. The focused panel carries an outline.
 
 These keys only work while a panel itself has focus (or nothing does). They are inert while typing in any text field, in the embedded terminal, and while a menu, popover, picker, dialog, the command palette or the conflict resolver has focus.
 
 | Action | Key | Notes |
 | --- | --- | --- |
-| Focus Sidebar / History / Diff / Details | `1` / `2` / `3` / `4` | Opens a collapsed Sidebar or Details first. History and the diff share the main area: `2` closes an open diff, and `3` does nothing unless a diff is open. |
+| Focus Sidebar / the middle / Details | `1` / `2` / `3` | Opens a collapsed Sidebar or Details first. History and the diff share the middle area, and `2` focuses whichever is showing; `Escape` closes a diff back to History. `4` also focuses Details. |
 | Previous / next panel | `h` / `l`, `Left` / `Right` | Skips collapsed panels and whichever of History or Diff is not showing. Never wraps. |
 | Move within the focused panel | `j` / `k`, `Down` / `Up` | `j` moves down and `k` up. Sidebar: next/previous branch, revealed in History. History: next/previous commit. Diff: next/previous change. Details: next/previous file, opening its diff; starts at the first file when none is selected. |
 | Open | `Enter` | Sidebar → History. History → Details (the commit's files). Details → the file's diff. |
 | Back from a diff | `Escape` | Closes the diff and returns focus to the panel it was opened from. |
+| Back from a commit to your changes | `Escape` | History or Details, while a selected commit fills Details: drops the selection so Details lists your changes again. |
 | Previous / next sidebar tab | `[` / `]` | Branches, Files and Pull requests. |
 | List the focused panel's keys | `?` | Modal; `Escape` or `?` closes it. The status bar also shows the focused panel's main keys. |
 
@@ -97,6 +98,7 @@ Details lists every changed file once, staged or not, the way lazygit does. Two 
 | --- | --- | --- |
 | Next / previous file | `j` / `k` | Details. Opens its diff; `F1` / `F4` and the diff's arrows do the same. A file the filter no longer shows (say, just staged under Unstaged) steps on from where it sat. |
 | Stage / unstage the open file | `Space` | Details or Diff. Stages what is unstaged, or unstages a fully staged file. The row stays where it is. The list updates as soon as the key is pressed; git catches up behind it. |
+| Select a range of files | `Shift+J` / `Shift+K`, `Shift+Down` / `Shift+Up`, shift-click | Details. The open file moves and the range stretches back to where it started. `Space` and `Ctrl+S` / `Ctrl+U` then act on the whole range, and `d` discards its files' changes. `Escape` or a plain `j` / `k` drops it. |
 | Stage or unstage everything shown | `a` | Stages what the list shows; when none of it is unstaged, unstages it. Unfiltered, that is every change. |
 | Stage or unstage the open file's folder | `Shift+Space` | Details. The same rule over the folder's shown files; also a folder row's hover button in the tree. |
 | Stage / unstage only | `Ctrl+S` / `Ctrl+U` | Diff. One direction of `Space`, whichever side of the file the diff shows. |
@@ -129,6 +131,8 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 
 `r` on a pull request reviews it file by file. Line comments wait as a pending review, saved on this computer (per repository and pull request) until `S` posts them all together as one GitHub review, through `gh api`, on the head commit the diff shows. If the pull request gets new commits, the review moves to them and asks you to check your comments' lines. Nothing reaches GitHub before that. The Sidebar lists the pull request's files, the main area shows the file's diff, and Details becomes Your review.
 
+Re-reviewing works like GitHub's: Your review opens with your last submitted review of the pull request (its verdict, when, the commit it was on, and how many commits and files changed since), and the file list badges the files updated since it. Viewed marks belong to the pull request, not to one review: they stay after you submit, and a file loses its mark when a new commit changes it.
+
 | Action | Key | Where | Notes |
 | --- | --- | --- | --- |
 | Move the line cursor | `j` / `k`, `Down` / `Up` | Diff | The cursor starts on the file's first change. |
@@ -141,6 +145,7 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Next / previous change | `}` / `{` | Diff | |
 | Next / previous file | `]` / `[` | Any panel | `j` / `k` in the Sidebar too. |
 | Mark the file viewed | `Space` | Diff, Sidebar | Then goes to the next file not yet viewed. `Space` again unmarks it. |
+| Changes since your last review | `Shift+L` | Any panel | Toggles the file list to only the files changed since your last submitted review; `j` / `k`, `]` / `[` and `Space`'s next unviewed file keep to them. The diff stays the whole pull request's, so line comments stay valid. If that review's commit is gone (force-pushed away), everything is shown. |
 | Go to a pending comment | `Enter` | Details | `j` / `k` pick one; `e` edits it, `d` `d` deletes it. |
 | Submit | `Shift+S` | Any panel | The review dialog, with the verdict and summary, and the pending line comments going up with it; replies post right after. A Comment review with line comments needs no summary; Request changes always does, and pending replies alone post without a review. Whatever reaches GitHub leaves the draft, even if something after it fails; review mode closes once nothing is left. |
 | Leave | `q` | Any panel | Back to the pull request list. The pending review stays saved; `r` picks it up again. |

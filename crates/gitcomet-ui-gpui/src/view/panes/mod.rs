@@ -8,6 +8,7 @@ mod sidebar;
 pub(super) use details::ChangesFilter;
 pub(super) use details::{
     ChangeLanes, ComparisonCardCache, ComparisonOrderCache, DetailsPaneInit, DetailsPaneView,
+    toggle_plan,
 };
 pub(super) use history::HistoryView;
 #[allow(unused_imports)]
