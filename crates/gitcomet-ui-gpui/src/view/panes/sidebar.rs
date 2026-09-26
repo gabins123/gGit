@@ -302,6 +302,15 @@ pub(in super::super) struct SidebarPaneView {
     collapsed_popover_filter_input: Entity<TextInput>,
     pub(in super::super) collapsed_popover_filter_query: String,
     _collapsed_popover_filter_subscription: gpui::Subscription,
+    /// Review mode's `/` filter over its file list. The box owns the text;
+    /// the review keeps the parsed query.
+    review_query_input: Entity<TextInput>,
+    review_query_open: bool,
+    /// Focus moves on the next frame: the box after `/` (so the `/` isn't
+    /// typed into it), the list after Enter or Esc.
+    review_query_focus_pending: bool,
+    review_list_focus_pending: bool,
+    _review_query_subscription: gpui::Subscription,
     sidebar_presentation_cache: SidebarPresentationCache,
     path_display_cache: std::cell::RefCell<path_display::PathDisplayCache>,
     sidebar_collapsed_items_by_repo: BTreeMap<std::path::PathBuf, BTreeSet<String>>,
@@ -616,6 +625,21 @@ impl SidebarPaneView {
             },
         );
 
+        let review_query_input = cx.new(|cx| {
+            TextInput::new_inert(
+                TextInputOptions {
+                    placeholder: "Filter: words match fuzzily; .rs keeps a file type".into(),
+                    leading_icon: Some("icons/zoom.svg"),
+                    chromeless: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        let review_query_subscription = cx.observe(&review_query_input, |this, input, cx| {
+            this.review_query_input_changed(input, cx)
+        });
+
         let mut this = Self {
             store,
             state,
@@ -633,6 +657,11 @@ impl SidebarPaneView {
             collapsed_popover_filter_input,
             collapsed_popover_filter_query: String::new(),
             _collapsed_popover_filter_subscription: collapsed_popover_filter_subscription,
+            review_query_input,
+            review_query_open: false,
+            review_query_focus_pending: false,
+            review_list_focus_pending: false,
+            _review_query_subscription: review_query_subscription,
             sidebar_presentation_cache,
             path_display_cache: std::cell::RefCell::new(path_display::PathDisplayCache::default()),
             sidebar_collapsed_items_by_repo,
@@ -3142,6 +3171,55 @@ impl SidebarPaneView {
 impl SidebarPaneView {
     /// Review mode's file list: which files are viewed and where the pending
     /// comments are.
+    /// `/` in review mode: shows the file filter and focuses it next frame.
+    pub(in crate::view) fn open_review_query(&mut self, cx: &mut gpui::Context<Self>) {
+        self.review_query_open = true;
+        self.review_query_focus_pending = true;
+        cx.notify();
+    }
+
+    /// Esc: drops the file filter and hands the keyboard back to the list.
+    pub(in crate::view) fn reset_review_query(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.review_query_open {
+            self.review_list_focus_pending = true;
+        }
+        self.review_query_open = false;
+        if !self.review_query_input.read(cx).text().is_empty() {
+            // The observer mirrors the empty text into the review.
+            self.review_query_input
+                .update(cx, |input, cx| input.set_text("", cx));
+        }
+        cx.notify();
+    }
+
+    /// Typing filters as it goes; Enter keeps the filter and goes back to the
+    /// list, Esc drops it.
+    fn review_query_input_changed(
+        &mut self,
+        input: Entity<TextInput>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let (enter, escape) = input.update(cx, |input, _| {
+            (input.take_enter_pressed(), input.take_escape_pressed())
+        });
+        if escape {
+            self.reset_review_query(cx);
+            self.review_list_focus_pending = true;
+            return;
+        }
+        if enter {
+            self.review_query_open = false;
+            self.review_list_focus_pending = true;
+            cx.notify();
+        }
+        let query = super::details::ChangesQuery::parse(input.read(cx).text());
+        let root = self.root_view.clone();
+        // The root repaints this pane; it can't while we're mid-update.
+        cx.defer(move |cx| {
+            let _ = root.update(cx, |root, cx| root.review_set_query(query, cx));
+        });
+    }
+
     fn render_review_files_content(
         &mut self,
         theme: AppTheme,
@@ -3150,7 +3228,7 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (number, title, current, rows, since) = {
+        let (number, title, current, rows, since, counts) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
@@ -3195,16 +3273,63 @@ impl SidebarPaneView {
             } else {
                 None
             };
+            let viewed_all = review
+                .files
+                .iter()
+                .filter(|path| review.draft.viewed.contains(*path))
+                .count();
+            let counts = (
+                viewed_all,
+                review.files.len(),
+                review.viewed_hidden(),
+                review.show_viewed,
+                !review.query.is_empty(),
+            );
             (
                 review.number,
                 review.title.clone(),
                 review.file_ix,
                 rows,
                 since,
+                counts,
             )
         };
-        let viewed = rows.iter().filter(|(_, _, viewed, ..)| *viewed).count();
-        let total = rows.len();
+        let (viewed, total, hidden, show_viewed, filtering) = counts;
+        let listed = rows.len();
+        let query_text = self.review_query_input.read(cx).text().to_string();
+        // "18 files · 7 viewed hidden (V shows)", and the filter when set.
+        let mut state = vec![format!(
+            "{listed} file{}",
+            if listed == 1 { "" } else { "s" }
+        )];
+        if hidden > 0 {
+            state.push(format!("{hidden} viewed hidden (V shows)"));
+        } else if show_viewed {
+            state.push("viewed shown (V hides)".to_string());
+        }
+        if filtering {
+            state.push(format!("/ {}", query_text.trim()));
+        }
+        let state = state.join(" · ");
+        let empty = (listed == 0).then(|| {
+            if hidden > 0 && !filtering {
+                "All files viewed. V shows them."
+            } else if filtering {
+                "No file matches the filter. Esc clears it."
+            } else {
+                "No files to show. L shows all of them."
+            }
+        });
+        let query_bar = (self.review_query_open || filtering).then(|| {
+            div()
+                .mx_2()
+                .mb_1()
+                .px_1()
+                .rounded(px(theme.radii.control))
+                .border_1()
+                .border_color(theme.colors.stroke.default)
+                .child(self.review_query_input.clone())
+        });
         let secondary = theme.colors.foreground.secondary;
         let success = theme.colors.status.success.foreground;
         let warning = theme.colors.status.warning.foreground;
@@ -3362,6 +3487,12 @@ impl SidebarPaneView {
                             .text_color(secondary)
                             .child(format!("Reviewing #{number} · {viewed} of {total} viewed")),
                     )
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(11.5))
+                            .text_color(secondary)
+                            .child(state),
+                    )
                     .when_some(since, |header, since| {
                         header.child(
                             div()
@@ -3377,6 +3508,7 @@ impl SidebarPaneView {
                             .child(title),
                     ),
             )
+            .children(query_bar)
             .child(
                 div()
                     .id("review_file_rows")
@@ -3385,6 +3517,16 @@ impl SidebarPaneView {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
+                    .when_some(empty, |list, empty| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(theme.ui_text(12.5))
+                                .text_color(secondary)
+                                .child(empty),
+                        )
+                    })
                     .children(file_rows),
             )
             .child(
@@ -3393,7 +3535,9 @@ impl SidebarPaneView {
                     .py_2()
                     .text_size(theme.ui_text(11.5))
                     .text_color(secondary)
-                    .child("space viewed · ]/[ file · L changed since · S submit · q leave"),
+                    .child(
+                        "space viewed · / filter · V viewed · L changed since · S submit · q leave",
+                    ),
             )
             .into_any_element()
     }
@@ -3645,6 +3789,14 @@ impl SidebarPaneView {
 
 impl Render for SidebarPaneView {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.review_query_focus_pending) {
+            let handle = self.review_query_input.read(cx).focus_handle();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
+        if std::mem::take(&mut self.review_list_focus_pending) {
+            let handle = self.panel_focus_handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
         #[cfg(test)]
         {
             self.render_count += 1;

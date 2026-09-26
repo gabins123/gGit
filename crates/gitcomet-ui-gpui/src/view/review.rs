@@ -231,6 +231,12 @@ pub(super) struct ReviewMode {
     hunk_key: Option<(String, String)>,
     /// The diff base a reopen was asked for, so a render asks only once.
     reopened_for: Option<String>,
+    /// `/`: the file list keeps to paths matching it, as the Changes list's
+    /// filter matches.
+    pub(super) query: super::panes::ChangesQuery,
+    /// `V`: viewed files stay in the list. Off, they're hidden, except the
+    /// open one.
+    pub(super) show_viewed: bool,
 }
 
 impl ReviewMode {
@@ -356,14 +362,33 @@ impl ReviewMode {
             .count()
     }
 
-    /// Whether file `ix` is in the list: every file, or with `L` on only the
-    /// ones changed since your last review.
+    /// Whether file `ix` is in the list, the one `j`/`k`, `]`/`[` and
+    /// `space` walk: it matches the `/` filter, passes `L` (only files
+    /// changed since your last review), and isn't viewed, unless `V` shows
+    /// viewed files or it's the open one (so marking it doesn't make the list
+    /// jump). A dismissed file ("changed since you viewed") isn't viewed.
     pub(super) fn file_listed(&self, ix: usize) -> bool {
-        // While what changed is being worked out, nothing is hidden.
+        self.file_passes_filters(ix)
+            && (self.show_viewed
+                || ix == self.file_ix
+                || !self.draft.viewed.contains(&self.files[ix]))
+    }
+
+    /// The `/` filter and `L`, viewed or not.
+    fn file_passes_filters(&self, ix: usize) -> bool {
+        // While what changed is being worked out, `L` hides nothing.
         let known = matches!(self.since_review, Some(SinceReview::Changed(_)));
-        self.files
-            .get(ix)
-            .is_some_and(|path| !self.only_changed || !known || self.changed_since_review(path))
+        self.files.get(ix).is_some_and(|path| {
+            (!self.only_changed || !known || self.changed_since_review(path))
+                && self.query.matches_path(path)
+        })
+    }
+
+    /// Viewed files the list hides for now: `V` shows them.
+    pub(super) fn viewed_hidden(&self) -> usize {
+        (0..self.files.len())
+            .filter(|ix| self.file_passes_filters(*ix) && !self.file_listed(*ix))
+            .count()
     }
 
     /// "Your last review: Approved · 2 days ago · at abc1234 · 3 commits since
@@ -556,11 +581,16 @@ impl GitCometView {
             hunk_ranges_loading: Default::default(),
             hunk_key: None,
             reopened_for: None,
+            query: Default::default(),
+            show_viewed: false,
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
             cx.notify();
         });
+        // A filter left from another review doesn't carry over.
+        self.sidebar_pane
+            .update(cx, |pane, cx| pane.reset_review_query(cx));
         self.review_open_file(file_ix, cx);
         if !head_moves {
             self.review_sync_viewed(cx);
@@ -2218,6 +2248,23 @@ impl GitCometView {
                 self.review_step_thread(if shift { -1 } else { 1 }, cx)
             }
             (_, "l", true) => self.review_toggle_only_changed(cx),
+            (_, "v", true) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.show_viewed = !review.show_viewed;
+                }
+                self.notify_pull_request_panes(cx);
+            }
+            (Some(FocusPanel::Sidebar | FocusPanel::Diff), "/", false) => self
+                .sidebar_pane
+                .update(cx, |pane, cx| pane.open_review_query(cx)),
+            (Some(FocusPanel::Sidebar), "escape", false)
+                if self
+                    .active_review()
+                    .is_some_and(|review| !review.query.is_empty()) =>
+            {
+                self.sidebar_pane
+                    .update(cx, |pane, cx| pane.reset_review_query(cx))
+            }
             (_, "]", false) => self.review_step_file(1, cx),
             (_, "[", false) => self.review_step_file(-1, cx),
             // After the jump the range is gone; collapsing it back onto the
@@ -2321,6 +2368,19 @@ impl GitCometView {
             _ => return None,
         }
         Some(true)
+    }
+
+    /// The file list's `/` filter as typed, mirrored from the Sidebar's box.
+    pub(super) fn review_set_query(
+        &mut self,
+        query: super::panes::ChangesQuery,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self.review.as_mut().filter(|review| review.query != query) else {
+            return;
+        };
+        review.query = query;
+        self.notify_pull_request_panes(cx);
     }
 
     /// `S`: the submit dialog for the review in progress.
@@ -2684,6 +2744,8 @@ mod tests {
             hunk_ranges_loading: Default::default(),
             hunk_key: None,
             reopened_for: None,
+            query: Default::default(),
+            show_viewed: false,
         };
         review.draft.head_oid = "h1".into();
         review
@@ -2802,6 +2864,60 @@ mod tests {
         review.merge_viewed_states(&github(&[("b.rs", Dismissed)]), 2);
         assert!(review.draft.viewed.is_empty());
         assert!(review.dismissed.contains("b.rs"));
+    }
+
+    #[test]
+    fn viewed_files_leave_the_list_unless_shown_or_open() {
+        let mut review = test_review();
+        let listed = |review: &ReviewMode| {
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>()
+        };
+        review.draft.viewed = ["a.rs".to_string(), "b.rs".to_string()].into();
+        // a.rs is open: it stays, so marking it doesn't make the list jump.
+        assert_eq!(listed(&review), [0, 2]);
+        assert_eq!(review.viewed_hidden(), 1);
+        review.file_ix = 2;
+        assert_eq!(listed(&review), [2]);
+        assert_eq!(review.viewed_hidden(), 2);
+        review.show_viewed = true;
+        assert_eq!(listed(&review), [0, 1, 2]);
+        assert_eq!(review.viewed_hidden(), 0);
+        // Changed since you viewed it on GitHub: not viewed, so listed.
+        review.show_viewed = false;
+        review.draft.viewed.remove("b.rs");
+        review.dismissed.insert("b.rs".into());
+        assert_eq!(listed(&review), [1, 2]);
+    }
+
+    #[test]
+    fn the_file_filter_matches_like_the_changes_list_and_stacks_with_l() {
+        let mut review = test_review();
+        review.files = vec![
+            "src/view/panel_focus.rs".into(),
+            "docs/shortcuts.md".into(),
+            "src/lib.rs".into(),
+        ];
+        let listed = |review: &ReviewMode| {
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>()
+        };
+        review.query = super::super::panes::ChangesQuery::parse("pnl FOC");
+        assert_eq!(listed(&review), [0]);
+        review.query = super::super::panes::ChangesQuery::parse(".rs");
+        assert_eq!(listed(&review), [0, 2]);
+        // `L` on too: only what changed since your last review, of those.
+        review.only_changed = true;
+        review.since_review = Some(SinceReview::Changed(crate::github::ChangesSince {
+            files: ["src/lib.rs".to_string(), "docs/shortcuts.md".to_string()].into(),
+            commits: 1,
+        }));
+        assert_eq!(listed(&review), [2]);
+        // The open file is kept past `V`'s rule, not past the filter.
+        review.file_ix = 1;
+        assert_eq!(listed(&review), [2]);
     }
 
     #[test]

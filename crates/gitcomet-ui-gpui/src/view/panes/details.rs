@@ -7,6 +7,7 @@ use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 
 mod changes;
+pub(in crate::view) use changes::ChangesQuery;
 pub(in crate::view) use changes::{ChangeLanes, ChangesFilter, toggle_plan};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

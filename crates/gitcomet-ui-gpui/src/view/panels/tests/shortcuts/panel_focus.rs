@@ -1096,6 +1096,59 @@ fn viewed_marks_follow_github_and_outdated_threads_take_replies(cx: &mut gpui::T
     press(cx, "q");
 }
 
+#[gpui::test]
+fn the_review_file_list_hides_viewed_files_and_filters_with_slash(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    // The files listed, and the open one.
+    let listed = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_review()
+                .map(|review| {
+                    let listed = (0..review.files.len())
+                        .filter(|ix| review.file_listed(*ix))
+                        .collect::<Vec<_>>();
+                    (listed, review.file_ix)
+                })
+                .expect("reviewing")
+        })
+    };
+
+    press(cx, "1 r");
+    assert_eq!(listed(cx), (vec![0, 1, 2], 0));
+    // Viewed, then on to b.rs: a.rs leaves the list.
+    press(cx, "1 space");
+    assert_eq!(listed(cx), (vec![1, 2], 1));
+    // V shows viewed files, and hides them again.
+    press(cx, "shift-v");
+    assert_eq!(listed(cx), (vec![0, 1, 2], 1));
+    press(cx, "shift-v");
+    assert_eq!(listed(cx), (vec![1, 2], 1));
+    // j/k skip the hidden a.rs.
+    press(cx, "k");
+    assert_eq!(listed(cx).1, 1);
+    press(cx, "j k");
+    assert_eq!(listed(cx).1, 1);
+
+    // `/` opens the filter; typing narrows the list as it goes.
+    press(cx, "/");
+    press(cx, "c");
+    assert_eq!(listed(cx).0, [2]);
+    // Enter keeps it and hands the keyboard back to the list.
+    press(cx, "enter");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+    assert_eq!(listed(cx).0, [2]);
+    press(cx, "j");
+    assert_eq!(listed(cx), (vec![2], 2));
+    // Esc from the list clears it.
+    press(cx, "escape");
+    assert_eq!(listed(cx), (vec![1, 2], 2));
+
+    press(cx, "q");
+}
+
 /// The open diff's file and lane, after syncing the store's latest snapshot.
 fn diff_file(
     cx: &mut gpui::VisualTestContext,

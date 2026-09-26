@@ -146,6 +146,16 @@ impl ChangesQuery {
         self.terms.is_empty() && self.types.is_empty()
     }
 
+    /// Whether `path` passes, its haystack and type worked out on the spot:
+    /// for short lists, like review mode's files, that don't keep them.
+    pub(in crate::view) fn matches_path(&self, path: &str) -> bool {
+        self.is_empty()
+            || self.matches(
+                &path.replace('\\', "/").to_lowercase(),
+                &file_type(Path::new(path)),
+            )
+    }
+
     fn matches(&self, haystack: &str, file_type: &str) -> bool {
         (self.types.is_empty() || self.types.iter().any(|kept| **kept == *file_type))
             && self.terms.iter().all(|term| fuzzy_contains(haystack, term))

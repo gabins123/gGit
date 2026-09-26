@@ -6,6 +6,7 @@ mod sidebar;
 
 #[cfg(test)]
 pub(super) use details::ChangesFilter;
+pub(super) use details::ChangesQuery;
 pub(super) use details::{
     ChangeLanes, ComparisonCardCache, ComparisonOrderCache, DetailsPaneInit, DetailsPaneView,
     toggle_plan,
