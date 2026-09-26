@@ -3311,14 +3311,12 @@ impl SidebarPaneView {
             state.push(format!("/ {}", query_text.trim()));
         }
         let state = state.join(" · ");
-        let empty = (listed == 0).then(|| {
-            if hidden > 0 && !filtering {
-                "All files viewed. V shows them."
-            } else if filtering {
-                "No file matches the filter. Esc clears it."
-            } else {
-                "No files to show. L shows all of them."
-            }
+        let empty = (listed == 0).then_some(if hidden > 0 && !filtering {
+            "All files viewed. V shows them."
+        } else if filtering {
+            "No file matches the filter. Esc clears it."
+        } else {
+            "No files to show. L shows all of them."
         });
         let query_bar = (self.review_query_open || filtering).then(|| {
             div()
