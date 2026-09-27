@@ -40,6 +40,10 @@ pub(super) struct RepoPullRequests {
     pub(super) diff_base: PrLoad<String>,
     /// Index into the selected PR's files.
     pub(super) selected_file: Option<usize>,
+    /// Its diff was asked for (enter, a click, review mode), so the commit
+    /// fetch opens it when it lands, or reports why it can't. The fetch
+    /// starts as soon as the details land; asked for or not.
+    pub(super) diff_asked: bool,
     /// Set while a review or create is with gh.
     pub(super) submitting: bool,
     /// gh's refusal of the last review, create or merge, shown in its dialog.
@@ -49,10 +53,33 @@ pub(super) struct RepoPullRequests {
     /// Pending comments of the reviews saved on this computer, by pull
     /// request, as of the list's last load.
     pub(super) drafts: FxHashMap<u64, usize>,
+    /// Pages of the selected PR's files that came in ahead of an earlier one,
+    /// held back so files only ever append, in GitHub's order: indexes into
+    /// the list, review mode's included, never shift.
+    file_pages: std::collections::BTreeMap<u32, Vec<github::PullRequestFile>>,
+    /// The next page to append.
+    next_file_page: u32,
+    /// The listing's last page; 0 when `gh pr view` brought every file.
+    file_page_count: u32,
+    /// Why some of the selected PR's files couldn't be listed.
+    pub(super) files_error: Option<String>,
     list_seq: u64,
     detail_seq: u64,
     diff_seq: u64,
+    files_seq: u64,
 }
+
+impl RepoPullRequests {
+    /// More of the selected PR's files are on their way.
+    pub(super) fn files_listing(&self) -> bool {
+        self.file_page_count > 0 && self.next_file_page <= self.file_page_count
+    }
+}
+
+/// Pages of files fetched at once: enough to have the list long before
+/// the first file is reviewed, few enough to stay clear of GitHub's limits
+/// on concurrent requests.
+const FILE_PAGE_LANES: u32 = 6;
 
 /// Why a branch can't head a new pull request yet.
 pub(super) enum HeadProblem {
@@ -287,6 +314,11 @@ impl GitCometView {
         };
         let repo_id = target.repo_id;
         let entry = self.pull_requests.repo_mut(repo_id);
+        // `R` also lists again the files a failed page left out.
+        if entry.files_error.is_some() && !entry.files_listing() {
+            self.list_more_pull_request_files(repo_id, cx);
+        }
+        let entry = self.pull_requests.repo_mut(repo_id);
         entry.list_seq += 1;
         let seq = entry.list_seq;
         // A refresh keeps the current list on screen until the new one lands.
@@ -343,6 +375,11 @@ impl GitCometView {
         entry.detail = PrLoad::Loading;
         entry.diff_base = PrLoad::Idle;
         entry.diff_seq += 1;
+        entry.diff_asked = false;
+        // The previous pull request's listing stops where it is.
+        entry.files_seq += 1;
+        entry.file_page_count = 0;
+        entry.files_error = None;
         // A diff asked for on the previous pull request must not steal focus.
         self.focus_diff_when_open = false;
         let entry = self.pull_requests.repo_mut(repo_id);
@@ -393,15 +430,260 @@ impl GitCometView {
                 if entry.detail_seq != seq {
                     return;
                 }
-                entry.detail = match result {
-                    Ok(detail) => PrLoad::Ready(Arc::new(detail)),
-                    Err(err) => PrLoad::Failed(err),
-                };
+                match result {
+                    Ok(mut detail) => {
+                        // A reload at the same head keeps the files listed so
+                        // far, whole and in place, and a listing still running
+                        // carries on into the new details. A new head lists
+                        // afresh.
+                        let carried = match entry.detail.ready() {
+                            Some(previous)
+                                if previous.number == detail.number
+                                    && previous.head_oid == detail.head_oid
+                                    && previous.base == detail.base =>
+                            {
+                                detail.files = previous.files.clone();
+                                true
+                            }
+                            _ => false,
+                        };
+                        entry.detail = PrLoad::Ready(Arc::new(detail));
+                        if !carried {
+                            this.list_more_pull_request_files(repo_id, cx);
+                        }
+                        this.fetch_pull_request_commits(repo_id, cx);
+                    }
+                    Err(err) => {
+                        // A reload that fails keeps the details on screen,
+                        // and any listing running into them.
+                        let reload = entry
+                            .detail
+                            .ready()
+                            .is_some_and(|previous| previous.number == number);
+                        if reload {
+                            this.push_toast(
+                                components::ToastKind::Warning,
+                                format!("Couldn't reload #{number}: {err}"),
+                                cx,
+                            );
+                        } else {
+                            entry.detail = PrLoad::Failed(err);
+                        }
+                    }
+                }
                 this.notify_pull_request_panes(cx);
             });
         })
         .detach();
         self.notify_pull_request_panes(cx);
+    }
+
+    /// Pages in the files past the first 100, several pages at once, as soon
+    /// as the details land: the list is whole long before the first file is
+    /// reviewed. Pages append in order, whatever order they arrive in, and
+    /// only files not listed yet: run again, this fills in what a failed page
+    /// left out.
+    fn list_more_pull_request_files(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) {
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.files_seq += 1;
+        let files_seq = entry.files_seq;
+        entry.file_pages.clear();
+        entry.file_page_count = 0;
+        entry.files_error = None;
+        let Some(detail) = entry.detail.ready() else {
+            return;
+        };
+        // Past GitHub's cap it's reviewed on GitHub: nothing to list here.
+        if detail.too_large_for_app() || cfg!(test) {
+            return;
+        }
+        let number = detail.number;
+        let pages = detail.changed_files.div_ceil(github::FILES_PER_PAGE) as u32;
+        // Up to 100, `gh pr view` brought every file.
+        if pages < 2 {
+            return;
+        }
+        // Page 1 as well: `gh pr view` and the REST listing needn't order
+        // files alike, and whatever is listed already is skipped.
+        entry.next_file_page = 1;
+        entry.file_page_count = pages;
+        for lane in 0..FILE_PAGE_LANES {
+            let lane_pages: Vec<u32> = (1 + lane..=pages)
+                .step_by(FILE_PAGE_LANES as usize)
+                .collect();
+            if lane_pages.is_empty() {
+                continue;
+            }
+            let target = target.clone();
+            cx.spawn(async move |view, cx| {
+                for page in lane_pages {
+                    let fetch = |target: GitHubTarget| {
+                        cx.background_executor().spawn(async move {
+                            github::pull_request_files_page(
+                                &target.workdir,
+                                &target.slug,
+                                number,
+                                page,
+                            )
+                        })
+                    };
+                    // A passing failure (the network, GitHub's limit on
+                    // bursts) gets two more tries, further apart.
+                    let mut result = fetch(target.clone()).await;
+                    for wait in [1, 3] {
+                        if result.is_ok() {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(wait))
+                            .await;
+                        result = fetch(target.clone()).await;
+                    }
+                    let still_wanted = view
+                        .update(cx, |this, cx| {
+                            this.pull_request_files_page_landed(
+                                repo_id, files_seq, number, page, result, cx,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !still_wanted {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Takes in one page of files: appends it and every page after it that
+    /// already came, in order. `false` once the listing it was for is over.
+    fn pull_request_files_page_landed(
+        &mut self,
+        repo_id: RepoId,
+        files_seq: u64,
+        number: u64,
+        page: u32,
+        result: Result<Vec<github::PullRequestFile>, PrError>,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if entry.files_seq != files_seq
+            || entry.selected != Some(number)
+            || entry.detail.ready().is_none()
+        {
+            return false;
+        }
+        let files = result.unwrap_or_else(|err| {
+            // The gap is filled with nothing so later pages still append;
+            // the list says files are missing, and `R` lists them again.
+            entry.files_error = Some(err.to_string());
+            Vec::new()
+        });
+        entry.file_pages.insert(page, files);
+        let mut arrived = Vec::new();
+        while let Some(files) = entry.file_pages.remove(&entry.next_file_page) {
+            arrived.extend(files);
+            entry.next_file_page += 1;
+        }
+        let PrLoad::Ready(detail) = &mut entry.detail else {
+            return false;
+        };
+        if !arrived.is_empty() {
+            let detail = Arc::make_mut(detail);
+            let mut known: rustc_hash::FxHashSet<String> =
+                detail.files.iter().map(|file| file.path.clone()).collect();
+            let new: Vec<github::PullRequestFile> = arrived
+                .into_iter()
+                .filter(|file| known.insert(file.path.clone()))
+                .collect();
+            detail.files.extend(new.iter().cloned());
+            // Review mode lists the same files in the same order; checked
+            // against its own list, which a reload at a new head doesn't reset.
+            if let Some(review) = self
+                .review
+                .as_mut()
+                .filter(|review| review.repo_id == repo_id && review.number == number)
+            {
+                let fresh: Vec<String> = {
+                    let listed: rustc_hash::FxHashSet<&str> =
+                        review.files.iter().map(String::as_str).collect();
+                    new.into_iter()
+                        .map(|file| file.path)
+                        .filter(|path| !listed.contains(path.as_str()))
+                        .collect()
+                };
+                review.files.extend(fresh);
+            }
+        }
+        self.notify_pull_request_panes(cx);
+        true
+    }
+
+    /// Fetches the PR's commits as soon as its details land, so the diff is
+    /// ready by the time it's asked for. Only a diff someone asked for opens,
+    /// or reports a failure.
+    fn fetch_pull_request_commits(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if !matches!(entry.diff_base, PrLoad::Idle | PrLoad::Failed(_)) {
+            return;
+        }
+        let Some(detail) = entry.detail.ready().cloned() else {
+            return;
+        };
+        if detail.too_large_for_app() {
+            return;
+        }
+        entry.diff_base = PrLoad::Loading;
+        entry.diff_seq += 1;
+        let seq = entry.diff_seq;
+        let number = detail.number;
+        let task = cx.background_spawn(async move {
+            github::prepare_diff_range(
+                &target.workdir,
+                &target.remote,
+                &detail.base_oid,
+                &detail.head_oid,
+            )
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let entry = this.pull_requests.repo_mut(repo_id);
+                if entry.diff_seq != seq {
+                    return;
+                }
+                let asked = entry.diff_asked;
+                match result {
+                    Ok(merge_base) => {
+                        entry.diff_base = PrLoad::Ready(merge_base);
+                        if asked {
+                            this.show_pull_request_file(repo_id);
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("Couldn't load the diff of #{number}: {err}");
+                        entry.diff_base = PrLoad::Failed(err);
+                        // Told once: a later retry (a reload) doesn't open it.
+                        entry.diff_asked = false;
+                        if asked {
+                            this.focus_diff_when_open = false;
+                            this.push_toast(components::ToastKind::Error, message, cx);
+                        }
+                    }
+                }
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
     }
 
     /// `j`/`k` in the list. With nothing selected it starts at either end.
@@ -486,8 +768,10 @@ impl GitCometView {
             self.push_toast(
                 components::ToastKind::Warning,
                 format!(
-                    "#{} is too large to review here ({} files, +{} −{}). Press o to open it on GitHub.",
-                    detail.number, detail.changed_files, detail.additions, detail.deletions
+                    "#{} has {} files; GitHub lists only the first {}. Press o to review it on GitHub.",
+                    detail.number,
+                    detail.changed_files,
+                    github::MAX_LISTED_FILES
                 ),
                 cx,
             );
@@ -498,6 +782,7 @@ impl GitCometView {
         }
         let last = detail.files.len() - 1;
         entry.selected_file = Some(file_ix.or(entry.selected_file).unwrap_or(0).min(last));
+        entry.diff_asked = true;
         match entry.diff_base {
             PrLoad::Ready(_) => {
                 self.show_pull_request_file(repo_id);
@@ -511,41 +796,7 @@ impl GitCometView {
             }
             PrLoad::Idle | PrLoad::Failed(_) => {}
         }
-        entry.diff_base = PrLoad::Loading;
-        entry.diff_seq += 1;
-        let seq = entry.diff_seq;
-        let number = detail.number;
-        let task = cx.background_spawn(async move {
-            github::prepare_diff_range(
-                &target.workdir,
-                &target.remote,
-                &detail.base_oid,
-                &detail.head_oid,
-            )
-        });
-        cx.spawn(async move |view, cx| {
-            let result = task.await;
-            let _ = view.update(cx, |this, cx| {
-                let entry = this.pull_requests.repo_mut(repo_id);
-                if entry.diff_seq != seq {
-                    return;
-                }
-                match result {
-                    Ok(merge_base) => {
-                        entry.diff_base = PrLoad::Ready(merge_base);
-                        this.show_pull_request_file(repo_id);
-                    }
-                    Err(err) => {
-                        let message = format!("Couldn't load the diff of #{number}: {err}");
-                        entry.diff_base = PrLoad::Failed(err);
-                        this.focus_diff_when_open = false;
-                        this.push_toast(components::ToastKind::Error, message, cx);
-                    }
-                }
-                this.notify_pull_request_panes(cx);
-            });
-        })
-        .detach();
+        self.fetch_pull_request_commits(repo_id, cx);
         self.notify_pull_request_panes(cx);
         true
     }
@@ -574,7 +825,7 @@ impl GitCometView {
             return false;
         };
         entry.selected_file = Some(next);
-        if entry.diff_base.ready().is_some() {
+        if entry.diff_asked && entry.diff_base.ready().is_some() {
             self.show_pull_request_file(repo_id);
         }
         self.notify_pull_request_panes(cx);
@@ -1149,6 +1400,40 @@ impl GitCometView {
         let entry = self.pull_requests.repo_mut(repo_id);
         entry.detail = PrLoad::Ready(Arc::new(detail));
         entry.diff_base = PrLoad::Ready(merge_base);
+        entry.next_file_page = 2;
+    }
+
+    /// A page of files as the background listing would hand it in.
+    #[cfg(test)]
+    pub(super) fn land_pull_request_files_page_for_test(
+        &mut self,
+        repo_id: RepoId,
+        page: u32,
+        files: Vec<github::PullRequestFile>,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let (files_seq, Some(number)) = (entry.files_seq, entry.selected) else {
+            return false;
+        };
+        self.pull_request_files_page_landed(repo_id, files_seq, number, page, Ok(files), cx)
+    }
+
+    /// More of `number`'s files are on their way: until they're in, its
+    /// list, review mode's included, is only the first part.
+    pub(super) fn pull_request_files_listing(&self, repo_id: RepoId, number: u64) -> bool {
+        self.pull_requests
+            .repo(repo_id)
+            .is_some_and(|prs| prs.selected == Some(number) && prs.files_listing())
+    }
+
+    /// Why some of `number`'s files couldn't be listed, once listing is
+    /// over; `R` lists them again.
+    pub(super) fn pull_request_files_error(&self, repo_id: RepoId, number: u64) -> Option<&str> {
+        self.pull_requests
+            .repo(repo_id)
+            .filter(|prs| prs.selected == Some(number) && !prs.files_listing())
+            .and_then(|prs| prs.files_error.as_deref())
     }
 
     /// The pull request's head moved: its merge base may have too (a base

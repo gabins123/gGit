@@ -12,11 +12,15 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-/// A pull request past either limit is reviewed on GitHub instead of in the app.
-/// `gh pr view --json files` lists at most 100 files, so past that the files
-/// list would be silently incomplete.
-pub(crate) const MAX_IN_APP_FILES: u64 = 100;
-pub(crate) const MAX_IN_APP_CHANGED_LINES: u64 = 20_000;
+/// GitHub's API lists a pull request's first 3,000 files and no more. Past
+/// that the list would be silently incomplete, so such a pull request is
+/// reviewed on GitHub instead.
+pub(crate) const MAX_LISTED_FILES: u64 = 3_000;
+/// Files per page of that list; `gh pr view` carries the first page.
+pub(crate) const FILES_PER_PAGE: u64 = 100;
+/// Codex reads the whole diff in one prompt: past these it's too much.
+const MAX_CODEX_FILES: u64 = 100;
+const MAX_CODEX_CHANGED_LINES: u64 = 20_000;
 
 /// How far `gh pr list` looks. Open PRs past this are on GitHub.
 const LIST_LIMIT: u32 = 100;
@@ -379,10 +383,15 @@ pub(crate) struct PullRequestDetail {
 }
 
 impl PullRequestDetail {
-    /// Whether the diff is past the in-app limits and belongs on GitHub.
+    /// Whether GitHub can't list all of its files, so it belongs on GitHub.
     pub(crate) fn too_large_for_app(&self) -> bool {
-        self.changed_files > MAX_IN_APP_FILES
-            || self.additions + self.deletions > MAX_IN_APP_CHANGED_LINES
+        self.changed_files > MAX_LISTED_FILES
+    }
+
+    /// Whether its diff is too much for one Codex prompt.
+    pub(crate) fn too_large_for_codex(&self) -> bool {
+        self.changed_files > MAX_CODEX_FILES
+            || self.additions + self.deletions > MAX_CODEX_CHANGED_LINES
     }
 }
 
@@ -829,6 +838,44 @@ pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullReques
     ]);
     let raw: RawDetail = parse_json(&run(command, None)?)?;
     Ok(raw.into())
+}
+
+/// One page of the pull request's files, as GitHub's REST API lists them:
+/// `gh pr view` stops at the first 100, and the rest come a page at a time.
+pub(crate) fn pull_request_files_page(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+    page: u32,
+) -> Result<Vec<PullRequestFile>, PrError> {
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
+    #[derive(Deserialize)]
+    struct RawFile {
+        filename: String,
+        #[serde(default)]
+        additions: u64,
+        #[serde(default)]
+        deletions: u64,
+    }
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "--hostname=github.com",
+        &format!("repos/{repo}/pulls/{number}/files?per_page={FILES_PER_PAGE}&page={page}"),
+    ]);
+    let files: Vec<RawFile> = parse_json(&run(command, None)?)?;
+    Ok(files
+        .into_iter()
+        .map(|file| PullRequestFile {
+            path: file.filename,
+            additions: file.additions,
+            deletions: file.deletions,
+        })
+        .collect())
 }
 
 /// The pull request's patch, as GitHub serves it.
@@ -1872,8 +1919,10 @@ mod tests {
         assert_eq!(detail.mergeable, Some(false));
         assert_eq!(detail.review, Some(ReviewDecision::Approved));
         assert_eq!(detail.files[0].path, "src/a.rs");
-        // Past both limits: 214 files and 20,001 changed lines.
-        assert!(detail.too_large_for_app());
+        // 214 files and 20,001 changed lines: too much for one Codex prompt,
+        // but reviewable here, a page of files at a time.
+        assert!(detail.too_large_for_codex());
+        assert!(!detail.too_large_for_app());
     }
 
     #[test]

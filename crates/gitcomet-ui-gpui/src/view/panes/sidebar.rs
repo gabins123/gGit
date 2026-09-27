@@ -279,6 +279,15 @@ impl CollapsedSidebarSection {
     }
 }
 
+/// A review file's pending comments, threads on its lines and outdated
+/// threads.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReviewFileCounts {
+    comments: usize,
+    threads: usize,
+    outdated: usize,
+}
+
 pub(in super::super) struct SidebarPaneView {
     pub(in super::super) store: Arc<AppStore>,
     state: Arc<AppState>,
@@ -305,6 +314,13 @@ pub(in super::super) struct SidebarPaneView {
     /// Review mode's `/` filter over its file list. The box owns the text;
     /// the review keeps the parsed query.
     review_query_input: Entity<TextInput>,
+    /// The review file list: the listed file indices this frame, their
+    /// pending comment, thread and outdated counts by path, and where it
+    /// last scrolled to (the open file's index).
+    review_files_scroll: UniformListScrollHandle,
+    review_rows: Vec<usize>,
+    review_file_counts: rustc_hash::FxHashMap<String, ReviewFileCounts>,
+    review_scrolled_to: Option<usize>,
     review_query_open: bool,
     /// Focus moves on the next frame: the box after `/` (so the `/` isn't
     /// typed into it), the list after Enter or Esc.
@@ -658,6 +674,10 @@ impl SidebarPaneView {
             collapsed_popover_filter_query: String::new(),
             _collapsed_popover_filter_subscription: collapsed_popover_filter_subscription,
             review_query_input,
+            review_files_scroll: UniformListScrollHandle::default(),
+            review_rows: Vec::new(),
+            review_file_counts: Default::default(),
+            review_scrolled_to: None,
             review_query_open: false,
             review_query_focus_pending: false,
             review_list_focus_pending: false,
@@ -3228,30 +3248,34 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (number, title, current, rows, since, counts) = {
+        let (number, title, current, since, counts) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
             };
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(usize, String, bool, usize, usize, bool, bool, usize)> = review
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(ix, _)| review.file_listed(*ix))
-                .map(|(ix, path)| {
-                    (
-                        ix,
-                        path.clone(),
-                        review.draft.viewed.contains(path),
-                        review.comments_on(path),
-                        review.threads_on(path),
-                        review.changed_since_review(path),
-                        review.dismissed.contains(path),
-                        review.outdated_on(path),
-                    )
-                })
+            // Up to 3,000 files: only the listed indices are kept here, and
+            // the per-file counts come from one pass over comments and
+            // threads; the rows on screen read the rest as they paint.
+            self.review_rows = (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
                 .collect();
+            let mut file_counts: rustc_hash::FxHashMap<String, ReviewFileCounts> =
+                Default::default();
+            for comment in &review.draft.comments {
+                file_counts
+                    .entry(comment.anchor.path.clone())
+                    .or_default()
+                    .comments += 1;
+            }
+            for thread in &review.threads {
+                let counts = file_counts.entry(thread.path.clone()).or_default();
+                if thread.line.is_some() {
+                    counts.threads += 1;
+                } else if thread.outdated() {
+                    counts.outdated += 1;
+                }
+            }
+            self.review_file_counts = file_counts;
             let changed = review.files_changed_since_review();
             let short = |oid: &str| oid.chars().take(7).collect::<String>();
             let since = if let Some(base) = review.since_base() {
@@ -3278,24 +3302,48 @@ impl SidebarPaneView {
                 .iter()
                 .filter(|path| review.draft.viewed.contains(*path))
                 .count();
+            // Files past the first 100 still coming, and of how many; or the
+            // pages that never came.
+            let listing = root
+                .pull_request_files_listing(review.repo_id, review.number)
+                .then(|| {
+                    root.pull_requests
+                        .repo(review.repo_id)
+                        .and_then(|prs| prs.detail.ready())
+                        .filter(|detail| detail.number == review.number)
+                        .map(|detail| detail.changed_files.min(crate::github::MAX_LISTED_FILES))
+                })
+                .flatten();
+            let files_missing = root
+                .pull_request_files_error(review.repo_id, review.number)
+                .is_some();
             let counts = (
                 viewed_all,
                 review.files.len(),
                 review.viewed_hidden(),
                 review.show_viewed,
                 !review.query.is_empty(),
+                listing,
+                files_missing,
             );
             (
                 review.number,
                 review.title.clone(),
                 review.file_ix,
-                rows,
                 since,
                 counts,
             )
         };
-        let (viewed, total, hidden, show_viewed, filtering) = counts;
-        let listed = rows.len();
+        let (viewed, total, hidden, show_viewed, filtering, listing, files_missing) = counts;
+        let listed = self.review_rows.len();
+        // Keep the open file in view as j/k, ]/[ and space move it.
+        if self.review_scrolled_to != Some(current)
+            && let Ok(row) = self.review_rows.binary_search(&current)
+        {
+            self.review_files_scroll
+                .scroll_to_item(row, gpui::ScrollStrategy::Nearest);
+            self.review_scrolled_to = Some(current);
+        }
         let query_text = self.review_query_input.read(cx).text().to_string();
         // "18 files · 7 viewed hidden (V shows)", and the filter when set.
         let mut state = vec![format!(
@@ -3310,8 +3358,15 @@ impl SidebarPaneView {
         if filtering {
             state.push(format!("/ {}", query_text.trim()));
         }
+        if let Some(of) = listing {
+            state.push(format!("listing {total} of {of}…"));
+        } else if files_missing {
+            state.push("some files missing · R retries".to_string());
+        }
         let state = state.join(" · ");
-        let empty = (listed == 0).then_some(if hidden > 0 && !filtering {
+        let empty = (listed == 0).then_some(if listing.is_some() && !filtering {
+            "Still listing the pull request's files."
+        } else if hidden > 0 && !filtering {
             "All files viewed. V shows them."
         } else if filtering {
             "No file matches the filter. Esc clears it."
@@ -3329,141 +3384,15 @@ impl SidebarPaneView {
                 .child(self.review_query_input.clone())
         });
         let secondary = theme.colors.foreground.secondary;
-        let success = theme.colors.status.success.foreground;
-        let warning = theme.colors.status.warning.foreground;
         let accent = theme.colors.status.info.foreground;
-
-        let file_rows = rows.into_iter().map(
-            |(ix, path, is_viewed, comments, threads, updated, dismissed, outdated)| {
-                let name = path
-                    .rsplit_once('/')
-                    .map_or(path.as_str(), |(_, name)| name);
-                div()
-                    .id(SharedString::from(format!("review_file_{ix}")))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .mx_1()
-                    .px_2()
-                    .py(px(4.0))
-                    .rounded(px(theme.radii.control))
-                    .control_interaction(
-                        controls::InteractionStyle::new(theme),
-                        controls::InteractionState::default()
-                            .selected(ix == current, theme.colors.interaction.selected_background),
-                    )
-                    .on_activate(
-                        false,
-                        controls::ControlActivation::Composite,
-                        cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            window.focus(&this.panel_focus_handle, cx);
-                            // The root repaints this pane; it can't while we're mid-update.
-                            let root = this.root_view.clone();
-                            cx.defer(move |cx| {
-                                let _ = root.update(cx, |root, cx| root.review_open_file(ix, cx));
-                            });
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(3.0))
-                            .border_1()
-                            .border_color(if is_viewed { success } else { secondary })
-                            .when(is_viewed, |check| {
-                                check.bg(success).child(crate::view::icons::svg_icon(
-                                    "icons/check.svg",
-                                    theme.colors.surface.chrome,
-                                    px(10.0),
-                                ))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(theme.ui_text(12.5))
-                                    .when(is_viewed, |text| text.text_color(secondary))
-                                    .child(name.to_string()),
-                            )
-                            .when(name != path, |row| {
-                                row.child(
-                                    div()
-                                        .truncate()
-                                        .text_size(theme.ui_text(11.0))
-                                        .text_color(secondary)
-                                        .child(path.clone()),
-                                )
-                            }),
-                    )
-                    .when(updated, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_size(theme.ui_text(11.5))
-                                .text_color(accent)
-                                .child("updated since your review"),
-                        )
-                    })
-                    .when(dismissed && !is_viewed, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_size(theme.ui_text(11.5))
-                                .text_color(warning)
-                                .child("changed since you viewed"),
-                        )
-                    })
-                    .when(outdated > 0, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_size(theme.ui_text(11.5))
-                                .text_color(secondary)
-                                .child(format!("{outdated} outdated")),
-                        )
-                    })
-                    .when(threads > 0, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_size(theme.ui_text(11.5))
-                                .text_color(secondary)
-                                .child(format!(
-                                    "{threads} thread{}",
-                                    if threads == 1 { "" } else { "s" }
-                                )),
-                        )
-                    })
-                    .when(comments > 0, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_size(theme.ui_text(11.5))
-                                .text_color(warning)
-                                .child(crate::view::icons::svg_icon(
-                                    "icons/pencil.svg",
-                                    warning,
-                                    px(11.0),
-                                ))
-                                .child(comments.to_string()),
-                        )
-                    })
-            },
-        );
+        let list = uniform_list(
+            "review_file_rows",
+            listed,
+            cx.processor(Self::render_review_file_rows),
+        )
+        .flex_1()
+        .min_h(px(0.0))
+        .track_scroll(&self.review_files_scroll);
 
         div()
             .id("review_files")
@@ -3507,26 +3436,17 @@ impl SidebarPaneView {
                     ),
             )
             .children(query_bar)
-            .child(
-                div()
-                    .id("review_file_rows")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .when_some(empty, |list, empty| {
-                        list.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .text_size(theme.ui_text(12.5))
-                                .text_color(secondary)
-                                .child(empty),
-                        )
-                    })
-                    .children(file_rows),
-            )
+            .when_some(empty, |pane, empty| {
+                pane.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_size(theme.ui_text(12.5))
+                        .text_color(secondary)
+                        .child(empty),
+                )
+            })
+            .child(list)
             .child(
                 div()
                     .px_3()
@@ -3538,6 +3458,195 @@ impl SidebarPaneView {
                     ),
             )
             .into_any_element()
+    }
+
+    /// The review file list's rows on screen: `review_rows[range]`, each a
+    /// fixed height so the list stays uniform.
+    fn render_review_file_rows(
+        this: &mut Self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(root) = this.root_view.upgrade() else {
+            return Vec::new();
+        };
+        let theme = this.theme;
+        // Two lines of text, which grow with the UI font, and the air around.
+        let scale = ui_scale::UiScale::current(cx);
+        let row_height = scale.px(8.0) + (scale.ui_text(12.5) + scale.ui_text(11.0)) * 1.618;
+        let secondary = theme.colors.foreground.secondary;
+        let success = theme.colors.status.success.foreground;
+        let warning = theme.colors.status.warning.foreground;
+        let accent = theme.colors.status.info.foreground;
+        let rows: Vec<_> = {
+            let root = root.read(cx);
+            let Some(review) = root.active_review() else {
+                return Vec::new();
+            };
+            range
+                .filter_map(|row| this.review_rows.get(row).copied())
+                .filter_map(|ix| {
+                    let path = review.files.get(ix)?.clone();
+                    let counts = this
+                        .review_file_counts
+                        .get(&path)
+                        .copied()
+                        .unwrap_or_default();
+                    Some((
+                        ix,
+                        review.draft.viewed.contains(&path),
+                        review.changed_since_review(&path),
+                        review.dismissed.contains(&path),
+                        counts,
+                        path,
+                        ix == review.file_ix,
+                    ))
+                })
+                .collect()
+        };
+        rows.into_iter()
+            .map(
+                |(ix, is_viewed, updated, dismissed, counts, path, is_current)| {
+                    let name = path
+                        .rsplit_once('/')
+                        .map_or(path.as_str(), |(_, name)| name)
+                        .to_string();
+                    let folder = path.rsplit_once('/').map(|(folder, _)| folder.to_string());
+                    let ReviewFileCounts {
+                        comments,
+                        threads,
+                        outdated,
+                    } = counts;
+                    div()
+                        .id(("review_file", ix))
+                        .h(row_height)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_1()
+                        .px_2()
+                        .rounded(px(theme.radii.control))
+                        .control_interaction(
+                            controls::InteractionStyle::new(theme),
+                            controls::InteractionState::default()
+                                .selected(is_current, theme.colors.interaction.selected_background),
+                        )
+                        .on_activate(
+                            false,
+                            controls::ControlActivation::Composite,
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                window.focus(&this.panel_focus_handle, cx);
+                                // The root repaints this pane; it can't while we're mid-update.
+                                let root = this.root_view.clone();
+                                cx.defer(move |cx| {
+                                    let _ =
+                                        root.update(cx, |root, cx| root.review_open_file(ix, cx));
+                                });
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.0))
+                                .border_1()
+                                .border_color(if is_viewed { success } else { secondary })
+                                .when(is_viewed, |check| {
+                                    check.bg(success).child(crate::view::icons::svg_icon(
+                                        "icons/check.svg",
+                                        theme.colors.surface.chrome,
+                                        px(10.0),
+                                    ))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(theme.ui_text(12.5))
+                                        .when(is_viewed, |text| text.text_color(secondary))
+                                        .child(name),
+                                )
+                                .when_some(folder, |row, folder| {
+                                    row.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(theme.ui_text(11.0))
+                                            .text_color(secondary)
+                                            .child(folder),
+                                    )
+                                }),
+                        )
+                        .when(updated, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(accent)
+                                    .child("updated since your review"),
+                            )
+                        })
+                        .when(dismissed && !is_viewed, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(warning)
+                                    .child("changed since you viewed"),
+                            )
+                        })
+                        .when(outdated > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(secondary)
+                                    .child(format!("{outdated} outdated")),
+                            )
+                        })
+                        .when(threads > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(secondary)
+                                    .child(format!(
+                                        "{threads} thread{}",
+                                        if threads == 1 { "" } else { "s" }
+                                    )),
+                            )
+                        })
+                        .when(comments > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(warning)
+                                    .child(crate::view::icons::svg_icon(
+                                        "icons/pencil.svg",
+                                        warning,
+                                        px(11.0),
+                                    ))
+                                    .child(comments.to_string()),
+                            )
+                        })
+                        .into_any_element()
+                },
+            )
+            .collect()
     }
 
     /// The Pull requests tab: the repository's open PRs, listed through gh.

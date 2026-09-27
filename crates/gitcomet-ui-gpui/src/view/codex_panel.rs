@@ -421,7 +421,7 @@ impl GitCometView {
                 let too_large = prs
                     .and_then(|prs| prs.detail.ready())
                     .is_some_and(|detail| {
-                        Some(detail.number) == number && detail.too_large_for_app()
+                        Some(detail.number) == number && detail.too_large_for_codex()
                     });
                 // Review mode reads the reviewed head's own diff, so Codex's
                 // line numbers are the ones on screen.

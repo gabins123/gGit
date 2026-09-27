@@ -1547,3 +1547,92 @@ fn two_is_the_middle_and_esc_leaves_a_commit_for_your_changes(cx: &mut gpui::Tes
     });
     assert_eq!(focused(cx, &view), Some(History));
 }
+
+#[gpui::test]
+fn files_past_the_first_page_append_in_order_into_the_list_and_the_review(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    let file = |path: &str| crate::github::PullRequestFile {
+        path: path.into(),
+        additions: 1,
+        deletions: 0,
+    };
+    let land = |cx: &mut gpui::VisualTestContext, page: u32, paths: &[&str]| {
+        let files = paths.iter().map(|path| file(path)).collect();
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.land_pull_request_files_page_for_test(REPO, page, files, cx)
+            })
+        });
+        draw_and_drain_test_window(cx);
+    };
+    let lists = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            let this = view.read(app);
+            let pull_request: Vec<String> = this
+                .active_pull_requests()
+                .and_then(|prs| prs.detail.ready())
+                .map(|detail| detail.files.iter().map(|file| file.path.clone()).collect())
+                .unwrap_or_default();
+            let review = this
+                .active_review()
+                .map(|review| review.files.clone())
+                .unwrap_or_default();
+            (pull_request, review)
+        })
+    };
+
+    // Reviewing starts on the first page; the rest comes after.
+    press(cx, "1 r");
+    assert_eq!(lists(cx).1, ["a.rs", "b.rs", "c.rs"]);
+    // Page 3 before page 2: held back, so nothing shifts.
+    land(cx, 3, &["e.rs"]);
+    assert_eq!(lists(cx).0, ["a.rs", "b.rs", "c.rs"]);
+    // Page 2 lets both in, in GitHub's order, in both lists.
+    land(cx, 2, &["d.rs", "b.rs"]);
+    let expected = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"];
+    assert_eq!(
+        lists(cx),
+        (
+            expected.map(String::from).to_vec(),
+            expected.map(String::from).to_vec()
+        )
+    );
+    press(cx, "q");
+}
+
+#[gpui::test]
+fn pull_request_files_move_only_the_highlight_until_a_diff_is_asked_for(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    // Its commits are local already, as the prefetch leaves them.
+    seed_three_file_pull_request(cx, &view);
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        sync_store_snapshot(cx, &view);
+        cx.update(|_window, app| {
+            match view.read(app).main_pane.read(app).state.repos[0]
+                .diff_state
+                .diff_target
+                .as_ref()
+            {
+                Some(DiffTarget::CommitRange { path, .. }) => path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                _ => None,
+            }
+        })
+    };
+
+    press(cx, "1 3 j j");
+    assert_eq!(shown(cx), None);
+    press(cx, "enter");
+    assert_eq!(shown(cx).as_deref(), Some("b.rs"));
+    // Once asked for, the diff follows the highlight.
+    press(cx, "3 j");
+    assert_eq!(shown(cx).as_deref(), Some("c.rs"));
+}

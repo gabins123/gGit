@@ -97,10 +97,9 @@ pub(in super::super) struct DetailsPaneView {
     /// views that have no status section to focus.
     pub(in super::super) panel_focus_handle: FocusHandle,
     /// The pull request view's files, checks and conversation.
-    pull_request_scroll: ScrollHandle,
-    /// What that view last scrolled for, so a new pull request starts at the
-    /// top and `j`/`k` keep the selected file in sight.
-    pull_request_scrolled: (u64, Option<usize>),
+    pull_request_list: gpui::ListState,
+    /// The pull request that list last showed, and its selected file.
+    pull_request_rows: Option<(Arc<crate::github::PullRequestDetail>, Option<usize>)>,
 
     pub(in super::super) untracked_scroll: UniformListScrollHandle,
     pub(in super::super) unstaged_scroll: UniformListScrollHandle,
@@ -550,8 +549,8 @@ impl DetailsPaneView {
             status_section_resize: None,
             status_section_focus_handles: std::array::from_fn(|_| cx.focus_handle()),
             panel_focus_handle: cx.focus_handle().tab_index(0).tab_stop(false),
-            pull_request_scroll: ScrollHandle::new(),
-            pull_request_scrolled: (0, None),
+            pull_request_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(400.0)),
+            pull_request_rows: None,
             untracked_scroll: UniformListScrollHandle::default(),
             unstaged_scroll: UniformListScrollHandle::default(),
             staged_scroll: UniformListScrollHandle::default(),
@@ -2854,11 +2853,9 @@ impl DetailsPaneView {
         direction: i8,
         cx: &mut gpui::Context<Self>,
     ) {
-        let handle = &self.pull_request_scroll;
-        let page = handle.bounds().size.height * 0.8;
-        let mut offset = handle.offset();
-        offset.y = (offset.y - page * f32::from(direction)).clamp(-handle.max_offset().y, px(0.0));
-        handle.set_offset(offset);
+        let list = &self.pull_request_list;
+        let page = list.viewport_bounds().size.height * 0.8;
+        list.scroll_by(page * f32::from(direction));
         cx.notify();
     }
 
@@ -2872,7 +2869,7 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (detail, number, selected_file, fetching) = {
+        let (detail, number, selected_file, fetching, listing, files_error) = {
             let root = root.read(cx);
             let Some(prs) = root.active_pull_requests() else {
                 return div().into_any_element();
@@ -2881,7 +2878,9 @@ impl DetailsPaneView {
                 prs.detail.clone(),
                 prs.selected.unwrap_or_default(),
                 prs.selected_file,
-                matches!(prs.diff_base, PrLoad::Loading),
+                prs.diff_asked && matches!(prs.diff_base, PrLoad::Loading),
+                prs.files_listing(),
+                prs.files_error.clone(),
             )
         };
         let detail = match detail {
@@ -2924,69 +2923,6 @@ impl DetailsPaneView {
             Some(false) => "Has conflicts",
             None => "Checking for conflicts",
         };
-        if self.pull_request_scrolled.0 != number {
-            self.pull_request_scroll.set_offset(point(px(0.0), px(0.0)));
-            self.pull_request_scrolled = (number, None);
-        }
-        if selected_file.is_some() && self.pull_request_scrolled.1 != selected_file {
-            // Files are the scroll area's first children, so a file's index is
-            // its item index.
-            if let Some(ix) = selected_file {
-                self.pull_request_scroll.scroll_to_item(ix);
-            }
-            self.pull_request_scrolled.1 = selected_file;
-        }
-        let section_title = |text: String| {
-            div()
-                .px_3()
-                .pt_3()
-                .pb_1()
-                .text_size(theme.ui_text(12.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(text)
-        };
-        let check_rows = detail.check_runs.iter().map(|run| {
-            use crate::github::CheckState;
-            let (mark, color) = match run.state {
-                CheckState::Failing => ("✗", theme.colors.status.danger.foreground),
-                CheckState::Pending => ("•", theme.colors.status.warning.foreground),
-                CheckState::Passing => ("✓", theme.colors.status.success.foreground),
-            };
-            div()
-                .px_3()
-                .flex()
-                .gap_2()
-                .text_size(theme.ui_text(12.0))
-                .child(div().flex_none().text_color(color).child(mark))
-                .child(div().min_w(px(0.0)).truncate().child(run.name.clone()))
-        });
-        // GitHub text from anyone who can comment: plain text only.
-        let conversation_rows = detail.conversation.iter().map(|entry| {
-            div()
-                .px_3()
-                .py_1()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_size(theme.ui_text(11.0))
-                        .text_color(secondary)
-                        .child(format!(
-                            "{} {} · {}",
-                            entry.author,
-                            entry.verb,
-                            entry.at.get(..10).unwrap_or(&entry.at)
-                        )),
-                )
-                .when(!entry.body.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .text_size(theme.ui_text(12.0))
-                            .child(entry.body.clone()),
-                    )
-                })
-        });
         let checks = detail.checks;
         let checks_line = if checks.total() == 0 {
             "No checks".to_string()
@@ -2997,8 +2933,152 @@ impl DetailsPaneView {
             )
         };
 
-        let files = detail.files.iter().enumerate().map(|(ix, file)| {
+        // A file row: its text and the air around it.
+        let scale = crate::ui_scale::UiScale::current(cx);
+        let row_height = scale.px(6.0) + scale.ui_text(12.0) * 1.618;
+        self.sync_pull_request_list(&detail, selected_file, row_height);
+        let listing_line = if listing {
+            Some(format!(
+                "Listing files… {} of {}",
+                detail.files.len(),
+                detail.changed_files
+            ))
+        } else {
+            files_error.map(|err| format!("Some files couldn't be listed ({err}). R retries."))
+        };
+        let list = self.pull_request_list.clone();
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .gap_1()
+            .py_2()
+            .child(
+                div()
+                    .px_3()
+                    .text_size(theme.ui_text(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} #{}", detail.title, detail.number)),
+            )
+            .child(line(format!("{state} · {review} · {mergeable}")))
+            .child(line(format!(
+                "{} wants to merge {} into {}",
+                detail.author, detail.head, detail.base
+            )))
+            .child(line(checks_line))
+            .when(detail.too_large_for_app(), |panel| {
+                panel.child(line(format!(
+                    "GitHub lists only the first {} of its {} files, so it's reviewed there: o opens it.",
+                    crate::github::MAX_LISTED_FILES,
+                    detail.changed_files
+                )))
+            })
+            .when_some(listing_line, |panel, text| panel.child(line(text)))
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .text_size(theme.ui_text(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!(
+                        "Changed files ({})  +{} −{}",
+                        detail.changed_files, detail.additions, detail.deletions
+                    )),
+            )
+            // Only the rows in sight are laid out: a pull request can list
+            // thousands of files.
+            .child(
+                div()
+                    .id("pull_request_files")
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(
+                        gpui::list(
+                            list.clone(),
+                            cx.processor(|this, ix, _window, cx| {
+                                this.render_pull_request_item(ix, cx)
+                            }),
+                        )
+                        .size_full(),
+                    )
+                    .child(
+                        components::Scrollbar::new("pull_request_files_scrollbar", list)
+                            .auto_hide()
+                            .render(theme),
+                    ),
+            )
+            .child(line(if fetching {
+                "Fetching the pull request's commits…".to_string()
+            } else {
+                "enter diff · space checkout · r review · M merge · J/K scroll".to_string()
+            }))
+            .into_any_element()
+    }
+
+    /// Keeps the list's items in step with the pull request shown: pages of
+    /// files append under the scroll without moving it, another pull request
+    /// starts at the top, and `j`/`k` keep the selected file in sight.
+    fn sync_pull_request_list(
+        &mut self,
+        detail: &Arc<crate::github::PullRequestDetail>,
+        selected_file: Option<usize>,
+        row_height: Pixels,
+    ) {
+        let list = &self.pull_request_list;
+        let count = pull_request_item_count(detail);
+        let previous = self
+            .pull_request_rows
+            .replace((Arc::clone(detail), selected_file));
+        let moved = previous
+            .as_ref()
+            .is_some_and(|(_, was)| *was != selected_file);
+        // Every item counts as a file row until it's drawn, so a file far
+        // past the rows drawn so far can be scrolled to, and the scrollbar
+        // spans them all.
+        let reveal = match previous {
+            Some((shown, _)) if Arc::ptr_eq(&shown, detail) => false,
+            // More files, or a reload: the scroll stays where it is.
+            Some((shown, _)) if shown.number == detail.number => {
+                let top = list.logical_scroll_top();
+                list.reset_with_uniform_height(count, row_height);
+                list.scroll_to(top);
+                false
+            }
+            _ => {
+                list.reset_with_uniform_height(count, row_height);
+                true
+            }
+        };
+        if (reveal || moved)
+            && let Some(ix) = selected_file
+        {
+            list.scroll_to_reveal_item(ix);
+        }
+    }
+
+    /// One item of the pull request list: its files, then its checks and its
+    /// conversation, each under a title.
+    fn render_pull_request_item(&mut self, ix: usize, cx: &mut gpui::Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let secondary = theme.colors.foreground.secondary;
+        let Some((detail, selected_file)) = self.pull_request_rows.clone() else {
+            return div().into_any_element();
+        };
+        let section_title = |text: String| {
             div()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .text_size(theme.ui_text(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text)
+                .into_any_element()
+        };
+        if let Some(file) = detail.files.get(ix) {
+            return div()
                 .id(SharedString::from(format!("pull_request_file_{ix}")))
                 .flex()
                 .items_center()
@@ -3049,77 +3129,74 @@ impl DetailsPaneView {
                         .text_color(theme.colors.status.danger.foreground)
                         .child(format!("−{}", file.deletions)),
                 )
-        });
-
+                .into_any_element();
+        }
+        let mut ix = ix - detail.files.len();
+        if !detail.check_runs.is_empty() {
+            if ix == 0 {
+                return section_title(format!("Checks ({})", detail.check_runs.len()));
+            }
+            if let Some(run) = detail.check_runs.get(ix - 1) {
+                use crate::github::CheckState;
+                let (mark, color) = match run.state {
+                    CheckState::Failing => ("✗", theme.colors.status.danger.foreground),
+                    CheckState::Pending => ("•", theme.colors.status.warning.foreground),
+                    CheckState::Passing => ("✓", theme.colors.status.success.foreground),
+                };
+                return div()
+                    .px_3()
+                    .flex()
+                    .gap_2()
+                    .text_size(theme.ui_text(12.0))
+                    .child(div().flex_none().text_color(color).child(mark))
+                    .child(div().min_w(px(0.0)).truncate().child(run.name.clone()))
+                    .into_any_element();
+            }
+            ix -= detail.check_runs.len() + 1;
+        }
+        if detail.conversation.is_empty() {
+            return div().into_any_element();
+        }
+        if ix == 0 {
+            return section_title(format!("Conversation ({})", detail.conversation.len()));
+        }
+        let Some(entry) = detail.conversation.get(ix - 1) else {
+            return div().into_any_element();
+        };
+        // GitHub text from anyone who can comment: plain text only.
         div()
+            .px_3()
+            .py_1()
             .flex()
             .flex_col()
-            .size_full()
-            .min_h(px(0.0))
-            .gap_1()
-            .py_2()
+            .gap(px(2.0))
             .child(
                 div()
-                    .px_3()
-                    .text_size(theme.ui_text(15.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("{} #{}", detail.title, detail.number)),
-            )
-            .child(line(format!("{state} · {review} · {mergeable}")))
-            .child(line(format!(
-                "{} wants to merge {} into {}",
-                detail.author, detail.head, detail.base
-            )))
-            .child(line(checks_line))
-            .when(detail.too_large_for_app(), |panel| {
-                panel.child(line(format!(
-                    "Too large to review here ({} files, +{} −{}). o opens it on GitHub.",
-                    detail.changed_files, detail.additions, detail.deletions
-                )))
-            })
-            .child(
-                div()
-                    .px_3()
-                    .pt_2()
-                    .text_size(theme.ui_text(12.0))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(theme.ui_text(11.0))
+                    .text_color(secondary)
                     .child(format!(
-                        "Changed files ({})  +{} −{}",
-                        detail.changed_files, detail.additions, detail.deletions
+                        "{} {} · {}",
+                        entry.author,
+                        entry.verb,
+                        entry.at.get(..10).unwrap_or(&entry.at)
                     )),
             )
-            .child(
-                div()
-                    .id("pull_request_files")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.pull_request_scroll)
-                    .children(files)
-                    .when(!detail.check_runs.is_empty(), |list| {
-                        list.child(section_title(format!(
-                            "Checks ({})",
-                            detail.check_runs.len()
-                        )))
-                        .children(check_rows)
-                    })
-                    .when(!detail.conversation.is_empty(), |list| {
-                        list.child(section_title(format!(
-                            "Conversation ({})",
-                            detail.conversation.len()
-                        )))
-                        .children(conversation_rows)
-                    }),
-            )
-            .child(line(if fetching {
-                "Fetching the pull request's commits…".to_string()
-            } else {
-                "enter diff · space checkout · r review · M merge · J/K scroll".to_string()
-            }))
+            .when(!entry.body.is_empty(), |row| {
+                row.child(
+                    div()
+                        .text_size(theme.ui_text(12.0))
+                        .child(entry.body.clone()),
+                )
+            })
             .into_any_element()
     }
+}
+
+/// The pull request list's items: files, then checks and conversation, each
+/// with a title when there are any.
+fn pull_request_item_count(detail: &crate::github::PullRequestDetail) -> usize {
+    let section = |len: usize| if len == 0 { 0 } else { len + 1 };
+    detail.files.len() + section(detail.check_runs.len()) + section(detail.conversation.len())
 }
 
 impl Render for DetailsPaneView {

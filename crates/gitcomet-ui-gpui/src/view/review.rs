@@ -244,22 +244,6 @@ impl ReviewMode {
         self.files.get(self.file_ix).map(String::as_str)
     }
 
-    pub(super) fn comments_on(&self, path: &str) -> usize {
-        self.draft
-            .comments
-            .iter()
-            .filter(|comment| comment.anchor.path == path)
-            .count()
-    }
-
-    /// Threads on lines of `path`: the ones `t` reaches and Details shows.
-    pub(super) fn threads_on(&self, path: &str) -> usize {
-        self.threads
-            .iter()
-            .filter(|thread| thread.path == path && thread.line.is_some())
-            .count()
-    }
-
     /// Lays GitHub's viewed marks (the answer to load `seq`) over this
     /// review: GitHub's viewed set replaces the one here, then the presses it
     /// doesn't have yet go on top. An unsynced press made at another head is
@@ -328,12 +312,6 @@ impl ReviewMode {
     /// Threads whose lines changed since they were written, in file order.
     pub(super) fn outdated_threads(&self) -> impl Iterator<Item = &ReviewThread> {
         self.threads.iter().filter(|thread| thread.outdated())
-    }
-
-    pub(super) fn outdated_on(&self, path: &str) -> usize {
-        self.outdated_threads()
-            .filter(|thread| thread.path == path)
-            .count()
     }
 
     /// With `L` on and what changed known: your last review's commit, which
@@ -471,6 +449,22 @@ impl GitCometView {
             })
     }
 
+    /// Whether the review's files past the first 100 are still being listed:
+    /// until then `files` isn't the whole pull request.
+    pub(super) fn review_files_listing(&self) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| self.pull_request_files_listing(review.repo_id, review.number))
+    }
+
+    /// Some of the review's files couldn't be listed; `R` lists them again.
+    pub(super) fn review_files_missing(&self) -> bool {
+        self.review.as_ref().is_some_and(|review| {
+            self.pull_request_files_error(review.repo_id, review.number)
+                .is_some()
+        })
+    }
+
     /// Where the review's diff starts: your last review's commit while `L`
     /// shows the changes since it, else the pull request's merge base.
     /// `None` while neither is known.
@@ -515,7 +509,10 @@ impl GitCometView {
         if detail.too_large_for_app() || detail.files.is_empty() {
             self.push_toast(
                 components::ToastKind::Warning,
-                format!("#{number} is too large to review here. Press o to open it on GitHub."),
+                format!(
+                    "#{number} has more files than GitHub lists ({}). Press o to review it on GitHub.",
+                    crate::github::MAX_LISTED_FILES
+                ),
                 cx,
             );
             return;
@@ -755,10 +752,32 @@ impl GitCometView {
         review.file_ix = ix;
         review.pending_jump = None;
         review.needs_cursor = true;
+        let (repo_id, path) = (review.repo_id, review.files[ix].clone());
         self.review_follow_head(cx);
         self.review_load_hunk_ranges(cx);
         self.sync_review_marks(cx);
-        self.open_pull_request_diff(Some(ix), cx);
+        // By path: review mode's list and the pull request's are the same,
+        // but a reload at a new head can change the latter under it. A file
+        // it no longer has shows no diff rather than another file's.
+        let detail_ix = self
+            .pull_requests
+            .repo(repo_id)
+            .and_then(|prs| prs.detail.ready())
+            .and_then(|detail| detail.files.iter().position(|file| file.path == path));
+        if let Some(detail_ix) = detail_ix {
+            self.open_pull_request_diff(Some(detail_ix), cx);
+        } else {
+            // The last file's diff would carry this one's marks.
+            self.store.dispatch(Msg::ClearDiffSelection { repo_id });
+            let message = if self.review_files_listing() {
+                format!("{path} is still being listed; try again in a moment.")
+            } else if self.review_files_missing() {
+                format!("{path} couldn't be listed; R lists it again.")
+            } else {
+                format!("{path} isn't part of this pull request any more.")
+            };
+            self.push_toast(components::ToastKind::Warning, message, cx);
+        }
         self.notify_pull_request_panes(cx);
     }
 
@@ -781,6 +800,8 @@ impl GitCometView {
     /// is the whole pull request.
     fn review_toggle_only_changed(&mut self, cx: &mut gpui::Context<Self>) {
         use super::pull_requests::PrLoad;
+        let listing = self.review_files_listing();
+        let missing = self.review_files_missing();
         let Some(review) = self.review.as_mut() else {
             return;
         };
@@ -800,6 +821,20 @@ impl GitCometView {
             }
             (_, Some(SinceReview::Failed(_))) => {
                 Some("Couldn't work out what changed since your last review.")
+            }
+            (_, Some(SinceReview::Changed(_)))
+                if review.files_changed_since_review() == 0 && listing =>
+            {
+                Some(
+                    "None of the files listed so far changed since your last review; the rest are still being listed.",
+                )
+            }
+            (_, Some(SinceReview::Changed(_)))
+                if review.files_changed_since_review() == 0 && missing =>
+            {
+                Some(
+                    "None of the files listed changed since your last review, but some couldn't be listed: R lists them again.",
+                )
             }
             (_, Some(SinceReview::Changed(_))) if review.files_changed_since_review() == 0 => {
                 Some("None of this pull request's files changed since your last review.")
@@ -1079,6 +1114,7 @@ impl GitCometView {
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
+                let listing = this.pull_request_files_listing(repo_id, number);
                 let Some(review) = this.review.as_mut().filter(|review| {
                     review.repo_id == repo_id
                         && review.number == number
@@ -1093,8 +1129,9 @@ impl GitCometView {
                     Err(crate::github::SinceFailure::Failed(why)) => SinceReview::Failed(why),
                 };
                 review.since_review = Some(since);
-                // `L` with nothing left to show would be an empty list.
-                review.only_changed &= review.files_changed_since_review() > 0;
+                // `L` with nothing left to show would be an empty list, unless
+                // files still being listed may yet fill it.
+                review.only_changed &= listing || review.files_changed_since_review() > 0;
                 this.review_refresh(cx);
             });
         })
@@ -2098,11 +2135,17 @@ impl GitCometView {
             return;
         }
         let Some(file_ix) = review.files.iter().position(|path| *path == anchor.path) else {
-            self.push_toast(
-                components::ToastKind::Warning,
-                format!("{} isn't part of this pull request any more.", anchor.path),
-                cx,
-            );
+            let message = if self.review_files_listing() {
+                format!(
+                    "{} is still being listed; try again once the file list is in.",
+                    anchor.path
+                )
+            } else if self.review_files_missing() {
+                format!("{} couldn't be listed; R lists it again.", anchor.path)
+            } else {
+                format!("{} isn't part of this pull request any more.", anchor.path)
+            };
+            self.push_toast(components::ToastKind::Warning, message, cx);
             return;
         };
         if file_ix != review.file_ix {

@@ -548,6 +548,7 @@ impl GitCometView {
                         "Filter the file list: fuzzy words, .rs for a type; esc clears",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    ("R", "Retry the files that failed to list"),
                     ("enter", "Go to the diff"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
@@ -615,7 +616,7 @@ impl GitCometView {
                         ("S", "Quick review: just a verdict and summary"),
                         ("M", "Merge it on GitHub"),
                         ("o", "Open on GitHub"),
-                        ("R", "Refresh the list"),
+                        ("R", "Refresh the list; retry files that failed to list"),
                         ("[ / ]", "Branches / Files / Pull requests tab"),
                     ];
                 }
