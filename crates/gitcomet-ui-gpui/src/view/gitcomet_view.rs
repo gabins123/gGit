@@ -1622,6 +1622,7 @@ impl GitCometView {
             focus_this_render: None,
             focus_prev_render: None,
             armed_branch_key: None,
+            review: None,
             _focus_lost_subscription: focus_lost_subscription,
             sidebar_width_design: initial_sidebar_width_design,
             details_width_design: initial_details_width_design,

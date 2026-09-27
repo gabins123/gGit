@@ -1,5 +1,6 @@
 use crate::msg::RepoCommandKind;
 use crate::msg::RepoPath;
+use crate::msg::RepoPathList;
 use crate::session;
 use gitcomet_core::conflict_session::{
     ConflictPayload, ConflictSession, ConflictStageParts, canonicalize_stage_parts,
@@ -1748,6 +1749,9 @@ pub struct RepoState {
     /// least one `FileStatusKind::Conflicted` entry. Recomputed in
     /// `set_worktree_status` and `set_status`.
     pub has_unstaged_conflicts: bool,
+    /// Stage/unstage requests still running, overlaid on every status that
+    /// lands so rows flip immediately and a stale load cannot flip them back.
+    pub pending_index_ops: VecDeque<PendingIndexOp>,
     pub log: Loadable<Shared<LogPage>>,
     pub log_loading_more: bool,
     pub log_rev: u64,
@@ -1867,6 +1871,7 @@ impl RepoState {
             status_rev: 0,
             head_gitlink_paths: FxHashSet::default(),
             has_unstaged_conflicts: false,
+            pending_index_ops: VecDeque::new(),
             log: Loadable::NotLoaded,
             log_loading_more: false,
             log_rev: 0,
@@ -2243,6 +2248,71 @@ impl RepoState {
         }
         self.status = status;
         self.status_rev = self.status_rev.wrapping_add(1);
+    }
+
+    /// Records a stage/unstage request and flips its rows right away.
+    pub(crate) fn begin_pending_index_op(&mut self, stage: bool, paths: RepoPathList) {
+        let mut op = PendingIndexOp {
+            stage,
+            paths: Arc::new(paths.as_slice().iter().cloned().collect()),
+            moved: Arc::default(),
+        };
+        if let (Loadable::Ready(unstaged), Loadable::Ready(staged)) =
+            (&self.worktree_status, &self.staged_status)
+        {
+            let (mut unstaged, mut staged) = (unstaged.as_ref().clone(), staged.as_ref().clone());
+            op.moved = op.apply(&mut unstaged, &mut staged).into();
+            self.set_worktree_status(Loadable::Ready(unstaged));
+            self.set_staged_status(Loadable::Ready(staged));
+        }
+        self.pending_index_ops.push_back(op);
+    }
+
+    /// Index writers run FIFO per repo, so finishes arrive in request order
+    /// and each one retires the oldest op. A retired op is never replayed: its
+    /// `moved` rows would otherwise hide a later external change to its paths.
+    pub(crate) fn finish_pending_index_op(&mut self) {
+        self.pending_index_ops.pop_front();
+    }
+
+    pub(crate) fn overlay_pending_index_ops(&self, status: RepoStatus) -> RepoStatus {
+        if self.pending_index_ops.is_empty() {
+            return status;
+        }
+        let mut unstaged = status.unstaged.as_ref().clone();
+        let mut staged = status.staged.as_ref().clone();
+        for op in &self.pending_index_ops {
+            op.apply(&mut unstaged, &mut staged);
+        }
+        RepoStatus {
+            staged: Arc::new(staged),
+            unstaged: Arc::new(unstaged),
+        }
+    }
+
+    /// Overlays one freshly loaded lane, pairing it with the other lane as
+    /// currently shown.
+    pub(crate) fn overlay_pending_index_ops_lane(
+        &self,
+        lane: Vec<FileStatus>,
+        staged_lane: bool,
+    ) -> Vec<FileStatus> {
+        if self.pending_index_ops.is_empty() {
+            return lane;
+        }
+        let current = |l: &Loadable<Arc<Vec<FileStatus>>>| match l {
+            Loadable::Ready(entries) => entries.as_ref().clone(),
+            _ => Vec::new(),
+        };
+        let (mut unstaged, mut staged) = if staged_lane {
+            (current(&self.worktree_status), lane)
+        } else {
+            (lane, current(&self.staged_status))
+        };
+        for op in &self.pending_index_ops {
+            op.apply(&mut unstaged, &mut staged);
+        }
+        if staged_lane { staged } else { unstaged }
     }
 
     pub fn worktree_status_entries(&self) -> Option<&[FileStatus]> {
@@ -2904,6 +2974,92 @@ impl RepoState {
         self.history_state.indexed.cancel();
         self.history_state.authors.cancellation.cancel();
         previous
+    }
+}
+
+/// A stage or unstage request whose backend action has not finished yet.
+#[derive(Clone, Debug)]
+pub struct PendingIndexOp {
+    pub stage: bool,
+    /// Empty means every path, like `git add -A` / `git reset`.
+    paths: Arc<FxHashSet<PathBuf>>,
+    /// Entries moved when the op was requested, already converted for the
+    /// target lane and sorted by path. Re-inserted on single-lane loads whose
+    /// source lane is the already-overlaid one and so no longer holds them.
+    moved: Arc<[FileStatus]>,
+}
+
+impl PendingIndexOp {
+    fn matches(&self, path: &std::path::Path) -> bool {
+        self.paths.is_empty() || path.ancestors().any(|p| self.paths.contains(p))
+    }
+
+    /// Moves matching entries between lanes (both sorted by path, unique) and
+    /// returns the moved entries. Conflicts, and staged renames (two paths),
+    /// are left to the real status.
+    fn apply(
+        &self,
+        unstaged: &mut Vec<FileStatus>,
+        staged: &mut Vec<FileStatus>,
+    ) -> Vec<FileStatus> {
+        let (from, to) = if self.stage {
+            (unstaged, staged)
+        } else {
+            (staged, unstaged)
+        };
+        let mut removed = Vec::new();
+        from.retain(|e| {
+            let movable = e.conflict.is_none()
+                && e.kind != FileStatusKind::Conflicted
+                && (self.stage || e.kind != FileStatusKind::Renamed);
+            if !movable || !self.matches(&e.path) {
+                return true;
+            }
+            let kind = match (self.stage, e.kind) {
+                (true, FileStatusKind::Untracked) => FileStatusKind::Added,
+                (false, FileStatusKind::Added) => FileStatusKind::Untracked,
+                (_, kind) => kind,
+            };
+            removed.push(FileStatus {
+                path: e.path.clone(),
+                kind,
+                conflict: None,
+            });
+            false
+        });
+        let adds = merge_by_path(removed.iter().cloned(), self.moved.iter().cloned());
+        if !adds.is_empty() {
+            let kept = std::mem::take(to);
+            // Rows already in the target lane win over moved ones.
+            *to = merge_by_path(kept.into_iter(), adds.into_iter());
+        }
+        removed
+    }
+}
+
+/// One sorted merge of two path-sorted, path-unique lists; on equal paths the
+/// row from `a` is kept.
+fn merge_by_path(
+    a: impl ExactSizeIterator<Item = FileStatus>,
+    b: impl ExactSizeIterator<Item = FileStatus>,
+) -> Vec<FileStatus> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.peekable(), b.peekable());
+    loop {
+        let order = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => x.path.cmp(&y.path),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => return out,
+        };
+        match order {
+            std::cmp::Ordering::Less => out.extend(a.next()),
+            std::cmp::Ordering::Greater => out.extend(b.next()),
+            std::cmp::Ordering::Equal => {
+                out.extend(a.next());
+                b.next();
+            }
+        }
     }
 }
 

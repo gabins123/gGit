@@ -41,7 +41,9 @@ fn status_navigation_section_for_target(
     match area {
         DiffArea::Staged => Some(StatusSection::Staged),
         DiffArea::Unstaged => match change_tracking_view {
-            ChangeTrackingView::Combined => Some(StatusSection::CombinedUnstaged),
+            ChangeTrackingView::Combined | ChangeTrackingView::Unified => {
+                Some(StatusSection::CombinedUnstaged)
+            }
             ChangeTrackingView::SplitUntracked => status
                 .unstaged
                 .iter()
@@ -109,7 +111,9 @@ pub(super) fn status_navigation_section(
     Some(match area {
         DiffArea::Staged => StatusSection::Staged,
         DiffArea::Unstaged => match change_tracking_view {
-            ChangeTrackingView::Combined => StatusSection::CombinedUnstaged,
+            ChangeTrackingView::Combined | ChangeTrackingView::Unified => {
+                StatusSection::CombinedUnstaged
+            }
             ChangeTrackingView::SplitUntracked => {
                 let entry = repo.status_entry_for_path(DiffArea::Unstaged, path)?;
                 if entry.kind == gitcomet_core::domain::FileStatusKind::Untracked {
@@ -353,6 +357,10 @@ impl MainPaneView {
             return true;
         }
 
+        if let Some(moved) = self.step_changes(repo_id, direction, focus_diff_panel, window, cx) {
+            return moved;
+        }
+
         let commit_file_source_indices = self
             .root_view
             .update(cx, |root, cx| {
@@ -492,9 +500,20 @@ impl MainPaneView {
             return true;
         }
 
+        if self.active_change_tracking_view(cx) == ChangeTrackingView::Unified {
+            let Some((path, lanes)) = self
+                .changes_drawn(repo_id, cx)
+                .and_then(|drawn| drawn.into_iter().next())
+            else {
+                return false;
+            };
+            self.open_change(repo_id, path, lanes, cx);
+            return true;
+        }
+
         // Sections in the order Details draws them.
         let sections: &[StatusSection] = match self.active_change_tracking_view(cx) {
-            ChangeTrackingView::Combined => {
+            ChangeTrackingView::Combined | ChangeTrackingView::Unified => {
                 &[StatusSection::CombinedUnstaged, StatusSection::Staged]
             }
             ChangeTrackingView::SplitUntracked => &[
@@ -538,6 +557,248 @@ impl MainPaneView {
             return true;
         }
         false
+    }
+
+    /// The Changes list's files in drawn order. Details owns its sort, filter
+    /// and layout, so navigation asks it rather than re-deriving them.
+    fn changes_drawn(
+        &self,
+        repo_id: RepoId,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<Vec<(std::path::PathBuf, crate::view::panes::ChangeLanes)>> {
+        self.root_view
+            .update(cx, |root, cx| {
+                root.details_pane.read(cx).changes_drawn(repo_id)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Opens a Changes file's diff, in the lane it opens in, and scrolls its
+    /// row into view.
+    fn open_change(
+        &mut self,
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        lanes: crate::view::panes::ChangeLanes,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.details_pane
+                .update(cx, |pane, cx| pane.reveal_changes_path(&path, cx));
+        });
+        let area = lanes.area();
+        if lanes.conflicted() && area == DiffArea::Unstaged {
+            self.store
+                .dispatch(Msg::SelectConflictDiff { repo_id, path });
+        } else {
+            self.store.dispatch(Msg::SelectDiff {
+                repo_id,
+                target: DiffTarget::WorkingTree { path, area },
+            });
+        }
+    }
+
+    /// The open working-tree file, while Details shows the one list.
+    pub(in crate::view) fn open_change_path(
+        &self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<std::path::PathBuf> {
+        if self.active_change_tracking_view(cx) != ChangeTrackingView::Unified {
+            return None;
+        }
+        match self.active_repo()?.diff_state.diff_target.as_ref()? {
+            DiffTarget::WorkingTree { path, .. } => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// The Changes file `direction` steps to from `path`, as Details draws the
+    /// list.
+    pub(in crate::view) fn changes_neighbor(
+        &self,
+        repo_id: RepoId,
+        path: &std::path::Path,
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<(std::path::PathBuf, crate::view::panes::ChangeLanes)> {
+        self.root_view
+            .update(cx, |root, cx| {
+                root.details_pane
+                    .read(cx)
+                    .changes_neighbor(repo_id, path, direction)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Stages or unstages a working-tree file the one-list way: the row
+    /// keeps its place and the diff follows the file to its new lane. `want`
+    /// narrows it to one direction (Ctrl+S / Ctrl+U); `None` toggles.
+    pub(in crate::view) fn flip_change(
+        &mut self,
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        area: DiffArea,
+        want: Option<bool>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // A range selected in the Changes list is what the key acts on.
+        let selection = self
+            .root_view
+            .update(cx, |root, cx| {
+                root.details_pane.read(cx).changes_selection(repo_id)
+            })
+            .ok()
+            .flatten();
+        if let Some(selection) = selection {
+            // Conflicts are resolved one at a time, never by a bulk stage.
+            let files = selection
+                .iter()
+                .filter(|(_, lanes)| !lanes.conflicted())
+                .map(|(path, lanes)| (path.as_path(), *lanes));
+            let Some((stage, paths)) = crate::view::panes::toggle_plan(files, want, false) else {
+                return;
+            };
+            let next_area = if stage {
+                if self.confirm_stage_conflict_markers(
+                    repo_id,
+                    DiffArea::Unstaged,
+                    paths.clone(),
+                    false,
+                    window,
+                    cx,
+                ) {
+                    return;
+                }
+                self.store.dispatch(Msg::StagePaths {
+                    repo_id,
+                    paths: paths.clone().into(),
+                });
+                DiffArea::Staged
+            } else {
+                self.store.dispatch(Msg::UnstagePaths {
+                    repo_id,
+                    paths: paths.clone().into(),
+                });
+                DiffArea::Unstaged
+            };
+            if next_area != area && paths.contains(&path) {
+                self.store.dispatch(Msg::SelectDiff {
+                    repo_id,
+                    target: DiffTarget::WorkingTree {
+                        path,
+                        area: next_area,
+                    },
+                });
+            }
+            self.rebuild_diff_cache(cx);
+            return;
+        }
+        let Some(lanes) = self
+            .active_repo()
+            .map(|repo| crate::view::panes::ChangeLanes::of(repo, &path))
+        else {
+            return;
+        };
+        let next_area = if want.unwrap_or(lanes.stages()) {
+            if !lanes.stages()
+                || self.confirm_stage_conflict_markers(
+                    repo_id,
+                    DiffArea::Unstaged,
+                    vec![path.clone()],
+                    false,
+                    window,
+                    cx,
+                )
+            {
+                return;
+            }
+            self.store.dispatch(Msg::StagePath {
+                repo_id,
+                path: path.clone(),
+            });
+            DiffArea::Staged
+        } else {
+            if lanes.staged.is_none() {
+                return;
+            }
+            self.store.dispatch(Msg::UnstagePath {
+                repo_id,
+                path: path.clone(),
+            });
+            DiffArea::Unstaged
+        };
+        if next_area != area {
+            self.store.dispatch(Msg::SelectDiff {
+                repo_id,
+                target: DiffTarget::WorkingTree {
+                    path,
+                    area: next_area,
+                },
+            });
+        }
+        self.rebuild_diff_cache(cx);
+    }
+
+    /// Shift+J/K: grows or shrinks the selected range, the open file being
+    /// the end that moves; the first press anchors it at the open file.
+    pub(in crate::view) fn extend_changes_selection(
+        &mut self,
+        repo_id: RepoId,
+        direction: i8,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(path) = self.open_change_path(cx) else {
+            return false;
+        };
+        let Some((next, lanes)) = self.changes_neighbor(repo_id, &path, direction, cx) else {
+            return false;
+        };
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.details_pane.update(cx, |pane, cx| {
+                pane.extend_changes_range(repo_id, path, next.clone(), cx)
+            });
+        });
+        self.open_change(repo_id, next, lanes, cx);
+        true
+    }
+
+    /// `j`/`k` and F1/F4 over the Changes list. `None` when the list isn't
+    /// what's showing, or the open diff isn't one of the working tree's.
+    fn step_changes(
+        &mut self,
+        repo_id: RepoId,
+        direction: i8,
+        focus_diff_panel: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<bool> {
+        if self.active_change_tracking_view(cx) != ChangeTrackingView::Unified {
+            return None;
+        }
+        let DiffTarget::WorkingTree { path, .. } =
+            self.active_repo()?.diff_state.diff_target.as_ref()?
+        else {
+            return None;
+        };
+        let path = path.clone();
+        let Some((path, lanes)) = self.changes_neighbor(repo_id, &path, direction, cx) else {
+            return Some(false);
+        };
+        if focus_diff_panel {
+            window.focus(&self.diff_panel_focus_handle, cx);
+        }
+        self.clear_status_multi_selection(repo_id, cx);
+        // A plain step drops the range selection.
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.details_pane
+                .update(cx, |pane, cx| pane.clear_changes_range(cx));
+        });
+        self.open_change(repo_id, path, lanes, cx);
+        Some(true)
     }
 
     pub(in crate::view) fn try_select_adjacent_diff_file_preserving_focus(

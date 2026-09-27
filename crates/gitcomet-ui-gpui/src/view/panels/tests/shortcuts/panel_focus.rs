@@ -55,6 +55,21 @@ fn press(cx: &mut gpui::VisualTestContext, keys: &str) {
     draw_and_drain_test_window(cx);
 }
 
+/// A full press and release: a focused button clicks on the key-up, which
+/// `simulate_keystrokes` never sends.
+fn tap(cx: &mut gpui::VisualTestContext, key: &str) {
+    cx.simulate_keystrokes(key);
+    cx.update(|window, app| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).expect("valid key"),
+            }),
+            app,
+        );
+    });
+    draw_and_drain_test_window(cx);
+}
+
 fn focused(cx: &mut gpui::VisualTestContext, view: &View) -> Option<FocusPanel> {
     cx.update(|window, app| view.read(app).focused_panel(window, app))
 }
@@ -102,8 +117,8 @@ fn number_keys_focus_panels_and_open_collapsed_ones(cx: &mut gpui::TestAppContex
         press(cx, key);
         assert_eq!(focused(cx, &view), Some(panel), "after {key}");
     }
-    // No diff is open, so there is nothing for 3 to focus.
-    press(cx, "3");
+    // 3 is Details as well: its number now that History and the diff share 2.
+    press(cx, "2 3");
     assert_eq!(focused(cx, &view), Some(Details));
 
     cx.update(|_window, app| view.update(app, |this, cx| this.set_sidebar_collapsed(true, cx)));
@@ -246,10 +261,12 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
                     title: "Keyboard nav".into(),
                     author: "someone".into(),
                     head: "feat".into(),
+                    head_owner: "someone".into(),
                     base: "main".into(),
                     is_draft: false,
                     review: None,
                     checks: Default::default(),
+                    review_requested: false,
                 }],
                 Some(7),
             );
@@ -264,7 +281,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
         number: 7,
         kind: crate::github::ReviewKind::Comment,
     };
-    press(cx, "r");
+    press(cx, "shift-s");
     assert!(popover_open(cx, &view, &review));
     // An empty comment can't post, so this is a no-op rather than a gh call.
     press(cx, "secondary-enter");
@@ -277,9 +294,49 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
     assert!(popover_open(
         cx,
         &view,
-        &PopoverKind::CreatePullRequest { repo_id: REPO }
+        &PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: None,
+        }
     ));
     press(cx, "escape");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+
+    // Merging opens a confirm dialog whose method switches on Alt chords;
+    // nothing reaches gh until Enter.
+    let merge = |method| PopoverKind::MergePullRequest {
+        repo_id: REPO,
+        number: 7,
+        method,
+    };
+    press(cx, "shift-m");
+    assert!(popover_open(
+        cx,
+        &view,
+        &merge(crate::github::MergeMethod::Merge)
+    ));
+    press(cx, "alt-s");
+    assert!(popover_open(
+        cx,
+        &view,
+        &merge(crate::github::MergeMethod::Squash)
+    ));
+    let submit_error = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_pull_requests()
+                .and_then(|prs| prs.submit_error.clone())
+        })
+    };
+    // Space is the checkout key, not a second way to merge.
+    tap(cx, "space");
+    assert_eq!(submit_error(cx), None);
+    // Enter merges, but only onto a head the details have shown; they never
+    // loaded here, so it stops before gh.
+    tap(cx, "enter");
+    assert!(submit_error(cx).is_some_and(|error| error.contains("still loading")));
+    press(cx, "escape");
+    assert!(!popover_is_open(cx, &view));
     assert_eq!(focused(cx, &view), Some(Sidebar));
 }
 
@@ -488,4 +545,1094 @@ fn enter_from_details_opens_the_diff_and_escape_comes_back(cx: &mut gpui::TestAp
     wait_until(cx, "focus back on Details", |cx| {
         diff_path(cx, &view).is_none() && focused(cx, &view) == Some(Details)
     });
+}
+
+#[gpui::test]
+fn shift_o_on_a_branch_sets_up_a_pull_request_from_it(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+        name: "origin".into(),
+        url: Some("https://github.com/owner/repo.git".into()),
+    }]));
+    repo.remotes_rev = 1;
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    let _ = select_feature_branch(cx, &view);
+    assert_key_opens(
+        cx,
+        &view,
+        "shift-o",
+        PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: Some("feature".into()),
+        },
+        Sidebar,
+    );
+    // `o` goes straight to GitHub, which needs the branch there; this one was
+    // never pushed, so it only says so.
+    press(cx, "o");
+    assert!(!popover_is_open(cx, &view));
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+}
+
+#[gpui::test]
+fn review_mode_walks_files_keeps_comments_and_leaves_with_q(cx: &mut gpui::TestAppContext) {
+    use crate::github::{ReviewAnchor, ReviewSide};
+
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let file = |path: &str| crate::github::PullRequestFile {
+        path: path.into(),
+        additions: 1,
+        deletions: 0,
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_pull_requests_for_test(REPO, vec![], Some(7));
+            this.seed_pull_request_detail_for_test(
+                REPO,
+                crate::github::PullRequestDetail {
+                    number: 7,
+                    title: "Keyboard nav".into(),
+                    body: String::new(),
+                    url: String::new(),
+                    author: "someone".into(),
+                    head: "feat".into(),
+                    head_oid: "a".repeat(40),
+                    base: "main".into(),
+                    base_oid: "b".repeat(40),
+                    is_draft: false,
+                    is_cross_repository: false,
+                    state: "OPEN".into(),
+                    review: None,
+                    mergeable: None,
+                    additions: 2,
+                    deletions: 0,
+                    changed_files: 2,
+                    files: vec![file("a.rs"), file("b.rs")],
+                    checks: Default::default(),
+                    check_runs: vec![],
+                    conversation: vec![],
+                },
+                "c".repeat(40),
+            );
+        })
+    });
+    apply_state(cx, &view, pull_request_state());
+    let review = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app).active_review().map(|review| {
+                (
+                    review.file_ix,
+                    review.draft.viewed.len(),
+                    review.draft.comments.len(),
+                )
+            })
+        })
+    };
+
+    press(cx, "1 r");
+    assert_eq!(review(cx), Some((0, 0, 0)));
+    press(cx, "1 ]");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(1));
+    // Viewed, then on to the first file still unviewed.
+    press(cx, "space");
+    assert_eq!(review(cx), Some((0, 1, 0)));
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.add_review_comment(
+                REPO,
+                7,
+                ReviewAnchor {
+                    path: "a.rs".into(),
+                    side: ReviewSide::Right,
+                    line: 1,
+                    start: None,
+                },
+                "Nit".into(),
+                None,
+                None,
+                cx,
+            );
+        })
+    });
+    assert_eq!(review(cx).map(|(.., comments)| comments), Some(1));
+    // The composer: typing, alt+s for the selected lines as a suggestion,
+    // then ctrl+enter lands the comment in the review.
+    let b_line_2 = ReviewAnchor {
+        path: "b.rs".into(),
+        side: ReviewSide::Right,
+        line: 2,
+        start: None,
+    };
+    let open = |cx: &mut gpui::VisualTestContext,
+                reply_to: Option<crate::github::ReplyTarget>,
+                suggestion: Option<String>| {
+        let anchor = b_line_2.clone();
+        cx.update(|window, app| {
+            view.update(app, |this, cx| {
+                this.open_review_composer(REPO, 7, anchor, None, reply_to, suggestion, window, cx);
+            })
+        });
+        draw_and_drain_test_window(cx);
+    };
+    let bodies = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_review()
+                .map(|review| {
+                    review
+                        .draft
+                        .comments
+                        .iter()
+                        .map(|comment| (comment.body.clone(), comment.reply_to.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    };
+    open(cx, None, Some("let x = 1;".into()));
+    press(cx, "o k alt-s secondary-enter");
+    assert!(!popover_is_open(cx, &view));
+    assert_eq!(
+        bodies(cx)[1],
+        (
+            "ok
+```suggestion
+let x = 1;
+```"
+            .to_string(),
+            None
+        )
+    );
+    // A reply to someone's thread waits in the review like any comment.
+    let octo = crate::github::ReplyTarget {
+        id: 99,
+        author: "octo".into(),
+    };
+    open(cx, Some(octo.clone()), None);
+    press(cx, "t y secondary-enter");
+    assert_eq!(bodies(cx)[2], ("ty".to_string(), Some(octo)));
+    // Your review: the second d deletes, a single one only asks.
+    press(cx, "4 j d");
+    assert_eq!(bodies(cx).len(), 3);
+    press(cx, "d");
+    assert_eq!(bodies(cx).len(), 2);
+
+    // S is the submit dialog for this pull request.
+    press(cx, "shift-s");
+    assert!(popover_open(
+        cx,
+        &view,
+        &PopoverKind::PullRequestReview {
+            repo_id: REPO,
+            number: 7,
+            kind: crate::github::ReviewKind::Comment,
+        }
+    ));
+    press(cx, "escape");
+
+    press(cx, "q");
+    assert_eq!(review(cx), None);
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+}
+
+/// Pull request #7 with a.rs, b.rs and c.rs, its commits as good as local.
+fn seed_three_file_pull_request(cx: &mut gpui::VisualTestContext, view: &View) {
+    let file = |path: &str| crate::github::PullRequestFile {
+        path: path.into(),
+        additions: 1,
+        deletions: 0,
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_pull_requests_for_test(REPO, vec![], Some(7));
+            this.seed_pull_request_detail_for_test(
+                REPO,
+                crate::github::PullRequestDetail {
+                    number: 7,
+                    title: "Keyboard nav".into(),
+                    body: String::new(),
+                    url: String::new(),
+                    author: "someone".into(),
+                    head: "feat".into(),
+                    head_oid: "a".repeat(40),
+                    base: "main".into(),
+                    base_oid: "b".repeat(40),
+                    is_draft: false,
+                    is_cross_repository: false,
+                    state: "OPEN".into(),
+                    review: None,
+                    mergeable: None,
+                    additions: 3,
+                    deletions: 0,
+                    changed_files: 3,
+                    files: vec![file("a.rs"), file("b.rs"), file("c.rs")],
+                    checks: Default::default(),
+                    check_runs: vec![],
+                    conversation: vec![],
+                },
+                "c".repeat(40),
+            );
+        })
+    });
+    apply_state(cx, view, pull_request_state());
+}
+
+#[gpui::test]
+fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpui::TestAppContext) {
+    use crate::view::panes::main::{ReviewCommentScope, SinceLines};
+    use crate::view::review::SinceReview;
+
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    let diff_base = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).review_diff_base(REPO, 7))
+    };
+    // The diff actually asked for: where it starts, and whether the review
+    // takes it as its own (its keys work only then).
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        sync_store_snapshot(cx, &view);
+        cx.update(|_window, app| {
+            let this = view.read(app);
+            let from = match this.main_pane.read(app).state.repos[0]
+                .diff_state
+                .diff_target
+                .as_ref()
+            {
+                Some(DiffTarget::CommitRange { from_commit_id, .. }) => {
+                    Some(from_commit_id.as_ref().to_string())
+                }
+                _ => None,
+            };
+            (from, this.review_diff_shown())
+        })
+    };
+    let scope = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .main_pane
+                .read(app)
+                .review_comment_scope
+                .clone()
+        })
+    };
+    let review = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app).active_review().map(|review| {
+                (
+                    review.file_ix,
+                    review.only_changed,
+                    review.draft.viewed.len(),
+                )
+            })
+        })
+    };
+    let seed = |cx: &mut gpui::VisualTestContext,
+                last: Option<crate::github::LastReview>,
+                since: Option<SinceReview>| {
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.seed_last_review_for_test(last, since, cx)
+            })
+        });
+    };
+
+    press(cx, "1 r");
+    assert_eq!(review(cx), Some((0, false, 0)));
+    // Never reviewed: nothing to narrow to.
+    seed(cx, None, None);
+    press(cx, "shift-l");
+    assert_eq!(review(cx), Some((0, false, 0)));
+
+    seed(
+        cx,
+        Some(crate::github::LastReview {
+            state: "CHANGES_REQUESTED".into(),
+            body: "Please split this.".into(),
+            submitted_at: "2026-01-01T00:00:00Z".into(),
+            commit_id: "d".repeat(40),
+        }),
+        Some(SinceReview::Changed(crate::github::ChangesSince {
+            files: ["b.rs".to_string(), "c.rs".to_string()].into(),
+            commits: 2,
+        })),
+    );
+    let line = cx.update(|_window, app| {
+        view.read(app)
+            .active_review()
+            .and_then(|review| review.last_review_line(std::time::SystemTime::now()))
+    });
+    assert!(
+        line.as_deref().is_some_and(
+            |line| line.starts_with("Your last review: Changes requested")
+                && line.ends_with("at ddddddd · 2 commits since · 2 files changed since")
+        ),
+        "{line:?}"
+    );
+    assert_eq!(diff_base(cx), Some("c".repeat(40)));
+    // On: a.rs didn't change, so the review moves to b.rs, and the diff
+    // starts at the last review's commit.
+    press(cx, "shift-l");
+    assert_eq!(review(cx), Some((1, true, 0)));
+    assert_eq!(diff_base(cx), Some("d".repeat(40)));
+    assert_eq!(shown(cx), (Some("d".repeat(40)), true));
+    // Comments wait for b.rs's lines in the pull request's own diff.
+    assert_eq!(scope(cx), ReviewCommentScope::Since(SinceLines::Loading));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.seed_review_threads_for_test(Vec::new(), vec![("b.rs".into(), vec![(1, 5)])], cx)
+        })
+    });
+    assert_eq!(
+        scope(cx),
+        ReviewCommentScope::Since(SinceLines::Ranges(vec![(1, 5)]))
+    );
+    // The Sidebar's j/k and ]/[ walk only b.rs and c.rs.
+    press(cx, "1 j");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(2));
+    press(cx, "j");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(2));
+    press(cx, "[ [");
+    assert_eq!(review(cx).map(|(file, ..)| file), Some(1));
+    // Viewed, then on to the next unviewed file among them.
+    press(cx, "space");
+    assert_eq!(review(cx), Some((2, true, 1)));
+    // Off: every file again, and the whole pull request's diff.
+    press(cx, "shift-l");
+    assert_eq!(diff_base(cx), Some("c".repeat(40)));
+    assert_eq!(shown(cx), (Some("c".repeat(40)), true));
+    assert_eq!(scope(cx), ReviewCommentScope::Full);
+    press(cx, "k k");
+    assert_eq!(review(cx), Some((0, false, 1)));
+
+    press(cx, "q");
+    assert_eq!(review(cx), None);
+}
+
+#[gpui::test]
+fn viewed_marks_follow_github_and_outdated_threads_take_replies(cx: &mut gpui::TestAppContext) {
+    use crate::github::{
+        PrError, ReviewSide, ReviewThread, ThreadComment, ViewedState, ViewedStates,
+    };
+    use crate::view::review::ViewedSync;
+
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    let marks = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app).active_review().map(|review| {
+                (
+                    review.draft.viewed.iter().cloned().collect::<Vec<String>>(),
+                    review.dismissed.iter().cloned().collect::<Vec<String>>(),
+                    review.viewed_sync.clone(),
+                )
+            })
+        })
+    };
+    let seed_states =
+        |cx: &mut gpui::VisualTestContext, seq: u64, result: Result<ViewedStates, PrError>| {
+            cx.update(|_window, app| {
+                view.update(app, |this, cx| {
+                    this.seed_viewed_states_for_test(seq, result, cx)
+                })
+            });
+        };
+    // The newest load's number, and the presses GitHub hasn't confirmed.
+    let pending = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).viewed_load_for_test())
+            .expect("reviewing")
+    };
+    let reload = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.update(app, |this, cx| this.load_viewed_states(cx)));
+        pending(cx).0
+    };
+    let pushed = |cx: &mut gpui::VisualTestContext, path: &str, viewed, result| {
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.review_viewed_pushed(REPO, 7, path, viewed, result, cx)
+            })
+        });
+    };
+    let states = |files: [(&str, ViewedState); 3]| {
+        Ok(ViewedStates {
+            pr_id: "PR_kw1".into(),
+            files: files
+                .into_iter()
+                .map(|(path, state)| (path.to_string(), state))
+                .collect(),
+        })
+    };
+    use ViewedState::*;
+
+    press(cx, "1 r");
+    let first = pending(cx).0;
+    assert_eq!(marks(cx), Some((vec![], vec![], ViewedSync::Loading)));
+    // space while GitHub's marks are still loading: shown at once, kept.
+    press(cx, "1 space");
+    assert_eq!(pending(cx).1, [("a.rs".to_string(), true, false)]);
+    // An answer to an older load is dropped.
+    let second = reload(cx);
+    seed_states(
+        cx,
+        first,
+        states([("a.rs", Viewed), ("b.rs", Viewed), ("c.rs", Viewed)]),
+    );
+    assert_eq!(marks(cx).map(|(.., sync)| sync), Some(ViewedSync::Loading));
+    // GitHub couldn't be reached: the marks here stay, and Your review says so.
+    seed_states(cx, second, Err(PrError::Failed("offline".into())));
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into()], vec![], ViewedSync::Offline))
+    );
+    // GitHub answers without the press: it stays on top, waiting to go up.
+    // b.rs was viewed there, then changed.
+    let third = reload(cx);
+    seed_states(
+        cx,
+        third,
+        states([("a.rs", Unviewed), ("b.rs", Dismissed), ("c.rs", Unviewed)]),
+    );
+    let github = ViewedSync::GitHub {
+        pr_id: "PR_kw1".into(),
+    };
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into()], vec!["b.rs".into()], github.clone()))
+    );
+    // GitHub takes it; a load started after that has it and the press goes.
+    pushed(cx, "a.rs", true, Ok(()));
+    assert_eq!(pending(cx).1, [("a.rs".to_string(), true, true)]);
+    let fourth = reload(cx);
+    seed_states(
+        cx,
+        fourth,
+        states([("a.rs", Viewed), ("b.rs", Dismissed), ("c.rs", Unviewed)]),
+    );
+    assert_eq!(pending(cx).1, []);
+    // space on b.rs marks it at once; GitHub refusing puts it back, dismissed.
+    press(cx, "1 space");
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into(), "b.rs".into()], vec![], github.clone()))
+    );
+    pushed(cx, "b.rs", true, Err(PrError::Failed("no".into())));
+    assert_eq!(
+        marks(cx),
+        Some((vec!["a.rs".into()], vec!["b.rs".into()], github))
+    );
+
+    // An outdated thread: listed after your pending comments, and r replies.
+    let outdated = ReviewThread {
+        root_id: 5,
+        path: "a.rs".into(),
+        side: ReviewSide::Right,
+        line: None,
+        original_line: Some(12),
+        comments: vec![ThreadComment {
+            author: "octo".into(),
+            body: "Old point\nmore".into(),
+            at: String::new(),
+        }],
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.seed_review_threads_for_test(vec![outdated], Vec::new(), cx)
+        })
+    });
+    // A pending comment first, so the outdated one sits after it.
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.add_review_comment(
+                REPO,
+                7,
+                crate::github::ReviewAnchor {
+                    path: "b.rs".into(),
+                    side: ReviewSide::Right,
+                    line: 1,
+                    start: None,
+                },
+                "Nit".into(),
+                None,
+                None,
+                cx,
+            );
+        })
+    });
+    press(cx, "4 j j r");
+    assert!(popover_is_open(cx, &view));
+    press(cx, "o k secondary-enter");
+    let replies = cx.update(|_window, app| {
+        view.read(app)
+            .active_review()
+            .map(|review| {
+                review
+                    .draft
+                    .comments
+                    .iter()
+                    .map(|comment| {
+                        (
+                            comment.body.clone(),
+                            comment.anchor.line,
+                            comment.reply_to.as_ref().map(|to| to.id),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        replies,
+        [
+            ("Nit".to_string(), 1, None),
+            ("ok".to_string(), 12, Some(5))
+        ]
+    );
+
+    press(cx, "q");
+}
+
+#[gpui::test]
+fn the_review_file_list_hides_viewed_files_and_filters_with_slash(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    // The files listed, and the open one.
+    let listed = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_review()
+                .map(|review| {
+                    let listed = (0..review.files.len())
+                        .filter(|ix| review.file_listed(*ix))
+                        .collect::<Vec<_>>();
+                    (listed, review.file_ix)
+                })
+                .expect("reviewing")
+        })
+    };
+
+    press(cx, "1 r");
+    assert_eq!(listed(cx), (vec![0, 1, 2], 0));
+    // Viewed, then on to b.rs: a.rs leaves the list.
+    press(cx, "1 space");
+    assert_eq!(listed(cx), (vec![1, 2], 1));
+    // V shows viewed files, and hides them again.
+    press(cx, "shift-v");
+    assert_eq!(listed(cx), (vec![0, 1, 2], 1));
+    press(cx, "shift-v");
+    assert_eq!(listed(cx), (vec![1, 2], 1));
+    // j/k skip the hidden a.rs.
+    press(cx, "k");
+    assert_eq!(listed(cx).1, 1);
+    press(cx, "j k");
+    assert_eq!(listed(cx).1, 1);
+
+    // `/` opens the filter; typing narrows the list as it goes.
+    press(cx, "/");
+    press(cx, "c");
+    assert_eq!(listed(cx).0, [2]);
+    // Enter keeps it and hands the keyboard back to the list.
+    press(cx, "enter");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+    assert_eq!(listed(cx).0, [2]);
+    press(cx, "j");
+    assert_eq!(listed(cx), (vec![2], 2));
+    // Esc from the list clears it.
+    press(cx, "escape");
+    assert_eq!(listed(cx), (vec![1, 2], 2));
+
+    press(cx, "q");
+}
+
+/// The open diff's file and lane, after syncing the store's latest snapshot.
+fn diff_file(
+    cx: &mut gpui::VisualTestContext,
+    view: &View,
+) -> Option<(std::path::PathBuf, DiffArea)> {
+    sync_store_snapshot(cx, view);
+    cx.update(|_window, app| {
+        match view.read(app).main_pane.read(app).state.repos[0]
+            .diff_state
+            .diff_target
+            .as_ref()
+        {
+            Some(DiffTarget::WorkingTree { path, area }) => Some((path.clone(), *area)),
+            _ => None,
+        }
+    })
+}
+
+#[gpui::test]
+fn the_changes_list_walks_every_file_once_and_flips_them_in_place(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    let file = |path: &str, kind| gitcomet_core::domain::FileStatus {
+        path: path.into(),
+        kind,
+        conflict: None,
+    };
+    // a.rs is partly staged, b.rs not at all, c.rs only staged, new.rs untracked.
+    repo.worktree_status = Loadable::Ready(Arc::new(vec![
+        file("a.rs", FileStatusKind::Modified),
+        file("b.rs", FileStatusKind::Modified),
+        file("new.rs", FileStatusKind::Untracked),
+    ]));
+    repo.staged_status = Loadable::Ready(Arc::new(vec![
+        file("a.rs", FileStatusKind::Modified),
+        file("c.rs", FileStatusKind::Added),
+    ]));
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_change_tracking_view(crate::view::ChangeTrackingView::Unified, cx)
+        })
+    });
+    draw_and_drain_test_window(cx);
+    let letters = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .details_pane
+                .read(app)
+                .changes_drawn(REPO)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, lanes)| {
+                    let [staged, unstaged] = lanes.letters();
+                    format!("{staged}{unstaged} {}", path.display())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(letters(cx), ["MM a.rs", " M b.rs", "A  c.rs", "?? new.rs"]);
+
+    press(cx, "4");
+    let walk = [
+        ("a.rs", DiffArea::Unstaged),
+        ("b.rs", DiffArea::Unstaged),
+        ("c.rs", DiffArea::Staged),
+        ("new.rs", DiffArea::Unstaged),
+    ];
+    for (path, area) in walk {
+        press(cx, "j");
+        wait_until(cx, "the next file to open", |cx| {
+            diff_file(cx, &view) == Some((path.into(), area))
+        });
+    }
+    // One at a time: each step reads where the last one landed.
+    press(cx, "k");
+    wait_until(cx, "c.rs again", |cx| {
+        diff_file(cx, &view) == Some(("c.rs".into(), DiffArea::Staged))
+    });
+    press(cx, "k");
+    wait_until(cx, "b.rs again", |cx| {
+        diff_file(cx, &view) == Some(("b.rs".into(), DiffArea::Unstaged))
+    });
+
+    // Shift+F narrows the list: Unstaged leaves out what's only staged, and
+    // the untracked file.
+    press(cx, "shift-f");
+    let filter = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).details_pane.read(app).changes_filter)
+    };
+    assert_eq!(filter(cx), crate::view::ChangesFilter::Unstaged);
+    assert_eq!(letters(cx), ["MM a.rs", " M b.rs"]);
+    press(cx, "shift-f shift-f shift-f");
+    assert_eq!(filter(cx), crate::view::ChangesFilter::All);
+
+    // `space` stages b.rs where it stands: the diff follows it to the staged
+    // side and focus stays in Details.
+    press(cx, "space");
+    wait_until(cx, "b.rs's staged diff", |cx| {
+        diff_file(cx, &view) == Some(("b.rs".into(), DiffArea::Staged))
+    });
+    assert_eq!(focused(cx, &view), Some(Details));
+}
+
+#[gpui::test]
+fn shift_n_sets_up_a_pull_request_from_anywhere(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+        name: "origin".into(),
+        url: Some("https://github.com/owner/repo.git".into()),
+    }]));
+    repo.remotes_rev = 1;
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    press(cx, "4");
+    assert_key_opens(
+        cx,
+        &view,
+        "shift-n",
+        PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: None,
+        },
+        Details,
+    );
+}
+
+#[gpui::test]
+fn the_create_dialog_steps_the_base_toggles_the_push_and_guards_submit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    repo.head_branch = Loadable::Ready("feature".into());
+    repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+        name: "origin".into(),
+        url: Some("https://github.com/owner/repo.git".into()),
+    }]));
+    repo.remotes_rev = 1;
+    let target = CommitId("7337337337337337".into());
+    let remote_branch = |name: &str| gitcomet_core::domain::RemoteBranch {
+        remote: "origin".into(),
+        name: name.into(),
+        target: target.clone(),
+    };
+    repo.remote_branches = Loadable::Ready(Arc::new(vec![
+        remote_branch("main"),
+        remote_branch("dev"),
+        remote_branch("feature-old"),
+    ]));
+    repo.remote_branches_rev = 2;
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    press(cx, "4 shift-n");
+    assert!(popover_open(
+        cx,
+        &view,
+        &PopoverKind::CreatePullRequest {
+            repo_id: REPO,
+            branch: None,
+        }
+    ));
+    let form = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            let host = view.read(app).popover_host.clone();
+            host.update(app, |host, cx| host.create_pull_request_form_for_test(cx))
+        })
+    };
+    // Focus starts in the title; `feature` isn't on GitHub, so it's pushed
+    // first by default.
+    press(cx, "h i");
+    assert_eq!(form(cx), (String::new(), true, true));
+
+    // Alt+B walks the remote's branches, default-like names first.
+    press(cx, "alt-b");
+    assert_eq!(form(cx).0, "dev");
+    press(cx, "alt-b");
+    assert_eq!(form(cx).0, "main");
+
+    // Without the push, GitHub has no branch to open it from.
+    press(cx, "alt-p");
+    assert_eq!(form(cx), ("main".into(), false, false));
+    press(cx, "alt-p");
+    assert_eq!(form(cx), ("main".into(), true, true));
+
+    // An open pull request from this very branch (same owner) blocks a
+    // second one; a stranger's same-named branch doesn't.
+    let seed = |cx: &mut gpui::VisualTestContext, owner: &str| {
+        cx.update(|_window, app| {
+            view.update(app, |this, _| {
+                this.seed_pull_requests_for_test(
+                    REPO,
+                    vec![crate::github::PullRequestSummary {
+                        number: 9,
+                        title: "Earlier".into(),
+                        author: owner.into(),
+                        head: "feature".into(),
+                        head_owner: owner.into(),
+                        base: "main".into(),
+                        is_draft: false,
+                        review: None,
+                        checks: Default::default(),
+                        review_requested: false,
+                    }],
+                    None,
+                );
+            })
+        });
+        draw_and_drain_test_window(cx);
+    };
+    seed(cx, "stranger");
+    assert!(form(cx).2);
+    seed(cx, "owner");
+    assert!(!form(cx).2);
+}
+
+#[gpui::test]
+fn slash_filters_the_changes_list_fuzzily_and_by_file_type(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    let file = |path: &str| gitcomet_core::domain::FileStatus {
+        path: path.into(),
+        kind: FileStatusKind::Modified,
+        conflict: None,
+    };
+    repo.worktree_status = Loadable::Ready(Arc::new(vec![
+        file("docs/notes.md"),
+        file("src/pane.rs"),
+        file("src/panel.rs"),
+    ]));
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_change_tracking_view(crate::view::ChangeTrackingView::Unified, cx)
+        })
+    });
+    draw_and_drain_test_window(cx);
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .details_pane
+                .read(app)
+                .changes_drawn(REPO)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(shown(cx).len(), 3);
+
+    // `/` hands the keyboard to the filter box: letters filter, they don't
+    // run panel keys. "pnl" is in order in panel.rs only.
+    press(cx, "4 /");
+    press(cx, "p n l");
+    assert_eq!(shown(cx), ["src/panel.rs"]);
+    assert_eq!(focused(cx, &view), None);
+
+    // Enter keeps the filter and goes back to the list; Esc there clears it.
+    press(cx, "enter");
+    assert_eq!(focused(cx, &view), Some(Details));
+    assert_eq!(shown(cx), ["src/panel.rs"]);
+    press(cx, "escape");
+    assert_eq!(shown(cx).len(), 3);
+
+    // `.md` keeps a file type; Esc in the box clears it and returns too.
+    press(cx, "/");
+    press(cx, ". m d");
+    assert_eq!(shown(cx), ["docs/notes.md"]);
+    press(cx, "escape");
+    assert_eq!(shown(cx).len(), 3);
+    assert_eq!(focused(cx, &view), Some(Details));
+
+    // `/` works from another panel too: the Changes list is still what it
+    // filters.
+    press(cx, "2 /");
+    press(cx, "p a n e");
+    assert_eq!(shown(cx), ["src/pane.rs", "src/panel.rs"]);
+    press(cx, "escape");
+    assert_eq!(shown(cx).len(), 3);
+}
+
+#[gpui::test]
+fn shift_j_and_k_select_a_range_of_changes_and_esc_drops_it(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let mut repo = panel_repo();
+    let file = |path: &str| gitcomet_core::domain::FileStatus {
+        path: path.into(),
+        kind: FileStatusKind::Modified,
+        conflict: None,
+    };
+    repo.worktree_status = Loadable::Ready(Arc::new(vec![
+        file("a.rs"),
+        file("b.rs"),
+        file("c.rs"),
+        file("d.rs"),
+    ]));
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_change_tracking_view(crate::view::ChangeTrackingView::Unified, cx)
+        })
+    });
+    draw_and_drain_test_window(cx);
+    let selection = |cx: &mut gpui::VisualTestContext| {
+        sync_store_snapshot(cx, &view);
+        cx.update(|_window, app| {
+            view.read(app)
+                .details_pane
+                .read(app)
+                .changes_selection(REPO)
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|(path, _)| path.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+        })
+    };
+
+    // One step at a time: each reads where the last one landed.
+    press(cx, "3 j");
+    wait_until(cx, "a.rs to open", |cx| {
+        diff_path(cx, &view).as_deref() == Some(Path::new("a.rs"))
+    });
+    press(cx, "j");
+    wait_until(cx, "b.rs to open", |cx| {
+        diff_path(cx, &view).as_deref() == Some(Path::new("b.rs"))
+    });
+    assert_eq!(selection(cx), None);
+    // Each Shift+J steps the open file on and widens the range behind it.
+    for (open, range) in [
+        ("c.rs", vec!["b.rs", "c.rs"]),
+        ("d.rs", vec!["b.rs", "c.rs", "d.rs"]),
+    ] {
+        press(cx, "shift-j");
+        wait_until(cx, "the range to grow", |cx| {
+            diff_path(cx, &view).as_deref() == Some(Path::new(open))
+        });
+        assert_eq!(
+            selection(cx),
+            Some(range.into_iter().map(String::from).collect())
+        );
+    }
+    // Back over the anchor: the range flips to the other side of it.
+    for (open, range) in [
+        ("c.rs", vec!["b.rs", "c.rs"]),
+        ("b.rs", vec![]),
+        ("a.rs", vec!["a.rs", "b.rs"]),
+    ] {
+        press(cx, "shift-k");
+        wait_until(cx, "the range to move", |cx| {
+            diff_path(cx, &view).as_deref() == Some(Path::new(open))
+        });
+        let expected = (!range.is_empty()).then(|| range.into_iter().map(String::from).collect());
+        assert_eq!(selection(cx), expected);
+    }
+    press(cx, "escape");
+    assert_eq!(selection(cx), None);
+    assert_eq!(focused(cx, &view), Some(Details));
+
+    // A plain step drops the range too.
+    press(cx, "shift-j");
+    wait_until(cx, "a range again", |cx| selection(cx).is_some());
+    press(cx, "j");
+    wait_until(cx, "the range to go", |cx| selection(cx).is_none());
+}
+
+#[gpui::test]
+fn two_is_the_middle_and_esc_leaves_a_commit_for_your_changes(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    // `2` is History while no diff is open; with one open, it's the diff.
+    press(cx, "2");
+    assert_eq!(focused(cx, &view), Some(History));
+    press(cx, "3 j");
+    wait_until(cx, "a file to open", |cx| diff_path(cx, &view).is_some());
+    press(cx, "2");
+    assert_eq!(focused(cx, &view), Some(Diff));
+    press(cx, "escape");
+    wait_until(cx, "the diff to close", |cx| diff_path(cx, &view).is_none());
+
+    // A commit selected in History fills Details; esc hands it back to your
+    // changes.
+    press(cx, "2 j");
+    wait_until(cx, "a commit to be selected", |cx| {
+        selected_commit(cx, &view).is_some()
+    });
+    press(cx, "escape");
+    wait_until(cx, "the commit to be dropped", |cx| {
+        selected_commit(cx, &view).is_none()
+    });
+    assert_eq!(focused(cx, &view), Some(History));
+}
+
+#[gpui::test]
+fn files_past_the_first_page_append_in_order_into_the_list_and_the_review(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    let file = |path: &str| crate::github::PullRequestFile {
+        path: path.into(),
+        additions: 1,
+        deletions: 0,
+    };
+    let land = |cx: &mut gpui::VisualTestContext, page: u32, paths: &[&str]| {
+        let files = paths.iter().map(|path| file(path)).collect();
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.land_pull_request_files_page_for_test(REPO, page, files, cx)
+            })
+        });
+        draw_and_drain_test_window(cx);
+    };
+    let lists = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            let this = view.read(app);
+            let pull_request: Vec<String> = this
+                .active_pull_requests()
+                .and_then(|prs| prs.detail.ready())
+                .map(|detail| detail.files.iter().map(|file| file.path.clone()).collect())
+                .unwrap_or_default();
+            let review = this
+                .active_review()
+                .map(|review| review.files.clone())
+                .unwrap_or_default();
+            (pull_request, review)
+        })
+    };
+
+    // Reviewing starts on the first page; the rest comes after.
+    press(cx, "1 r");
+    assert_eq!(lists(cx).1, ["a.rs", "b.rs", "c.rs"]);
+    // Page 3 before page 2: held back, so nothing shifts.
+    land(cx, 3, &["e.rs"]);
+    assert_eq!(lists(cx).0, ["a.rs", "b.rs", "c.rs"]);
+    // Page 2 lets both in, in GitHub's order, in both lists.
+    land(cx, 2, &["d.rs", "b.rs"]);
+    let expected = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"];
+    assert_eq!(
+        lists(cx),
+        (
+            expected.map(String::from).to_vec(),
+            expected.map(String::from).to_vec()
+        )
+    );
+    press(cx, "q");
+}
+
+#[gpui::test]
+fn pull_request_files_move_only_the_highlight_until_a_diff_is_asked_for(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    // Its commits are local already, as the prefetch leaves them.
+    seed_three_file_pull_request(cx, &view);
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        sync_store_snapshot(cx, &view);
+        cx.update(|_window, app| {
+            match view.read(app).main_pane.read(app).state.repos[0]
+                .diff_state
+                .diff_target
+                .as_ref()
+            {
+                Some(DiffTarget::CommitRange { path, .. }) => path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                _ => None,
+            }
+        })
+    };
+
+    press(cx, "1 3 j j");
+    assert_eq!(shown(cx), None);
+    press(cx, "enter");
+    assert_eq!(shown(cx).as_deref(), Some("b.rs"));
+    // Once asked for, the diff follows the highlight.
+    press(cx, "3 j");
+    assert_eq!(shown(cx).as_deref(), Some("c.rs"));
 }

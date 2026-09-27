@@ -275,6 +275,34 @@ impl MainPaneView {
             return false;
         }
 
+        // Review mode: the root view's panel keys own the review keys and call
+        // back into the cursor methods; Esc only shrinks the range, never
+        // closing the diff. F-keys and chords keep their normal meaning.
+        if self.review_active
+            && !mods.control
+            && !mods.alt
+            && !mods.platform
+            && !mods.function
+            && !self
+                .diff_raw_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+            && !self
+                .diff_search_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+        {
+            if key == "escape" {
+                self.review_collapse_selection(cx);
+                return true;
+            }
+            if key.chars().count() == 1 || matches!(key, "space" | "up" | "down" | "enter") {
+                return false;
+            }
+        }
+
         // kdiff3 manual diff help: Escape abandons pending alignment marks
         // before reaching the resolver's other escape behaviors, so a
         // mis-marked line does not cost the user their selection or view.
@@ -379,6 +407,12 @@ impl MainPaneView {
             let path = path.clone();
             let area = *area;
             let change_tracking_view = self.active_change_tracking_view(cx);
+            // The one list flips the file in place, lazygit style: the row
+            // stays put and the diff follows it to its new lane.
+            if change_tracking_view == ChangeTrackingView::Unified {
+                self.flip_change(repo_id, path, area, None, window, cx);
+                return true;
+            }
             let status_section_order =
                 self.active_status_section_order(repo_id, change_tracking_view, cx);
             let next_path_in_section = status_nav::status_navigation_context_for_repo(
@@ -513,6 +547,16 @@ impl MainPaneView {
             let path = path.clone();
             let area = *area;
             let status_ready = repo.status_entries_for_area(area).is_some();
+
+            // Ctrl+S / Ctrl+U in the one list: the same in-place flip as
+            // `space`, one direction only, whichever lane the diff shows.
+            if matches!(key, "s" | "u")
+                && !mods.shift
+                && self.active_change_tracking_view(cx) == ChangeTrackingView::Unified
+            {
+                self.flip_change(repo_id, path, area, Some(key == "s"), window, cx);
+                return true;
+            }
 
             match key {
                 "s" if area == DiffArea::Unstaged && !mods.shift => {

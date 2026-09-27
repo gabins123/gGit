@@ -1103,6 +1103,8 @@ pub struct GitCometView {
     /// Focus as the last two renders saw it; see `restore_panel_focus`.
     pub(super) focus_this_render: Option<FocusHandle>,
     pub(super) focus_prev_render: Option<FocusHandle>,
+    /// The pull request being reviewed; see `review.rs`.
+    pub(super) review: Option<super::review::ReviewMode>,
     /// A first Shift+D / Shift+M on this branch, waiting for the second.
     pub(super) armed_branch_key: Option<(String, super::branch_sidebar::BranchMenuTarget)>,
     pub(super) _focus_lost_subscription: gpui::Subscription,

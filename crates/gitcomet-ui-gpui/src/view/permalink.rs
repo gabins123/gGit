@@ -386,6 +386,20 @@ fn is_full_sha(reference: &str) -> bool {
     reference.len() == 40 && reference.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// GitHub's page for opening a pull request from `head` (a branch, or
+/// `owner:branch` on a fork) into `base`, or into the default branch.
+pub(super) fn github_compare_url(slug: &str, base: Option<&str>, head: &str) -> String {
+    let head = match head.split_once(':') {
+        Some((owner, branch)) => format!("{}:{}", encode_path(owner), encode_path(branch)),
+        None => encode_path(head),
+    };
+    let range = match base {
+        Some(base) => format!("{}...{head}", encode_path(base)),
+        None => head,
+    };
+    format!("https://github.com/{slug}/compare/{range}?expand=1")
+}
+
 /// Percent-encode every character outside the RFC 3986 unreserved set (plus
 /// `/`, which separates path segments). Backslashes from Windows path
 /// rendering are normalized to forward slashes.
@@ -888,6 +902,18 @@ mod tests {
         ] {
             assert_eq!(remote_web_url(url), None, "{url}");
         }
+    }
+
+    #[test]
+    fn compare_urls_name_the_head_and_optional_base() {
+        assert_eq!(
+            github_compare_url("o/r", None, "feat/x#2"),
+            "https://github.com/o/r/compare/feat/x%232?expand=1"
+        );
+        assert_eq!(
+            github_compare_url("o/r", Some("dev"), "fork:feat"),
+            "https://github.com/o/r/compare/dev...fork:feat?expand=1"
+        );
     }
 
     #[test]

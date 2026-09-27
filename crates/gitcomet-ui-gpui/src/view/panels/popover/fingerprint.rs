@@ -167,7 +167,9 @@ fn repo_for_popover<'a>(state: &'a AppState, popover: &PopoverKind) -> Option<&'
         // Popovers that carry an explicit repo id.
         PopoverKind::CommitPrompt { repo_id }
         | PopoverKind::PullRequestReview { repo_id, .. }
-        | PopoverKind::CreatePullRequest { repo_id }
+        | PopoverKind::MergePullRequest { repo_id, .. }
+        | PopoverKind::ReviewComment { repo_id, .. }
+        | PopoverKind::CreatePullRequest { repo_id, .. }
         | PopoverKind::StashPickerPrompt { repo_id, .. }
         | PopoverKind::UpstreamPicker { repo_id, .. }
         | PopoverKind::CreateBranchFromRefPrompt { repo_id, .. }
@@ -483,7 +485,9 @@ fn hash_repo_for_popover<H: Hasher>(repo: &RepoState, popover: &PopoverKind, has
         | PopoverKind::ReflogEntryMenu { .. }
         | PopoverKind::CommitPrompt { .. }
         // Its gh state lives in the root view, which notifies the host itself.
-        | PopoverKind::PullRequestReview { .. } => {}
+        | PopoverKind::PullRequestReview { .. }
+        | PopoverKind::ReviewComment { .. }
+        | PopoverKind::MergePullRequest { .. } => {}
     }
 }
 
@@ -948,9 +952,34 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
             number.hash(hasher);
             (*kind as u8).hash(hasher);
         }
-        PopoverKind::CreatePullRequest { repo_id } => {
+        PopoverKind::CreatePullRequest { repo_id, branch } => {
             121u8.hash(hasher);
             repo_id.hash(hasher);
+            branch.hash(hasher);
+        }
+        PopoverKind::ReviewComment {
+            repo_id,
+            number,
+            anchor,
+            edit,
+            reply_to,
+        } => {
+            123u8.hash(hasher);
+            repo_id.hash(hasher);
+            number.hash(hasher);
+            anchor.hash(hasher);
+            edit.hash(hasher);
+            reply_to.hash(hasher);
+        }
+        PopoverKind::MergePullRequest {
+            repo_id,
+            number,
+            method,
+        } => {
+            122u8.hash(hasher);
+            repo_id.hash(hasher);
+            number.hash(hasher);
+            method.hash(hasher);
         }
         PopoverKind::StashPickerPrompt { repo_id, purpose } => {
             74u8.hash(hasher);

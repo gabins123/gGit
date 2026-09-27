@@ -6,10 +6,10 @@ use std::sync::Arc;
 #[cfg(any(debug_assertions, feature = "benchmarks"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const STATUS_ROW_HEIGHT_PX: f32 = 24.0;
+pub(in crate::view) const STATUS_ROW_HEIGHT_PX: f32 = 24.0;
 /// Line box for the path label, in UI-font units so it tracks the font
 /// setting like the label's own size.
-const STATUS_ROW_LINE_HEIGHT_PX: f32 = 18.0;
+pub(in crate::view) const STATUS_ROW_LINE_HEIGHT_PX: f32 = 18.0;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

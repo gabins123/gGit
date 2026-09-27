@@ -24,11 +24,15 @@ pub(super) enum FocusPanel {
 impl FocusPanel {
     const ORDER: [Self; 4] = [Self::Sidebar, Self::History, Self::Diff, Self::Details];
 
+    /// `2` names the middle area; which of History and the diff that is
+    /// depends on what's open, so the caller settles it.
     fn from_digit_key(key: &str) -> Option<Self> {
         match key {
             "1" => Some(Self::Sidebar),
             "2" => Some(Self::History),
-            "3" => Some(Self::Diff),
+            "3" => Some(Self::Details),
+            // Details' number before the middle area became one: old habits
+            // still land.
             "4" => Some(Self::Details),
             _ => None,
         }
@@ -71,6 +75,7 @@ impl FocusPanel {
                 ("j/k", "branch"),
                 ("space", "checkout"),
                 ("n", "new"),
+                ("o", "PR"),
                 ("m", "menu"),
             ],
             Self::History => &[
@@ -107,6 +112,8 @@ impl FocusPanel {
                 ("D", "Delete the branch"),
                 ("M", "Merge it into the current branch"),
                 ("R", "Rebase the current branch onto it"),
+                ("o", "Open a pull request for it on GitHub"),
+                ("O", "New pull request from it: base, title, body"),
                 ("m", "The branch's menu"),
                 ("[ / ]", "Branches / Files / Pull requests tab"),
             ],
@@ -118,6 +125,7 @@ impl FocusPanel {
                 ("g", "Reset to it (mixed; soft or hard in the menu)"),
                 ("T", "Tag it"),
                 ("m", "The commit's menu"),
+                ("esc", "Back to your changes in Details"),
             ],
             Self::Diff => &[
                 ("j / k", "Next / previous change"),
@@ -134,6 +142,7 @@ impl FocusPanel {
                 ("a", "Stage everything, or unstage it all"),
                 ("d", "Discard the open file's changes"),
                 ("m", "The open file's menu"),
+                ("esc", "From a commit's files back to your changes"),
             ],
         }
     }
@@ -141,7 +150,7 @@ impl FocusPanel {
 
 /// Status bar hints shown after the focused panel's own.
 pub(super) const PANEL_STATUS_HINTS: &[(&str, &str)] = &[
-    ("1-4", "panels"),
+    ("1-3", "panels"),
     ("p/P", "pull/push"),
     ("i", "codex"),
     ("?", "keys"),
@@ -150,8 +159,8 @@ pub(super) const PANEL_STATUS_HINTS: &[(&str, &str)] = &[
 /// Keys that work the same in every panel, as the `?` list shows them.
 const PANEL_KEYS_HELP: &[(&str, &str)] = &[
     (
-        "1 2 3 4",
-        "Sidebar, History, Diff, Details; opens a collapsed one",
+        "1 2 3",
+        "Sidebar; the middle (History, or the diff when one is open); Details. Opens a collapsed one",
     ),
     ("h / l", "Previous / next panel"),
     ("c", "Write the commit message"),
@@ -159,6 +168,7 @@ const PANEL_KEYS_HELP: &[(&str, &str)] = &[
     ("p / P", "Pull / push"),
     ("f", "Fetch all remotes"),
     ("s", "Stash the changes"),
+    ("N", "New pull request from the current branch"),
     ("0", "Codex panel"),
     ("i", "Codex actions"),
     ("?", "This list"),
@@ -433,6 +443,41 @@ impl GitCometView {
 
     /// The hint bar's keys for `panel`, which differ on the Pull requests tab.
     pub(super) fn key_hints(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if self.active_review().is_some() {
+            return match panel {
+                FocusPanel::Sidebar => &[
+                    ("j/k", "file"),
+                    ("space", "viewed"),
+                    ("/", "filter"),
+                    ("V", "show viewed"),
+                    ("L", "changed since"),
+                    ("enter", "diff"),
+                    ("S", "submit"),
+                    ("q", "leave"),
+                ],
+                FocusPanel::Diff | FocusPanel::History => &[
+                    ("j/k", "line"),
+                    ("shift+j/k", "select"),
+                    ("c", "comment"),
+                    ("t/T", "thread"),
+                    ("r", "reply"),
+                    ("a/x", "suggestion"),
+                    ("}/{", "change"),
+                    ("]/[", "file"),
+                    ("space", "viewed"),
+                    ("L", "changed since"),
+                    ("S", "submit"),
+                ],
+                FocusPanel::Details => &[
+                    ("j/k", "comment"),
+                    ("enter", "go to"),
+                    ("e", "edit"),
+                    ("d d", "delete"),
+                    ("r", "reply outdated"),
+                    ("S", "submit"),
+                ],
+            };
+        }
         if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
             return &[("[ ]", "tab")];
         }
@@ -442,18 +487,41 @@ impl GitCometView {
                     return &[
                         ("j/k", "PR"),
                         ("enter", "diff"),
-                        ("n", "new"),
+                        ("space", "checkout"),
                         ("r", "review"),
+                        ("M", "merge"),
                         ("o", "GitHub"),
-                        ("R", "refresh"),
                     ];
                 }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
                         ("j/k", "file"),
+                        ("J/K", "scroll"),
                         ("enter", "diff"),
                         ("r", "review"),
-                        ("o", "GitHub"),
+                        ("M", "merge"),
+                    ];
+                }
+                _ => {}
+            }
+        }
+        if self.changes_list_shown() {
+            match panel {
+                FocusPanel::Details => {
+                    return &[
+                        ("j/k", "file"),
+                        ("J/K", "select"),
+                        ("space", "stage"),
+                        ("a", "all"),
+                        ("/", "filter"),
+                    ];
+                }
+                FocusPanel::Diff => {
+                    return &[
+                        ("j/k", "change"),
+                        ("space", "stage"),
+                        ("F1/F4", "file"),
+                        ("esc", "back"),
                     ];
                 }
                 _ => {}
@@ -463,6 +531,76 @@ impl GitCometView {
     }
 
     fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if self.active_review().is_some() {
+            return match panel {
+                FocusPanel::Sidebar => &[
+                    ("j / k", "Next / previous file"),
+                    (
+                        "space",
+                        "Mark viewed (on GitHub too), then the next unviewed file",
+                    ),
+                    (
+                        "L",
+                        "Changes since your last review (files and diff) / the whole PR",
+                    ),
+                    (
+                        "/",
+                        "Filter the file list: fuzzy words, .rs for a type; esc clears",
+                    ),
+                    ("V", "Show / hide viewed files (hidden by default)"),
+                    ("R", "Retry the files that failed to list"),
+                    ("enter", "Go to the diff"),
+                    ("S", "Submit the review"),
+                    ("q", "Leave review mode; pending comments stay"),
+                ],
+                FocusPanel::Diff | FocusPanel::History => &[
+                    ("j / k", "Line cursor down / up"),
+                    ("shift+j / k", "Select lines from the cursor"),
+                    (
+                        "c",
+                        "Comment on the line or selection; alt+s suggests a change",
+                    ),
+                    ("t / T", "Next / previous thread or Codex suggestion"),
+                    ("r", "Reply to the thread on this line"),
+                    ("a / x", "Adopt / drop the Codex suggestion on this line"),
+                    ("} / {", "Next / previous change"),
+                    ("] / [", "Next / previous file"),
+                    (
+                        "space",
+                        "Mark viewed (on GitHub too), then the next unviewed file",
+                    ),
+                    (
+                        "L",
+                        "Changes since your last review (files and diff) / the whole PR",
+                    ),
+                    (
+                        "/",
+                        "Filter the file list: fuzzy words, .rs for a type; esc clears",
+                    ),
+                    ("V", "Show / hide viewed files (hidden by default)"),
+                    ("esc", "Drop the selection"),
+                    ("S", "Submit the review"),
+                    ("q", "Leave review mode; pending comments stay"),
+                ],
+                FocusPanel::Details => &[
+                    (
+                        "j / k",
+                        "Next / previous pending comment or outdated conversation",
+                    ),
+                    ("enter", "Go to its line"),
+                    ("e", "Edit it"),
+                    ("d d", "Delete it"),
+                    ("r", "Reply to the picked outdated conversation"),
+                    (
+                        "L",
+                        "Changes since your last review (files and diff) / the whole PR",
+                    ),
+                    ("V", "Show / hide viewed files (hidden by default)"),
+                    ("S", "Submit the review"),
+                    ("q", "Leave review mode; pending comments stay"),
+                ],
+            };
+        }
         if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
             return &[("[ / ]", "Branches / Files / Pull requests tab")];
         }
@@ -472,19 +610,66 @@ impl GitCometView {
                     return &[
                         ("j / k", "Next / previous pull request"),
                         ("enter", "Open its diff"),
+                        ("space", "Check it out locally"),
                         ("n", "New pull request"),
-                        ("r", "Review the selected pull request"),
+                        ("r", "Review it: line comments, one submit"),
+                        ("S", "Quick review: just a verdict and summary"),
+                        ("M", "Merge it on GitHub"),
                         ("o", "Open on GitHub"),
-                        ("R", "Refresh the list"),
+                        ("R", "Refresh the list; retry files that failed to list"),
                         ("[ / ]", "Branches / Files / Pull requests tab"),
                     ];
                 }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
                         ("j / k", "Next / previous file"),
+                        ("J / K", "Scroll the checks and conversation"),
                         ("enter", "Open the file's diff"),
+                        ("space", "Check it out locally"),
                         ("r", "Review"),
+                        ("M", "Merge it on GitHub"),
                         ("o", "Open on GitHub"),
+                    ];
+                }
+                _ => {}
+            }
+        }
+        if self.changes_list_shown() {
+            match panel {
+                FocusPanel::Details => {
+                    return &[
+                        ("j / k", "Next / previous file, opening its diff"),
+                        ("enter", "Go to the file's diff"),
+                        (
+                            "J / K",
+                            "Select a range of files from the open one; shift-click too",
+                        ),
+                        (
+                            "space",
+                            "Stage / unstage the open file, or the selected range; they keep their place",
+                        ),
+                        ("a", "Stage what the list shows, or unstage it all"),
+                        ("shift+space", "Stage / unstage the open file's folder"),
+                        (
+                            "/",
+                            "Filter by path, fuzzy; .rs keeps a file type. Enter keeps it",
+                        ),
+                        ("esc", "Drop the selection, then the / filter"),
+                        ("F", "Show all, unstaged, staged or untracked"),
+                        ("`", "Tree or flat list"),
+                        ("o", "Sort the list"),
+                        ("d", "Discard the open file's changes, or the selection's"),
+                        ("m", "The open file's menu"),
+                    ];
+                }
+                FocusPanel::Diff => {
+                    return &[
+                        ("j / k", "Next / previous change"),
+                        ("space", "Stage / unstage the file; it keeps its place"),
+                        ("F1 / F4", "Previous / next file"),
+                        ("d", "Discard the file's changes"),
+                        ("m", "The file's menu"),
+                        ("esc", "Close the diff and go back"),
                     ];
                 }
                 _ => {}
@@ -493,9 +678,47 @@ impl GitCometView {
         panel.help()
     }
 
+    /// With a range selected in the Changes list, hands its files with
+    /// worktree changes to the discard dialog, which reads them from the
+    /// status selection. `false` without a range.
+    fn discard_changes_selection(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(selection) = self.details_pane.read(cx).changes_selection(repo_id) else {
+            return false;
+        };
+        let paths: Vec<std::path::PathBuf> = selection
+            .into_iter()
+            .filter(|(_, lanes)| lanes.unstaged.is_some() && !lanes.conflicted())
+            .map(|(path, _)| path)
+            .collect();
+        if paths.is_empty() {
+            return false;
+        }
+        self.details_pane.update(cx, |pane, _| {
+            pane.status_multi_selection.insert(
+                repo_id,
+                StatusMultiSelection {
+                    explicit_section: Some(StatusSection::CombinedUnstaged),
+                    unstaged: paths,
+                    ..Default::default()
+                },
+            );
+        });
+        true
+    }
+
+    /// Details shows the one Changes list rather than sections, a pull
+    /// request or a commit.
+    fn changes_list_shown(&self) -> bool {
+        self.change_tracking_view == ChangeTrackingView::Unified
+            && !self.pull_request_details_active()
+            && self
+                .active_repo()
+                .is_some_and(|repo| repo.history_state.selected_commit.is_none())
+    }
+
     /// Opens a dialog or menu from a key; dismissing it hands focus back to
     /// the panel it was opened from.
-    fn open_popover_from_key(
+    pub(super) fn open_popover_from_key(
         &mut self,
         kind: PopoverKind,
         window: &mut Window,
@@ -587,6 +810,15 @@ impl GitCometView {
     }
 
     fn stage_or_unstage_all(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.change_tracking_view == ChangeTrackingView::Unified {
+            // Deferred: staging may raise the conflict-markers dialog, which
+            // needs the root this key handler is still inside.
+            self.defer_pane_action(self.details_pane.clone(), cx, |pane, window, cx| {
+                pane.toggle_all_changes(None, window, cx);
+                true
+            });
+            return;
+        }
         let unstaged = self
             .active_repo()
             .and_then(|repo| repo.worktree_status_entries())
@@ -749,6 +981,16 @@ impl GitCometView {
                 repo_id,
                 onto: reference,
             }),
+            // lazygit's pull request keys: `o` opens GitHub's page for it,
+            // `O` sets it up here first (base, title, body; or GitHub after all).
+            ("o", _) => {
+                self.open_pull_request_compare(&target, cx);
+                return;
+            }
+            ("O", BranchMenuTarget::Local { name }) => {
+                self.open_create_pull_request(repo_id, Some(name.clone()), window, cx);
+                return;
+            }
             _ => None,
         };
         if let Some(kind) = kind {
@@ -829,6 +1071,8 @@ impl GitCometView {
             (_, "P") => self.execute_command("push", Some(window), cx),
             (_, "f") => self.execute_command("fetch-all", Some(window), cx),
             (_, "s") => self.open_popover_from_key(PopoverKind::StashPrompt, window, cx),
+            // From anywhere: the current branch's pull request, set up here.
+            (_, "N") => self.open_create_pull_request(repo_id, None, window, cx),
             (_, "c") if status_shown => self.focus_commit_message(repo_id, window, cx),
             (_, "A") if status_shown => {
                 // Like the menu: turning amend off is always allowed.
@@ -841,6 +1085,118 @@ impl GitCometView {
             (Some(panel), "m") => self.open_selection_menu(panel, repo_id, window, cx),
             (Some(FocusPanel::Details), "a") if worktree_shown => {
                 self.stage_or_unstage_all(window, cx)
+            }
+            // From any panel, or none: the Changes list is the one list
+            // it filters, and it's on screen whenever this is true.
+            (_, "/") if self.changes_list_shown() => {
+                if self.details_collapsed {
+                    self.set_details_collapsed(false, cx);
+                }
+                self.details_pane
+                    .update(cx, |pane, cx| pane.open_changes_query(cx));
+            }
+            // Esc peels one layer: the range selection, then the filter.
+            (Some(FocusPanel::Details), "escape")
+                if self.changes_list_shown()
+                    && self
+                        .details_pane
+                        .read(cx)
+                        .changes_selection(repo_id)
+                        .is_some() =>
+            {
+                self.details_pane
+                    .update(cx, |pane, cx| pane.clear_changes_range(cx));
+            }
+            (Some(FocusPanel::Details), "escape")
+                if worktree_shown
+                    && self.change_tracking_view == ChangeTrackingView::Unified
+                    && self.details_pane.read(cx).changes_query_active() =>
+            {
+                self.details_pane
+                    .update(cx, |pane, cx| pane.clear_changes_query(window, cx));
+            }
+            // Out of a commit's details and back to your changes.
+            (Some(FocusPanel::History | FocusPanel::Details), "escape")
+                if status_shown
+                    && self
+                        .active_repo()
+                        .is_some_and(|repo| repo.history_state.selected_commit.is_some()) =>
+            {
+                // A file of the commit may be open in the diff: it goes too,
+                // or it would stay up with nothing listing it.
+                if matches!(
+                    self.active_repo()
+                        .and_then(|repo| repo.diff_state.diff_target.as_ref()),
+                    Some(DiffTarget::Commit { .. })
+                ) {
+                    self.store.dispatch(Msg::ClearDiffSelection { repo_id });
+                }
+                self.store.dispatch(Msg::ClearCommitSelection { repo_id });
+            }
+            (Some(FocusPanel::Details), "J" | "K" | "DOWN" | "UP") if self.changes_list_shown() => {
+                let direction = if matches!(key.as_str(), "J" | "DOWN") {
+                    1
+                } else {
+                    -1
+                };
+                self.defer_pane_action(self.main_pane.clone(), cx, move |pane, window, cx| {
+                    pane.extend_changes_selection(repo_id, direction, window, cx)
+                });
+            }
+            (Some(FocusPanel::Details), "SPACE")
+                if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>
+            {
+                // Deferred: staging may raise the conflict-markers dialog.
+                self.defer_pane_action(self.details_pane.clone(), cx, |pane, window, cx| {
+                    pane.toggle_open_change_folder(window, cx);
+                    true
+                });
+            }
+            (Some(FocusPanel::Details), "F" | "`" | "o")
+                if worktree_shown && self.change_tracking_view == ChangeTrackingView::Unified =>
+            {
+                let list = crate::view::rows::FileListId::Changes;
+                match key.as_str() {
+                    "F" => self
+                        .details_pane
+                        .update(cx, |pane, cx| pane.cycle_changes_filter(cx)),
+                    "`" => self.details_pane.update(cx, |pane, cx| {
+                        pane.toggle_file_list_layout(repo_id, list, cx)
+                    }),
+                    _ => self.open_popover_from_key(
+                        PopoverKind::CommitFileSortMenu { list },
+                        window,
+                        cx,
+                    ),
+                }
+            }
+            // With a range selected, `d` is about the range, never quietly
+            // about just the open file.
+            (Some(FocusPanel::Details | FocusPanel::Diff), "d")
+                if self.changes_list_shown()
+                    && self
+                        .details_pane
+                        .read(cx)
+                        .changes_selection(repo_id)
+                        .is_some() =>
+            {
+                if self.discard_changes_selection(repo_id, cx) {
+                    self.open_popover_from_key(
+                        PopoverKind::DiscardChangesConfirm {
+                            repo_id,
+                            area: DiffArea::Unstaged,
+                            path: None,
+                        },
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.push_toast(
+                        components::ToastKind::Warning,
+                        "Nothing selected has working-tree changes to discard.".to_string(),
+                        cx,
+                    );
+                }
             }
             (Some(FocusPanel::Details | FocusPanel::Diff), "d") if worktree_shown => {
                 if let Some((area, path)) = self
@@ -858,7 +1214,9 @@ impl GitCometView {
                     );
                 }
             }
-            (Some(FocusPanel::Sidebar), "space" | "n" | "D" | "M" | "R") if branches => {
+            (Some(FocusPanel::Sidebar), "space" | "n" | "D" | "M" | "R" | "o" | "O")
+                if branches =>
+            {
                 self.branch_action(repo_id, &key, armed, window, cx)
             }
             (Some(FocusPanel::History), "C" | "t" | "g" | "T") => {
@@ -887,11 +1245,48 @@ impl GitCometView {
             self.refresh_pull_requests(cx);
             return Some(true);
         }
-        if shift {
-            return None;
-        }
         let selected = self.active_pull_requests().and_then(|prs| prs.selected);
         let in_details = current == Some(FocusPanel::Details) && self.pull_request_details_active();
+        if shift {
+            return match key.to_ascii_lowercase().as_str() {
+                // Submit a review with no line comments: the quick verdict.
+                "s" => {
+                    let number = selected?;
+                    self.open_pull_request_prompt(
+                        PopoverKind::PullRequestReview {
+                            repo_id,
+                            number,
+                            kind: crate::github::ReviewKind::Comment,
+                        },
+                        window,
+                        cx,
+                    );
+                    Some(true)
+                }
+                "m" => {
+                    let number = selected?;
+                    self.open_pull_request_prompt(
+                        PopoverKind::MergePullRequest {
+                            repo_id,
+                            number,
+                            method: crate::github::MergeMethod::Merge,
+                        },
+                        window,
+                        cx,
+                    );
+                    Some(true)
+                }
+                // lazygit's main-panel scroll: checks and conversation.
+                direction @ ("j" | "k") if in_details => {
+                    let direction = if direction == "j" { 1 } else { -1 };
+                    self.details_pane.update(cx, |pane, cx| {
+                        pane.scroll_pull_request_details(direction, cx)
+                    });
+                    Some(true)
+                }
+                _ => None,
+            };
+        }
         let direction = match key {
             "j" | "down" => 1,
             "k" | "up" => -1,
@@ -906,6 +1301,10 @@ impl GitCometView {
                 self.select_adjacent_pull_request_file(direction, cx);
                 Some(true)
             }
+            (Some(FocusPanel::Sidebar | FocusPanel::Details), "space") if selected.is_some() => {
+                self.checkout_pull_request(cx);
+                Some(true)
+            }
             (Some(from @ (FocusPanel::Sidebar | FocusPanel::Details)), "enter")
                 if selected.is_some() =>
             {
@@ -916,32 +1315,12 @@ impl GitCometView {
                 Some(true)
             }
             (_, "n") => {
-                if self.github_target().is_none() {
-                    self.push_toast(
-                        components::ToastKind::Warning,
-                        "Pull requests need a github.com remote.".to_string(),
-                        cx,
-                    );
-                } else {
-                    self.open_pull_request_prompt(
-                        PopoverKind::CreatePullRequest { repo_id },
-                        window,
-                        cx,
-                    );
-                }
+                self.open_create_pull_request(repo_id, None, window, cx);
                 Some(true)
             }
             (_, "r") => {
-                let number = selected?;
-                self.open_pull_request_prompt(
-                    PopoverKind::PullRequestReview {
-                        repo_id,
-                        number,
-                        kind: crate::github::ReviewKind::Comment,
-                    },
-                    window,
-                    cx,
-                );
+                selected?;
+                self.start_review(cx);
                 Some(true)
             }
             (_, "o") => Some(self.open_pull_request_on_github(cx)),
@@ -1028,6 +1407,9 @@ impl GitCometView {
         let current = self
             .focused_panel(window, cx)
             .filter(|panel| *panel == FocusPanel::Diff || self.panel_available(*panel));
+        if let Some(handled) = self.handle_review_key(current, key, mods.shift, window, cx) {
+            return handled;
+        }
         if let Some(handled) = self.handle_pull_request_key(current, key, mods.shift, window, cx) {
             return handled;
         }
@@ -1050,6 +1432,12 @@ impl GitCometView {
             _ => {}
         }
         if let Some(panel) = FocusPanel::from_digit_key(key) {
+            // The middle area shows History or the diff, one at a time.
+            let panel = if panel == FocusPanel::History && self.diff_is_open() {
+                FocusPanel::Diff
+            } else {
+                panel
+            };
             // `3` without a diff has nothing to focus; still consumed so the
             // digit never leaks into anything behind the panels.
             self.focus_panel(panel, window, cx);
@@ -1228,12 +1616,14 @@ mod tests {
             .into_iter()
             .map(FocusPanel::from_digit_key)
             .collect();
+        // `2` is the middle area; the key handler turns it into the diff
+        // while one is open. `4` is Details' old number.
         assert_eq!(
             panels,
             [
                 Some(Sidebar),
                 Some(History),
-                Some(Diff),
+                Some(Details),
                 Some(Details),
                 None,
                 None,

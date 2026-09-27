@@ -8,9 +8,18 @@ fn model_for_view(view: ChangeTrackingView) -> ContextMenuModel {
     let check = |enabled: bool| enabled.then_some("icons/check.svg".into());
 
     ContextMenuModel::new(vec![
-        ContextMenuItem::Header("Change tracking".into()),
-        ContextMenuItem::Description("Controls how Untracked files are grouped".into()),
+        ContextMenuItem::Header("Changes".into()),
+        ContextMenuItem::Description("One list, or staged apart from the rest".into()),
         ContextMenuItem::Separator,
+        ContextMenuItem::Entry {
+            label: ChangeTrackingView::Unified.menu_label().into(),
+            icon: check(view == ChangeTrackingView::Unified),
+            shortcut: Some("U".into()),
+            disabled: false,
+            action: Box::new(ContextMenuAction::SetChangeTrackingView {
+                view: ChangeTrackingView::Unified,
+            }),
+        },
         ContextMenuItem::Entry {
             label: ChangeTrackingView::Combined.menu_label().into(),
             icon: check(view == ChangeTrackingView::Combined),

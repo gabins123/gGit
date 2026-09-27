@@ -6,6 +6,10 @@ use gitcomet_state::model::{AuthRetryOperation, CommandLogEntry};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 
+mod changes;
+pub(in crate::view) use changes::ChangesQuery;
+pub(in crate::view) use changes::{ChangeLanes, ChangesFilter, toggle_plan};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingCommitAmend {
     repo_id: RepoId,
@@ -92,6 +96,10 @@ pub(in super::super) struct DetailsPaneView {
     /// Keyboard focus for the pane as a whole (`4`, `h`/`l`), for the commit
     /// views that have no status section to focus.
     pub(in super::super) panel_focus_handle: FocusHandle,
+    /// The pull request view's files, checks and conversation.
+    pull_request_list: gpui::ListState,
+    /// The pull request that list last showed, and its selected file.
+    pull_request_rows: Option<(Arc<crate::github::PullRequestDetail>, Option<usize>)>,
 
     pub(in super::super) untracked_scroll: UniformListScrollHandle,
     pub(in super::super) unstaged_scroll: UniformListScrollHandle,
@@ -192,6 +200,18 @@ pub(in super::super) struct DetailsPaneView {
     pub(in super::super) range_files_path_alignment_group: components::PathTruncationAlignmentGroup,
     pub(in super::super) worktree_files_path_alignment_group:
         components::PathTruncationAlignmentGroup,
+    /// The one-list view's caches, and what its filter shows.
+    changes: changes::ChangesCache,
+    pub(in crate::view) changes_filter: ChangesFilter,
+    /// The `/` filter: its box, what it parsed to, whether the box shows while
+    /// empty, and a focus to hand it on the next frame.
+    pub(in crate::view) changes_query_input: Entity<components::TextInput>,
+    _changes_query_subscription: gpui::Subscription,
+    changes_query: changes::ChangesQuery,
+    changes_query_open: bool,
+    changes_query_focus_pending: bool,
+    /// The Changes list's range selection.
+    changes_range: Option<changes::ChangesRange>,
 }
 
 pub(in super::super) struct DetailsPaneInit {
@@ -368,6 +388,22 @@ impl DetailsPaneView {
             cx.notify();
         });
 
+        let changes_query_input = cx.new(|cx| {
+            components::TextInput::new_inert(
+                components::TextInputOptions {
+                    placeholder: "Filter: words match fuzzily; .rs keeps a file type".into(),
+                    leading_icon: Some("icons/zoom.svg"),
+                    chromeless: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        let changes_query_subscription =
+            cx.observe_in(&changes_query_input, window, |this, input, window, cx| {
+                this.changes_query_input_changed(input, window, cx)
+            });
+
         let commit_message_scroll = ScrollHandle::new();
         let commit_message_input = cx.new(|cx| {
             let mut input = components::TextInput::new(
@@ -513,6 +549,8 @@ impl DetailsPaneView {
             status_section_resize: None,
             status_section_focus_handles: std::array::from_fn(|_| cx.focus_handle()),
             panel_focus_handle: cx.focus_handle().tab_index(0).tab_stop(false),
+            pull_request_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(400.0)),
+            pull_request_rows: None,
             untracked_scroll: UniformListScrollHandle::default(),
             unstaged_scroll: UniformListScrollHandle::default(),
             staged_scroll: UniformListScrollHandle::default(),
@@ -582,6 +620,14 @@ impl DetailsPaneView {
             range_files_path_alignment_group: components::PathTruncationAlignmentGroup::default(),
             worktree_files_path_alignment_group: components::PathTruncationAlignmentGroup::default(
             ),
+            changes: Default::default(),
+            changes_filter: ChangesFilter::default(),
+            changes_query_input,
+            _changes_query_subscription: changes_query_subscription,
+            changes_query: Default::default(),
+            changes_query_open: false,
+            changes_query_focus_pending: false,
+            changes_range: None,
         };
         pane.sync_scaled_section_heights_from_design();
         pane.set_theme(theme, cx);
@@ -2422,7 +2468,399 @@ impl DetailsPaneView {
 }
 
 impl DetailsPaneView {
-    /// The selected pull request: its state, branches, checks and files.
+    /// Review mode's Your review panel: the pending comments, and what
+    /// submitting will do.
+    fn review_panel_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let secondary = theme.colors.foreground.secondary;
+        let warning = theme.colors.status.warning.foreground;
+        let Some(root) = self.root_view.upgrade() else {
+            return div().into_any_element();
+        };
+        let (comments, selected, head_moved, thread, suggested, last_review, offline, outdated) = {
+            let root = root.read(cx);
+            let Some(review) = root.active_review() else {
+                return div().into_any_element();
+            };
+            let last_review = {
+                use super::super::pull_requests::PrLoad;
+                use super::super::review::SinceReview;
+                // GitHub text: plain, and only its first few lines.
+                let body = review
+                    .last_review
+                    .ready()
+                    .and_then(Option::as_ref)
+                    .map(|last| last.body.lines().take(3).collect::<Vec<_>>().join("\n"))
+                    .filter(|body| !body.trim().is_empty());
+                let line = match &review.last_review {
+                    PrLoad::Idle => None,
+                    PrLoad::Loading => Some("Loading your last review…".to_string()),
+                    PrLoad::Failed(err) => Some(format!("Couldn't load your last review: {err}")),
+                    PrLoad::Ready(None) => {
+                        Some("You haven't reviewed this pull request before.".to_string())
+                    }
+                    PrLoad::Ready(Some(_)) => review.last_review_line(std::time::SystemTime::now()),
+                };
+                let gone = review.since_review == Some(SinceReview::Gone);
+                (line, body, gone)
+            };
+            (
+                review.draft.comments.clone(),
+                review.selected_comment,
+                review.head_moved,
+                root.review_threads_at_cursor(cx)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                root.review_suggestions_at_cursor(cx)
+                    .into_iter()
+                    .map(|(_, suggestion)| suggestion.body.clone())
+                    .collect::<Vec<_>>(),
+                last_review,
+                review.viewed_sync == super::super::review::ViewedSync::Offline,
+                // GitHub text from anyone who can comment: plain text only.
+                review
+                    .outdated_threads()
+                    .map(|thread| {
+                        let first = thread.comments.first();
+                        (
+                            format!(
+                                "{}:{}",
+                                thread.path,
+                                thread.original_line.unwrap_or_default()
+                            ),
+                            first.map(|c| c.author.clone()).unwrap_or_default(),
+                            first
+                                .and_then(|c| c.body.lines().next())
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (last_line, last_body, last_gone) = last_review;
+        let count = comments.len();
+        let outdated_count = outdated.len();
+        let outdated_rows = outdated
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (at, author, first))| {
+                div()
+                    .id(SharedString::from(format!("review_outdated_{ix}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(theme.radii.control))
+                    .control_interaction(
+                        controls::InteractionStyle::new(theme),
+                        controls::InteractionState::default().selected(
+                            selected == Some(count + ix),
+                            theme.colors.interaction.selected_background,
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_size(theme.ui_text(11.5))
+                            .text_color(secondary)
+                            .child(div().truncate().child(at))
+                            .child(div().flex_none().child(author)),
+                    )
+                    .child(div().truncate().text_size(theme.ui_text(12.5)).child(first))
+            });
+        let rows = comments.into_iter().enumerate().map(|(ix, comment)| {
+            let file = comment
+                .anchor
+                .path
+                .rsplit_once('/')
+                .map_or(comment.anchor.path.as_str(), |(_, name)| name)
+                .to_string();
+            let first_line = comment.body.lines().next().unwrap_or_default().to_string();
+            let where_ = match &comment.reply_to {
+                Some(to) => format!("reply to {} · {}", to.author, comment.anchor.lines_label()),
+                None => comment.anchor.lines_label(),
+            };
+            div()
+                .id(SharedString::from(format!("review_comment_{ix}")))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .mx_1()
+                .px_2()
+                .py_1()
+                .rounded(px(theme.radii.control))
+                .control_interaction(
+                    controls::InteractionStyle::new(theme),
+                    controls::InteractionState::default().selected(
+                        selected == Some(ix),
+                        theme.colors.interaction.selected_background,
+                    ),
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        let root = this.root_view.clone();
+                        // The root repaints this pane; it can't while we're mid-update.
+                        window.defer(cx, move |window, cx| {
+                            let _ = root
+                                .update(cx, |root, cx| root.review_jump_to_comment(ix, window, cx));
+                        });
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_size(theme.ui_text(11.5))
+                        .text_color(secondary)
+                        .child(div().truncate().child(file))
+                        .child(div().flex_none().child(where_)),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(theme.ui_text(12.5))
+                        .child(first_line),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Your review"))
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(11.5))
+                            .text_color(warning)
+                            .child(format!("{count} pending")),
+                    ),
+            )
+            .when_some(last_line, |panel, line| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(secondary)
+                        .child(line)
+                        .when(last_gone, |block| {
+                            block.child(div().text_color(warning).child(
+                                "Your last review's commit is gone; showing everything.",
+                            ))
+                        })
+                        .when_some(last_body, |block, body| {
+                            block.child(
+                                div()
+                                    .max_h(px(64.0))
+                                    .overflow_hidden()
+                                    .text_size(theme.ui_text(12.5))
+                                    .text_color(theme.colors.foreground.primary)
+                                    .child(body),
+                            )
+                        }),
+                )
+            })
+            .when(offline, |panel| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(warning)
+                        .child("GitHub couldn't be reached, so viewed marks are this computer's only."),
+                )
+            })
+            .when(head_moved, |panel| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(warning)
+                        .child("The pull request has new commits since your pending comments were written. Check their lines before submitting."),
+                )
+            })
+            .child(
+                div()
+                    .id("review_comment_rows")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .when(count == 0, |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(theme.ui_text(12.5))
+                                .text_color(secondary)
+                                .child("No comments yet. In the diff, c comments on the line under the cursor; shift+j/k selects more lines."),
+                        )
+                    })
+                    .children(rows)
+                    .when(outdated_count > 0, |list| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .pt_2()
+                                .pb_1()
+                                .flex()
+                                .gap_2()
+                                .text_size(theme.ui_text(12.0))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("Outdated conversations ({outdated_count})")),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(secondary)
+                                        .child("j/k pick · r reply"),
+                                ),
+                        )
+                        .children(outdated_rows)
+                    }),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(secondary)
+                    .child("Saved on this computer. Nothing is on GitHub until you submit: the comments go up as one review, replies right after it.")
+                    .child("enter go to line · e edit · d d delete · S submit"),
+            )
+            .when(!suggested.is_empty(), |panel| {
+                // Codex's text, shown plain; it only becomes yours with `a`.
+                panel.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(theme.colors.stroke.default)
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(theme.ui_text(12.5))
+                                        .child("Codex suggestion on this line"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme.ui_text(11.5))
+                                        .text_color(secondary)
+                                        .child("in the diff: a add to my review · x drop"),
+                                ),
+                        )
+                        .children(
+                            suggested
+                                .into_iter()
+                                .map(|body| div().text_size(theme.ui_text(12.5)).child(body)),
+                        ),
+                )
+            })
+            .when(!thread.is_empty(), |panel| {
+                let heading = if thread.len() == 1 {
+                    "Thread on this line".to_string()
+                } else {
+                    format!("{} threads on this line", thread.len())
+                };
+                // GitHub text from anyone who can comment: plain text only.
+                let said = thread.into_iter().flat_map(|thread| thread.comments).map(|comment| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(theme.ui_text(11.0))
+                                .text_color(secondary)
+                                .child(format!(
+                                    "{} · {}",
+                                    comment.author,
+                                    comment.at.get(..10).unwrap_or(&comment.at)
+                                )),
+                        )
+                        .child(div().text_size(theme.ui_text(12.5)).child(comment.body))
+                });
+                panel.child(
+                    div()
+                        .id("review_thread_at_cursor")
+                        .max_h(px(260.0))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(theme.colors.stroke.default)
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(theme.ui_text(12.5))
+                                        .child(heading),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme.ui_text(11.5))
+                                        .text_color(secondary)
+                                        .child("in the diff: r reply · t next thread"),
+                                ),
+                        )
+                        .children(said),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// `J`/`K`: scrolls the pull request view most of a page.
+    pub(in crate::view) fn scroll_pull_request_details(
+        &mut self,
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let list = &self.pull_request_list;
+        let page = list.viewport_bounds().size.height * 0.8;
+        list.scroll_by(page * f32::from(direction));
+        cx.notify();
+    }
+
+    /// The selected pull request: its state, branches, files, checks and
+    /// conversation.
     fn pull_request_details_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         use super::super::pull_requests::PrLoad;
 
@@ -2431,7 +2869,7 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (detail, number, selected_file, fetching) = {
+        let (detail, number, selected_file, fetching, listing, files_error) = {
             let root = root.read(cx);
             let Some(prs) = root.active_pull_requests() else {
                 return div().into_any_element();
@@ -2440,7 +2878,9 @@ impl DetailsPaneView {
                 prs.detail.clone(),
                 prs.selected.unwrap_or_default(),
                 prs.selected_file,
-                matches!(prs.diff_base, PrLoad::Loading),
+                prs.diff_asked && matches!(prs.diff_base, PrLoad::Loading),
+                prs.files_listing(),
+                prs.files_error.clone(),
             )
         };
         let detail = match detail {
@@ -2493,8 +2933,152 @@ impl DetailsPaneView {
             )
         };
 
-        let files = detail.files.iter().enumerate().map(|(ix, file)| {
+        // A file row: its text and the air around it.
+        let scale = crate::ui_scale::UiScale::current(cx);
+        let row_height = scale.px(6.0) + scale.ui_text(12.0) * 1.618;
+        self.sync_pull_request_list(&detail, selected_file, row_height);
+        let listing_line = if listing {
+            Some(format!(
+                "Listing files… {} of {}",
+                detail.files.len(),
+                detail.changed_files
+            ))
+        } else {
+            files_error.map(|err| format!("Some files couldn't be listed ({err}). R retries."))
+        };
+        let list = self.pull_request_list.clone();
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .gap_1()
+            .py_2()
+            .child(
+                div()
+                    .px_3()
+                    .text_size(theme.ui_text(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} #{}", detail.title, detail.number)),
+            )
+            .child(line(format!("{state} · {review} · {mergeable}")))
+            .child(line(format!(
+                "{} wants to merge {} into {}",
+                detail.author, detail.head, detail.base
+            )))
+            .child(line(checks_line))
+            .when(detail.too_large_for_app(), |panel| {
+                panel.child(line(format!(
+                    "GitHub lists only the first {} of its {} files, so it's reviewed there: o opens it.",
+                    crate::github::MAX_LISTED_FILES,
+                    detail.changed_files
+                )))
+            })
+            .when_some(listing_line, |panel, text| panel.child(line(text)))
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .text_size(theme.ui_text(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!(
+                        "Changed files ({})  +{} −{}",
+                        detail.changed_files, detail.additions, detail.deletions
+                    )),
+            )
+            // Only the rows in sight are laid out: a pull request can list
+            // thousands of files.
+            .child(
+                div()
+                    .id("pull_request_files")
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(
+                        gpui::list(
+                            list.clone(),
+                            cx.processor(|this, ix, _window, cx| {
+                                this.render_pull_request_item(ix, cx)
+                            }),
+                        )
+                        .size_full(),
+                    )
+                    .child(
+                        components::Scrollbar::new("pull_request_files_scrollbar", list)
+                            .auto_hide()
+                            .render(theme),
+                    ),
+            )
+            .child(line(if fetching {
+                "Fetching the pull request's commits…".to_string()
+            } else {
+                "enter diff · space checkout · r review · M merge · J/K scroll".to_string()
+            }))
+            .into_any_element()
+    }
+
+    /// Keeps the list's items in step with the pull request shown: pages of
+    /// files append under the scroll without moving it, another pull request
+    /// starts at the top, and `j`/`k` keep the selected file in sight.
+    fn sync_pull_request_list(
+        &mut self,
+        detail: &Arc<crate::github::PullRequestDetail>,
+        selected_file: Option<usize>,
+        row_height: Pixels,
+    ) {
+        let list = &self.pull_request_list;
+        let count = pull_request_item_count(detail);
+        let previous = self
+            .pull_request_rows
+            .replace((Arc::clone(detail), selected_file));
+        let moved = previous
+            .as_ref()
+            .is_some_and(|(_, was)| *was != selected_file);
+        // Every item counts as a file row until it's drawn, so a file far
+        // past the rows drawn so far can be scrolled to, and the scrollbar
+        // spans them all.
+        let reveal = match previous {
+            Some((shown, _)) if Arc::ptr_eq(&shown, detail) => false,
+            // More files, or a reload: the scroll stays where it is.
+            Some((shown, _)) if shown.number == detail.number => {
+                let top = list.logical_scroll_top();
+                list.reset_with_uniform_height(count, row_height);
+                list.scroll_to(top);
+                false
+            }
+            _ => {
+                list.reset_with_uniform_height(count, row_height);
+                true
+            }
+        };
+        if (reveal || moved)
+            && let Some(ix) = selected_file
+        {
+            list.scroll_to_reveal_item(ix);
+        }
+    }
+
+    /// One item of the pull request list: its files, then its checks and its
+    /// conversation, each under a title.
+    fn render_pull_request_item(&mut self, ix: usize, cx: &mut gpui::Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let secondary = theme.colors.foreground.secondary;
+        let Some((detail, selected_file)) = self.pull_request_rows.clone() else {
+            return div().into_any_element();
+        };
+        let section_title = |text: String| {
             div()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .text_size(theme.ui_text(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text)
+                .into_any_element()
+        };
+        if let Some(file) = detail.files.get(ix) {
+            return div()
                 .id(SharedString::from(format!("pull_request_file_{ix}")))
                 .flex()
                 .items_center()
@@ -2545,71 +3129,96 @@ impl DetailsPaneView {
                         .text_color(theme.colors.status.danger.foreground)
                         .child(format!("−{}", file.deletions)),
                 )
-        });
-
+                .into_any_element();
+        }
+        let mut ix = ix - detail.files.len();
+        if !detail.check_runs.is_empty() {
+            if ix == 0 {
+                return section_title(format!("Checks ({})", detail.check_runs.len()));
+            }
+            if let Some(run) = detail.check_runs.get(ix - 1) {
+                use crate::github::CheckState;
+                let (mark, color) = match run.state {
+                    CheckState::Failing => ("✗", theme.colors.status.danger.foreground),
+                    CheckState::Pending => ("•", theme.colors.status.warning.foreground),
+                    CheckState::Passing => ("✓", theme.colors.status.success.foreground),
+                };
+                return div()
+                    .px_3()
+                    .flex()
+                    .gap_2()
+                    .text_size(theme.ui_text(12.0))
+                    .child(div().flex_none().text_color(color).child(mark))
+                    .child(div().min_w(px(0.0)).truncate().child(run.name.clone()))
+                    .into_any_element();
+            }
+            ix -= detail.check_runs.len() + 1;
+        }
+        if detail.conversation.is_empty() {
+            return div().into_any_element();
+        }
+        if ix == 0 {
+            return section_title(format!("Conversation ({})", detail.conversation.len()));
+        }
+        let Some(entry) = detail.conversation.get(ix - 1) else {
+            return div().into_any_element();
+        };
+        // GitHub text from anyone who can comment: plain text only.
         div()
+            .px_3()
+            .py_1()
             .flex()
             .flex_col()
-            .size_full()
-            .min_h(px(0.0))
-            .gap_1()
-            .py_2()
+            .gap(px(2.0))
             .child(
                 div()
-                    .px_3()
-                    .text_size(theme.ui_text(15.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("{} #{}", detail.title, detail.number)),
-            )
-            .child(line(format!("{state} · {review} · {mergeable}")))
-            .child(line(format!(
-                "{} wants to merge {} into {}",
-                detail.author, detail.head, detail.base
-            )))
-            .child(line(checks_line))
-            .when(detail.too_large_for_app(), |panel| {
-                panel.child(line(format!(
-                    "Too large to review here ({} files, +{} −{}). o opens it on GitHub.",
-                    detail.changed_files, detail.additions, detail.deletions
-                )))
-            })
-            .child(
-                div()
-                    .px_3()
-                    .pt_2()
-                    .text_size(theme.ui_text(12.0))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(theme.ui_text(11.0))
+                    .text_color(secondary)
                     .child(format!(
-                        "Changed files ({})  +{} −{}",
-                        detail.changed_files, detail.additions, detail.deletions
+                        "{} {} · {}",
+                        entry.author,
+                        entry.verb,
+                        entry.at.get(..10).unwrap_or(&entry.at)
                     )),
             )
-            .child(
-                div()
-                    .id("pull_request_files")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .children(files),
-            )
-            .child(line(if fetching {
-                "Fetching the pull request's commits…".to_string()
-            } else {
-                "enter opens the diff · r review · o GitHub".to_string()
-            }))
+            .when(!entry.body.is_empty(), |row| {
+                row.child(
+                    div()
+                        .text_size(theme.ui_text(12.0))
+                        .child(entry.body.clone()),
+                )
+            })
             .into_any_element()
     }
 }
 
+/// The pull request list's items: files, then checks and conversation, each
+/// with a title when there are any.
+fn pull_request_item_count(detail: &crate::github::PullRequestDetail) -> usize {
+    let section = |len: usize| if len == 0 { 0 } else { len + 1 };
+    detail.files.len() + section(detail.check_runs.len()) + section(detail.conversation.len())
+}
+
 impl Render for DetailsPaneView {
-    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let pull_request = self
+    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.changes_query_focus_pending) {
+            let handle = self.changes_query_input.read(cx).focus_handle();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
+        let (reviewing, pull_request) = self
             .root_view
             .upgrade()
-            .is_some_and(|root| root.read(cx).pull_request_details_active());
-        let content = if pull_request {
+            .map(|root| {
+                let root = root.read(cx);
+                (
+                    root.active_review().is_some(),
+                    root.pull_request_details_active(),
+                )
+            })
+            .unwrap_or_default();
+        let content = if reviewing {
+            self.review_panel_view(cx)
+        } else if pull_request {
             self.pull_request_details_view(cx)
         } else {
             self.commit_details_view(cx)

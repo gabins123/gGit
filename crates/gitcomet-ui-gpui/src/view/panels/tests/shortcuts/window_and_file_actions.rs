@@ -311,8 +311,14 @@ fn shared_context_menu_rows_fill_the_popover_width(cx: &mut gpui::TestAppContext
         popover_is_open(cx, &view),
         "expected the change-tracking settings popover to be open"
     );
-    assert_context_menu_entry_fills_popover_width(cx, "context_menu_combine_with_unstaged");
-    assert_context_menu_entry_fills_popover_width(cx, "context_menu_show_separate_untracked_block");
+    assert_context_menu_entry_fills_popover_width(
+        cx,
+        "context_menu_sections_untracked_with_unstaged",
+    );
+    assert_context_menu_entry_fills_popover_width(
+        cx,
+        "context_menu_sections_separate_untracked_block",
+    );
 }
 
 #[gpui::test]
@@ -335,7 +341,10 @@ fn context_menus_grow_wider_with_ui_zoom(cx: &mut gpui::TestAppContext) {
     draw_and_drain_test_window(cx);
 
     let default_width = debug_width(cx, "app_popover");
-    assert_context_menu_entry_fills_popover_width(cx, "context_menu_combine_with_unstaged");
+    assert_context_menu_entry_fills_popover_width(
+        cx,
+        "context_menu_sections_untracked_with_unstaged",
+    );
 
     set_ui_scale_percent_for_test(cx, &view, 200);
     draw_and_drain_test_window(cx);
@@ -350,7 +359,10 @@ fn context_menus_grow_wider_with_ui_zoom(cx: &mut gpui::TestAppContext) {
         zoomed_width > default_width * 1.6,
         "expected the context menu to grow substantially with zoom (default={default_width}, zoomed={zoomed_width})"
     );
-    assert_context_menu_entry_fills_popover_width(cx, "context_menu_combine_with_unstaged");
+    assert_context_menu_entry_fills_popover_width(
+        cx,
+        "context_menu_sections_untracked_with_unstaged",
+    );
 }
 
 #[gpui::test]

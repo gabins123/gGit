@@ -37,15 +37,16 @@ fn model_for_sort(
     current: crate::view::rows::CommitFileSort,
 ) -> ContextMenuModel {
     let check = |selected: bool| selected.then_some("icons/check.svg".into());
-    let header =
-        match list {
-            // A linked worktree's list is uncommitted changes too, so it cannot
-            // borrow the committed-files wording.
-            crate::view::rows::FileListId::Status(_)
-            | crate::view::rows::FileListId::WorktreeFiles => "Sort files",
-            crate::view::rows::FileListId::CommitFiles
-            | crate::view::rows::FileListId::RangeFiles => "Sort committed files",
-        };
+    let header = match list {
+        // A linked worktree's list is uncommitted changes too, so it cannot
+        // borrow the committed-files wording.
+        crate::view::rows::FileListId::Status(_)
+        | crate::view::rows::FileListId::Changes
+        | crate::view::rows::FileListId::WorktreeFiles => "Sort files",
+        crate::view::rows::FileListId::CommitFiles | crate::view::rows::FileListId::RangeFiles => {
+            "Sort committed files"
+        }
+    };
     let mut items = vec![
         ContextMenuItem::Header(header.into()),
         ContextMenuItem::Separator,

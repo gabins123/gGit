@@ -474,6 +474,17 @@ pub fn user_themes_dir() -> Option<PathBuf> {
     Some(app_data_dir()?.join("themes"))
 }
 
+/// Where pending pull request reviews wait until they are submitted: one
+/// file per repository and pull request. None under a test harness, so tests
+/// never read or leave drafts on disk.
+pub fn review_drafts_dir() -> Option<PathBuf> {
+    if cfg!(test) || running_under_test_harness() {
+        return None;
+    }
+
+    Some(app_data_dir()?.join("review-drafts"))
+}
+
 fn non_empty_path(value: Option<&OsStr>) -> Option<PathBuf> {
     let value = value?;
     if value.is_empty() {

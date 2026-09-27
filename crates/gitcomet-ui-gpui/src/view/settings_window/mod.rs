@@ -112,6 +112,11 @@ fn custom_external_editor_path_prompt_options() -> gpui::PathPromptOptions {
 
 const CHANGE_TRACKING_OPTIONS: &[(&str, ChangeTrackingView, &str)] = &[
     (
+        "settings_window_change_tracking_unified",
+        ChangeTrackingView::Unified,
+        "Every changed file once, staged or not, like lazygit",
+    ),
+    (
         "settings_window_change_tracking_combined",
         ChangeTrackingView::Combined,
         "Keep untracked files inside the Unstaged section",

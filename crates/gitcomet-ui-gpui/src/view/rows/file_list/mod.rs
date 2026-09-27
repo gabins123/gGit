@@ -41,6 +41,8 @@ pub(in crate::view) struct FileOrdinal(pub usize);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(in crate::view) enum FileListId {
     Status(crate::view::StatusSection),
+    /// The one-list view of the working tree's changes.
+    Changes,
     CommitFiles,
     WorktreeFiles,
     RangeFiles,
@@ -99,7 +101,7 @@ impl FileListId {
     /// How the filter tooltips name what the counts belong to.
     pub(in crate::view) const fn filter_scope(self) -> &'static str {
         match self {
-            Self::Status(_) => "the working tree",
+            Self::Status(_) | Self::Changes => "the working tree",
             Self::CommitFiles => "this commit",
             Self::WorktreeFiles => "this worktree",
             Self::RangeFiles => "this comparison",

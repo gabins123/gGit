@@ -43,17 +43,18 @@ macOS-only window-management shortcuts:
 
 ## Panel navigation
 
-Lazygit-style keyboard focus across the four main panels. The focused panel carries an outline.
+Lazygit-style keyboard focus across the main panels. The focused panel carries an outline.
 
 These keys only work while a panel itself has focus (or nothing does). They are inert while typing in any text field, in the embedded terminal, and while a menu, popover, picker, dialog, the command palette or the conflict resolver has focus.
 
 | Action | Key | Notes |
 | --- | --- | --- |
-| Focus Sidebar / History / Diff / Details | `1` / `2` / `3` / `4` | Opens a collapsed Sidebar or Details first. History and the diff share the main area: `2` closes an open diff, and `3` does nothing unless a diff is open. |
+| Focus Sidebar / the middle / Details | `1` / `2` / `3` | Opens a collapsed Sidebar or Details first. History and the diff share the middle area, and `2` focuses whichever is showing; `Escape` closes a diff back to History. `4` also focuses Details. |
 | Previous / next panel | `h` / `l`, `Left` / `Right` | Skips collapsed panels and whichever of History or Diff is not showing. Never wraps. |
 | Move within the focused panel | `j` / `k`, `Down` / `Up` | `j` moves down and `k` up. Sidebar: next/previous branch, revealed in History. History: next/previous commit. Diff: next/previous change. Details: next/previous file, opening its diff; starts at the first file when none is selected. |
 | Open | `Enter` | Sidebar → History. History → Details (the commit's files). Details → the file's diff. |
 | Back from a diff | `Escape` | Closes the diff and returns focus to the panel it was opened from. |
+| Back from a commit to your changes | `Escape` | History or Details, while a selected commit fills Details: drops the selection so Details lists your changes again. |
 | Previous / next sidebar tab | `[` / `]` | Branches, Files and Pull requests. |
 | List the focused panel's keys | `?` | Modal; `Escape` or `?` closes it. The status bar also shows the focused panel's main keys. |
 
@@ -70,8 +71,8 @@ Single keys for everyday Git work, lazygit-style. Each one runs the same action 
 | Pull / push | `p` / `Shift+P` | Any panel | The main Pull and Push buttons: the default pull mode, and a set-upstream dialog for a branch without one. |
 | Fetch all remotes | `f` | Any panel | |
 | Stash the changes | `s` | Any panel | Opens the stash dialog. Apply, pop and drop are in the command palette. |
-| Stage / unstage the open file, then the next | `Space` | Details, Diff | The diff's existing `Space`, reachable from Details too. |
-| Stage everything, or unstage it all | `a` | Details | Stages all changes; with nothing left to stage, unstages everything. |
+| Stage / unstage the open file | `Space` | Details, Diff | In the Changes list the file keeps its place and its status letters flip. In the sectioned views it moves to the other section, and the next file opens. |
+| Stage everything, or unstage it all | `a` | Details | Stages all changes; with nothing left to stage, unstages everything. In the Changes list, a filter narrows it to the files shown. |
 | Discard the open file's changes | `d` | Details, Diff | Always confirms. Not for conflicted files. |
 | The selection's context menu | `m` | Any panel | Sidebar: the branch. History: the commit. Details and Diff: the open file. |
 | Check out the branch | `Space` | Sidebar | A remote branch asks for the local branch name. |
@@ -79,12 +80,33 @@ Single keys for everyday Git work, lazygit-style. Each one runs the same action 
 | Delete the branch | `Shift+D` twice | Sidebar | The first press asks for the second. Local branches other than the checked-out one. An unmerged branch then asks before force-deleting. |
 | Merge it into the current branch | `Shift+M` twice | Sidebar | The first press asks for the second. |
 | Rebase the current branch onto it | `Shift+R` | Sidebar | Confirms first. |
+| Open a pull request on GitHub | `o` | Sidebar | lazygit's key: GitHub's new pull request page for the branch, in the browser, against the default branch. The branch must already be on GitHub. |
+| Set up a pull request from the branch | `Shift+O` | Sidebar | The New pull request dialog for that branch; see `n` under Pull requests tab. |
+| New pull request from the current branch | `Shift+N` | Any panel | The same dialog, for the checked-out branch. |
 | Cherry-pick the commit | `Shift+C` | History | Confirms first. Not the HEAD commit. |
 | Revert the commit | `t` | History | Confirms first. |
 | Reset to the commit | `g` | History | A mixed reset, after confirming. Soft and hard resets are in the commit's menu (`m`). |
 | Tag the commit | `Shift+T` | History | |
 
 On the Pull requests tab, its own keys (`n`, `r`, `o`, `Shift+R`) take precedence. While the conflict resolver is open, `a`–`d` (with or without `Shift`) stay its picks.
+
+### Changes list
+
+Details lists every changed file once, staged or not, the way lazygit does. Two status letters lead each row: what is staged (left, green) and what is not (right, red); `??` is untracked, `UU` conflicted. So `M ` is fully staged, ` M` not at all, and `MM` both; `D?` is a file removed from the index (`git rm --cached`) but still on disk, where staging it undoes the removal. A file's diff opens on what is still unstaged, and on the staged change once nothing else is. The header's menu switches back to the sectioned views (Unstaged / Staged, with or without a separate Untracked block); the choice is saved.
+
+| Action | Key | Notes |
+| --- | --- | --- |
+| Next / previous file | `j` / `k` | Details. Opens its diff; `F1` / `F4` and the diff's arrows do the same. A file the filter no longer shows (say, just staged under Unstaged) steps on from where it sat. |
+| Stage / unstage the open file | `Space` | Details or Diff. Stages what is unstaged, or unstages a fully staged file. The row stays where it is. The list updates as soon as the key is pressed; git catches up behind it. |
+| Select a range of files | `Shift+J` / `Shift+K`, `Shift+Down` / `Shift+Up`, shift-click | Details. The open file moves and the range stretches back to where it started. `Space` and `Ctrl+S` / `Ctrl+U` then act on the whole range, and `d` discards its files' changes. `Escape` or a plain `j` / `k` drops it. |
+| Stage or unstage everything shown | `a` | Stages what the list shows; when none of it is unstaged, unstages it. Unfiltered, that is every change. |
+| Stage or unstage the open file's folder | `Shift+Space` | Details. The same rule over the folder's shown files; also a folder row's hover button in the tree. |
+| Stage / unstage only | `Ctrl+S` / `Ctrl+U` | Diff. One direction of `Space`, whichever side of the file the diff shows. |
+| Filter by path or file type | `/` | Any panel, while Details shows the Changes list. A box opens above the list and filters as you type. Each word must fuzzy-match the path (its letters in that order, anything between: `pnl` finds `panel_focus.rs`); `.rs` or `*.rs` keeps that file type, and several types keep any of them. The most common types are chips under the box that add or remove themselves on click. `Enter` keeps the filter and goes back to the list, where `j` / `k`, `space` and `a` work on what it shows; `Esc` clears it, from the box or the list. |
+| Kind | `Shift+F` | Cycles All, Unstaged, Staged, Untracked, like lazygit's file filter. The chips above the list show each count and switch on click. |
+| Tree or flat list | `` ` `` | lazygit's key. A folder's hover button stages it, or unstages it once it is all staged. |
+| Sort | `o` | Path, file type or size of the change. |
+| Discard, menu, commit | `d`, `m`, `c` | As in Git actions above. |
 
 ### Pull requests tab
 
@@ -94,11 +116,43 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | --- | --- | --- |
 | Next / previous pull request | `j` / `k` | Sidebar. Selecting one shows it in Details. |
 | Next / previous changed file | `j` / `k` | Details, while it shows a pull request. Moves the diff along once one is open. |
-| Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. Pull requests over 100 files or 20,000 changed lines are left to GitHub. |
-| New pull request | `n` | From the checked-out branch, which must already be pushed: creating never pushes. In the dialog, `Alt+D` toggles draft, `Alt+P` runs the normal push, and `Ctrl+Enter` (`Cmd+Enter`) creates. |
-| Review | `r` | `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
+| Open the diff | `Enter` | The pull request's commits are fetched by object id — no branch, ref or working-tree file changes — and shown as a merge-base..head diff. The commits are fetched as soon as a pull request is selected, so the diff is usually ready by the time you ask. Before `Enter`, `j` / `k` in Details only move the highlight. Files past the first 100 are listed in the background, several pages at once, and append to the list (and to review mode's) as they arrive; Details says "Listing files… N of M" until the list is whole. A page that fails three times leaves its files out, and Details says so: `Shift+R` lists them again. GitHub lists at most 3,000 files; a larger pull request is reviewed on GitHub. |
+| New pull request | `n` | From the checked-out branch (`Shift+N` from any panel; `Shift+O` on another branch in the Branches tab). The dialog fills itself in the way `gh pr create --fill` would: the base is the remote's default branch (`origin/HEAD`), and the title and description come from the branch's commits (one commit: its subject and body; several: the branch name and a list of their subjects). Fields you type into first are left alone. `Alt+B` steps the base through the remote's branches, and matching ones are offered as you type. A branch GitHub doesn't have, or doesn't have all of, is pushed first, and the dialog names where (`git push --set-upstream` for a new one: to `origin` when that is on GitHub, as on a fork); `Alt+P` turns that off. A branch that tracks another name (say `origin/main`, after `git switch -c feat origin/main`) is pushed as a new branch of its own name, never onto the one it tracks. The push runs git directly with terminal prompts off, so it needs a credential helper or an SSH agent; failing that, push with `Shift+P` first. `Alt+D` toggles draft; `Alt+O` opens GitHub's page instead, or the pull request already open from the branch (matched by owner and branch, so a fork's `main` isn't yours), which the dialog also warns about and won't create a second of. `Ctrl+Enter` (`Cmd+Enter`) pushes if needed and creates. |
+| Review | `r` | Opens review mode for the pull request (below), picking up a pending review of it where it was left. |
+| Your review queue | | The list leads with the pull requests waiting for your review, then the ones with a review of yours pending on this computer (with its count), then the rest; `j` / `k` follow that order. |
+| Quick review | `Shift+S` | Just a verdict and a summary, no line comments. `Alt+C` / `Alt+A` / `Alt+X` pick Comment, Approve or Request changes; `Ctrl+Enter` (`Cmd+Enter`) posts. Comment and Request changes need text. |
+| Check out locally | `Space` | Sidebar or Details. Runs `gh pr checkout`, which fetches the branch into a local branch of the same name and checks it out. A pull request from a fork (or one whose details haven't loaded) gets its own `pr/<number>` branch instead, so a same-named local branch is never fast-forwarded to someone else's commits. git refuses over conflicting uncommitted changes. |
+| Merge on GitHub | `Shift+M` | Confirms first. `Alt+M` / `Alt+S` / `Alt+R` pick merge commit, squash or rebase; `Alt+D` also deletes the branch on GitHub (not offered for forks); `Enter` merges. GitHub refuses if the branch moved since its details loaded, so only the commits you saw land. With a required merge queue, GitHub queues it instead. Local branches are left alone. |
+| Scroll the checks and conversation | `Shift+J` / `Shift+K` | Details. Below the changed files it lists each check (failing first) and the comments and reviews, oldest first, as plain text. Hidden comments are left out. |
 | Open on GitHub | `o` | The selected pull request, or the repository's pull request list. |
-| Refresh | `Shift+R` | The list loads when the tab first shows; there is no polling. |
+| Refresh | `Shift+R` | The list loads when the tab first shows; there is no polling. Also lists again the files of the selected pull request that failed to list. |
+
+### Review mode
+
+`r` on a pull request reviews it file by file. Line comments wait as a pending review, saved on this computer (per repository and pull request) until `S` posts them all together as one GitHub review, through `gh api`, on the head commit the diff shows. If the pull request gets new commits, the review moves to them and asks you to check your comments' lines. Nothing of the review reaches GitHub before that; viewed marks are the exception, your own private state on GitHub, sent as you mark each file. The Sidebar lists the pull request's files, the main area shows the file's diff, and Details becomes Your review.
+
+Re-reviewing works like GitHub's: Your review opens with your last submitted review of the pull request (its verdict, when, the commit it was on, and how many commits and files changed since), and the file list badges the files updated since it. Viewed marks are GitHub's own, per user and pull request: review mode loads them when it opens, and `Space` changes them on GitHub too (a refused change is put back, with a message). They stay after you submit, and a file you viewed that a new commit changed shows "changed since you viewed" and counts as not viewed. If GitHub can't be reached, the marks on this computer are used instead, and Your review says so; the files you mark or unmark meanwhile go up to GitHub once it can be reached, unless the pull request got new commits since. Threads whose lines changed since (outdated) are listed under "Outdated conversations" in Your review, and counted per file in the file list.
+
+| Action | Key | Where | Notes |
+| --- | --- | --- | --- |
+| Move the line cursor | `j` / `k`, `Down` / `Up` | Diff | The cursor starts on the file's first change. |
+| Select lines | `Shift+J` / `Shift+K`, `Shift+Down` / `Shift+Up` | Diff | Grows a selection from the cursor; a plain move drops it, as does `Escape`. No modes. |
+| Comment | `c` | Diff | On the line or the selected lines. `Ctrl+Enter` adds it to the review; `Escape` closes the box and keeps the text for those lines. GitHub only takes comments on changed lines and the 3 lines around them. |
+| Suggest a change | `Alt+S` | Comment box | Puts the selected lines in a GitHub suggestion block, after what's typed, to edit into the fix. GitHub then offers to commit it. Not on removed lines. |
+| Next / previous thread | `t` / `Shift+T` | Diff | Threads already on GitHub, marked in blue (your pending comments are amber). Details shows the thread under the cursor. |
+| Reply | `r` | Diff | To the thread on the line under the cursor. The reply waits with the rest of the review and posts right after it. |
+| Codex suggestions | `i` then `p` | Any panel | In review mode, Codex reviews the pull request's patch as suggested line comments, marked in grey; `t` steps to them too and Details shows the one under the cursor. Nothing is posted: `a` adopts it as your pending comment (edit or delete it like any other), `x` drops it. |
+| Next / previous change | `}` / `{` | Diff | |
+| Next / previous file | `]` / `[` | Any panel | `j` / `k` in the Sidebar too. |
+| Filter the file list | `/` | Sidebar, Diff | A box above the review's file list; typing filters as you go, the same way the Changes list's `/` does: each word matches the path fuzzily, `.rs` or `*.rs` keeps that file type. `Enter` keeps the filter and goes back to the list; `Escape` clears it, from the box or the list. `j` / `k`, `]` / `[` and `Space`'s next unviewed file walk only the files listed. |
+| Show viewed files | `Shift+V` | Any panel | Viewed files are hidden from the file list by default, the open one too (its diff stays up, and `j` / `k` go on from it); the header says how many ("7 viewed hidden (V shows)"). Files changed since you viewed them count as not viewed. `Shift+V` again hides them. |
+| Retry missing files | `Shift+R` | Any panel | A pull request over 100 files lists the rest in the background (the file list's header says "listing N of M…"); when some fail to list, it says "some files missing · R retries". |
+| Mark the file viewed | `Space` | Diff, Sidebar | On GitHub too. Then goes to the next file not yet viewed. `Space` again unmarks it. |
+| Changes since your last review | `Shift+L` | Any panel | GitHub's "Changes since your last review": the file list keeps to the files changed since your last submitted review, and the diff runs from that review's commit to the head (the header says which). `j` / `k`, `]` / `[` and `Space`'s next unviewed file keep to those files. GitHub only takes comments on the pull request's own changes, so here `c` takes new-side lines inside them (and the 3 lines around) and refuses old-side lines; only new-side thread and suggestion marks show. `Shift+L` again is the whole pull request. Not offered if you never reviewed it, nothing changed, or that review's commit is gone (force-pushed away). |
+| Go to a pending comment | `Enter` | Details | `j` / `k` pick one; `e` edits it, `d` `d` deletes it. |
+| Reply to an outdated conversation | `r` | Details | `j` / `k` go on past your pending comments to the outdated conversations; `r` replies to the picked one. The reply waits with the rest of the review. |
+| Submit | `Shift+S` | Any panel | The review dialog, with the verdict and summary, and the pending line comments going up with it; replies post right after. A Comment review with line comments needs no summary; Request changes always does, and pending replies alone post without a review. Whatever reaches GitHub leaves the draft, even if something after it fails; review mode closes once nothing is left. |
+| Leave | `q` | Any panel | Back to the pull request list. The pending review stays saved; `r` picks it up again. |
 
 ### Codex
 

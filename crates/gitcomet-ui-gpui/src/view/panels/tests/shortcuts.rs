@@ -955,7 +955,7 @@ fn history_context_menu_shortcuts_match_expected_actions(cx: &mut gpui::TestAppC
     let change_tracking_model = cx.update(|_window, app| {
         context_menu_model_for(&view, app, PopoverKind::ChangeTrackingSettings)
     });
-    assert_declared_shortcuts(&change_tracking_model, &["C", "S"]);
+    assert_declared_shortcuts(&change_tracking_model, &["U", "C", "S"]);
     assert_shortcut_action!(
         change_tracking_model,
         "C",

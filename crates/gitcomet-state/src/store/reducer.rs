@@ -5,6 +5,8 @@ mod effects;
 mod external_and_history;
 mod git_hook_activity;
 mod history_authors;
+#[cfg(test)]
+mod index_overlay_tests;
 mod indexed_history;
 #[cfg(test)]
 mod line_stats_tests;
@@ -793,6 +795,12 @@ pub(crate) fn fill_select_diff_inline(
     diff_selection::fill_select_diff_inline(repos, state, repo_id, target, mode, effects)
 }
 
+fn begin_pending_index_op(state: &mut AppState, repo_id: RepoId, stage: bool, paths: RepoPathList) {
+    if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
+        repo_state.begin_pending_index_op(stage, paths);
+    }
+}
+
 #[inline]
 pub(crate) fn fill_stage_path_inline(
     state: &mut AppState,
@@ -801,6 +809,7 @@ pub(crate) fn fill_stage_path_inline(
     effects: &mut SinglePathActionEffects,
 ) {
     begin_local_action(state, repo_id);
+    begin_pending_index_op(state, repo_id, true, RepoPathList::new(vec![path.clone()]));
     effects.push(Effect::StagePath { repo_id, path });
 }
 
@@ -812,6 +821,7 @@ pub(crate) fn fill_stage_paths_inline(
     effects: &mut BatchPathActionEffects,
 ) {
     begin_local_action(state, repo_id);
+    begin_pending_index_op(state, repo_id, true, paths.clone());
     effects.push(Effect::StagePaths { repo_id, paths });
 }
 
@@ -823,6 +833,7 @@ pub(crate) fn fill_unstage_path_inline(
     effects: &mut SinglePathActionEffects,
 ) {
     begin_local_action(state, repo_id);
+    begin_pending_index_op(state, repo_id, false, RepoPathList::new(vec![path.clone()]));
     effects.push(Effect::UnstagePath { repo_id, path });
 }
 
@@ -834,6 +845,7 @@ pub(crate) fn fill_unstage_paths_inline(
     effects: &mut BatchPathActionEffects,
 ) {
     begin_local_action(state, repo_id);
+    begin_pending_index_op(state, repo_id, false, paths.clone());
     effects.push(Effect::UnstagePaths { repo_id, paths });
 }
 
@@ -1882,18 +1894,22 @@ fn reduce_inner(
         }
         Msg::StagePath { repo_id, path } => {
             begin_local_action(state, repo_id);
+            begin_pending_index_op(state, repo_id, true, RepoPathList::new(vec![path.clone()]));
             actions_emit_effects::stage_path(repo_id, path)
         }
         Msg::StagePaths { repo_id, paths } => {
             begin_local_action(state, repo_id);
+            begin_pending_index_op(state, repo_id, true, paths.clone());
             actions_emit_effects::stage_paths(repo_id, paths)
         }
         Msg::UnstagePath { repo_id, path } => {
             begin_local_action(state, repo_id);
+            begin_pending_index_op(state, repo_id, false, RepoPathList::new(vec![path.clone()]));
             actions_emit_effects::unstage_path(repo_id, path)
         }
         Msg::UnstagePaths { repo_id, paths } => {
             begin_local_action(state, repo_id);
+            begin_pending_index_op(state, repo_id, false, paths.clone());
             actions_emit_effects::unstage_paths(repo_id, paths)
         }
         Msg::DiscardWorktreeChangesPath { repo_id, path } => {

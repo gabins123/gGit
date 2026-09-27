@@ -4,8 +4,12 @@ pub(in crate::view) mod main;
 mod reflog;
 mod sidebar;
 
+#[cfg(test)]
+pub(super) use details::ChangesFilter;
+pub(super) use details::ChangesQuery;
 pub(super) use details::{
-    ComparisonCardCache, ComparisonOrderCache, DetailsPaneInit, DetailsPaneView,
+    ChangeLanes, ComparisonCardCache, ComparisonOrderCache, DetailsPaneInit, DetailsPaneView,
+    toggle_plan,
 };
 pub(super) use history::HistoryView;
 #[allow(unused_imports)]
