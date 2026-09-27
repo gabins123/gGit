@@ -234,8 +234,8 @@ pub(super) struct ReviewMode {
     /// `/`: the file list keeps to paths matching it, as the Changes list's
     /// filter matches.
     pub(super) query: super::panes::ChangesQuery,
-    /// `V`: viewed files stay in the list. Off, they're hidden, except the
-    /// open one.
+    /// `V`: viewed files stay in the list. Off, they're hidden, the open one
+    /// included; its diff stays up and `j`/`k` go on from it.
     pub(super) show_viewed: bool,
 }
 
@@ -365,13 +365,12 @@ impl ReviewMode {
     /// Whether file `ix` is in the list, the one `j`/`k`, `]`/`[` and
     /// `space` walk: it matches the `/` filter, passes `L` (only files
     /// changed since your last review), and isn't viewed, unless `V` shows
-    /// viewed files or it's the open one (so marking it doesn't make the list
-    /// jump). A dismissed file ("changed since you viewed") isn't viewed.
+    /// viewed files. The open file follows the same rule: once everything is
+    /// viewed the list is empty, even though a diff is still up. A dismissed
+    /// file ("changed since you viewed") isn't viewed.
     pub(super) fn file_listed(&self, ix: usize) -> bool {
         self.file_passes_filters(ix)
-            && (self.show_viewed
-                || ix == self.file_ix
-                || !self.draft.viewed.contains(&self.files[ix]))
+            && (self.show_viewed || !self.draft.viewed.contains(&self.files[ix]))
     }
 
     /// The `/` filter and `L`, viewed or not.
@@ -2867,7 +2866,7 @@ mod tests {
     }
 
     #[test]
-    fn viewed_files_leave_the_list_unless_shown_or_open() {
+    fn viewed_files_leave_the_list_unless_shown() {
         let mut review = test_review();
         let listed = |review: &ReviewMode| {
             (0..review.files.len())
@@ -2875,9 +2874,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         review.draft.viewed = ["a.rs".to_string(), "b.rs".to_string()].into();
-        // a.rs is open: it stays, so marking it doesn't make the list jump.
-        assert_eq!(listed(&review), [0, 2]);
-        assert_eq!(review.viewed_hidden(), 1);
+        // a.rs is open, and viewed: it leaves the list like any other.
+        assert_eq!(listed(&review), [2]);
+        assert_eq!(review.viewed_hidden(), 2);
         review.file_ix = 2;
         assert_eq!(listed(&review), [2]);
         assert_eq!(review.viewed_hidden(), 2);
@@ -2915,7 +2914,7 @@ mod tests {
             commits: 1,
         }));
         assert_eq!(listed(&review), [2]);
-        // The open file is kept past `V`'s rule, not past the filter.
+        // Opening a filtered-out file doesn't bring it back into the list.
         review.file_ix = 1;
         assert_eq!(listed(&review), [2]);
     }
