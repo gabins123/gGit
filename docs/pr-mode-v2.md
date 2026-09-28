@@ -95,7 +95,40 @@ meaning. Words move to tooltips.
 - New SVG assets live beside the existing ones (`assets/icons/`); there is no pull-request icon
   yet. The `?` list for the PR tab gains a short legend.
 
-## Phase 4: markdown files in PR diffs
+## Phase 4: stacked pull requests
+
+Match GitHub's stacked pull requests (public preview, July 2026):
+https://docs.github.com/en/pull-requests/get-started/about-stacked-prs and
+https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/merging-stacked-pull-requests
+
+- **What a stack is**: PR B is stacked on PR A when B's base branch is A's head branch, in the
+  same repository (cross-fork stacks don't exist on GitHub; skip `isCrossRepository` PRs).
+  Where the repository has GitHub's native stacks, read the read-only GraphQL `stack` field on
+  `PullRequest` (check the live schema with introspection; it is new) and prefer it; otherwise,
+  or if the field is missing or errors, build stacks from the base-branch chain. A PR with two
+  children makes a tree; show it as one.
+- **PR list** (`view/panes/sidebar.rs`): a stack renders as a unit, bottom PR first, the PRs above
+  indented under it with a connector and their position ("2/3"). The unit sits where its
+  highest-ranked member would sit in the inbox order; each row keeps its own symbols.
+- **Details (3)**: a **Stack** section above Commits, like GitHub's stack map: every PR in the
+  stack from the base branch up, each with its state, review and checks glyphs, the current one
+  highlighted. `<` and `>` move to the PR below and above (in the list, panel 2 and Details).
+- **Review**: unchanged; a stacked PR's diff is already against its base (the parent's branch).
+  The review-mode header says "stacked on #N".
+- **Merge** (`Shift+M`, `PopoverKind::MergePullRequest`), following GitHub's rules:
+  - Native stack: merging a PR merges it and every unmerged PR below it, bottom-up, in one
+    operation, through GitHub's asynchronous stack merge API (poll until it finishes). The dialog
+    lists which PRs merge and which stay open. It refuses, naming the PR, when any PR below isn't
+    approved, has failing checks, or the stack isn't linear. Merge commit, squash and rebase all
+    stay available. Afterwards refresh: GitHub rebases the next PR onto the stack's base.
+  - Base-branch chain only (no native stack): merge works as today, into the PR's own base. The
+    dialog says where that is ("into feat/a, not dev"); for the bottom PR it notes that deleting
+    the branch (`Alt+D`) makes GitHub retarget the next PR to the base.
+  - No command that merges a whole stack by waiting on checks between layers.
+
+## Phase 5: how changed files appear
+
+### Markdown files in PR diffs
 
 - `diff_target_rendered_preview_kind` (`view/mod_helpers/mod.rs`) only accepts `WorkingTree` and
   `Commit`. Accept `CommitRange { path: Some(_), .. }` too, so the `enter` diff, review mode and
@@ -107,7 +140,34 @@ meaning. Words move to tooltips.
   `space`, `]`/`[`, `t` keep working. `c` switches to Text with the cursor on the block's first
   source line (rows carry `source_line_range`).
 
-## Phase 5: reviewer agents
+### Image diffs
+
+- The side-by-side image diff exists (`view/panels/main/diff.rs` ~150,
+  `view/panes/main/diff_cache/image_cache.rs`) and already loads for `CommitRange` targets
+  (`crates/gitcomet-state/src/store/reducer/util.rs` `selected_diff_load_plan`). Confirm it shows
+  in review mode and the `enter` diff; fix it if not.
+- Add GitHub's other two modes: **Swipe** (old and new split by a divider) and **Onion skin**
+  (new over old at an adjustable opacity). Side by side stays the default. `Alt+V` cycles the
+  modes; `,` and `.` move the divider or the opacity by 10%. Everywhere the image diff shows
+  (working tree, commit, PR).
+- Show each side's pixel size and file size. An added or deleted image shows its one side.
+
+### Generated files
+
+- Match GitHub's `linguist-generated`
+  (https://docs.github.com/en/repositories/working-with-files/managing-files/customizing-how-changed-files-appear-on-github):
+  a path is generated when `.gitattributes` at the PR head sets `linguist-generated`, or when it
+  is on a short built-in list modeled on GitHub Linguist (lockfiles: `Cargo.lock`,
+  `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `Gemfile.lock`,
+  `composer.lock`, `go.sum`; minified `*.min.js`, `*.min.css`). `-linguist-generated` or
+  `linguist-generated=false` un-marks a path. Read attributes with gix, not a subprocess.
+- Review mode Files list: generated files are hidden like viewed files, with a
+  "N generated files hidden" line; `Shift+G` shows them. They don't count toward viewed progress.
+  Opening one shows "Generated file" and `enter` loads its diff.
+- Details size line: "6 files (2 generated)". Reviewer agents (Phase 6) leave generated files out
+  of their material unless the scope is exactly that file.
+
+## Phase 6: reviewer agents
 
 - **.reviewer loader**: read `.reviewer/` from the PR's base commit (`git show <base_oid>:<path>`),
   never from the PR head. `README.md` is always sent; `checklist.md` is one rule per line;
@@ -134,4 +194,5 @@ meaning. Words move to tooltips.
 ## Out of scope
 
 Posting comments or replies from the PR view, resolving threads, closed/merged PRs in the list,
-labels, running agents without a keypress, risk scores.
+labels, running agents without a keypress, risk scores. For stacks: creating, extending or
+dissolving them (use `gh stack` or GitHub), restacking locally, cross-fork stacks.
