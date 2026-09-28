@@ -80,6 +80,7 @@ impl GitCometView {
         let git_runtime_changed = self.state.git_runtime != next.git_runtime;
         let prev_git_runtime_available = self.state.git_runtime.is_available();
         let prev_had_repos = !self.state.repos.is_empty();
+        let prev_sidebar_mode = self.state.sidebar_mode;
         let prev_banner_error = self.state.banner_error.clone();
         let prev_auth_prompt = self.state.auth_prompt.clone();
         let prev_branch_exists_prompt = self.state.branch_exists_prompt.clone();
@@ -365,6 +366,15 @@ impl GitCometView {
         }
 
         self.state = next;
+        if prev_sidebar_mode != gitcomet_state::model::SidebarMode::PullRequests
+            && self.state.sidebar_mode == gitcomet_state::model::SidebarMode::PullRequests
+            && self.pull_request_content_active()
+            && let Some(repo) = self.active_repo()
+            && repo.diff_state.diff_target.is_some()
+        {
+            self.store
+                .dispatch(Msg::ClearDiffSelection { repo_id: repo.id });
+        }
         if self.state.git_log_settings.verify_commit_signatures
             && matches!(
                 self.state.signing_tools.gpg.availability,

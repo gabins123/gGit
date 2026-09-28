@@ -614,6 +614,7 @@ fn review_mode_walks_files_keeps_comments_and_leaves_with_q(cx: &mut gpui::TestA
                     checks: Default::default(),
                     check_runs: vec![],
                     conversation: vec![],
+                    reviewers: vec![],
                 },
                 "c".repeat(40),
             );
@@ -773,12 +774,49 @@ fn seed_three_file_pull_request(cx: &mut gpui::VisualTestContext, view: &View) {
                     checks: Default::default(),
                     check_runs: vec![],
                     conversation: vec![],
+                    reviewers: vec![],
                 },
                 "c".repeat(40),
             );
         })
     });
     apply_state(cx, view, pull_request_state());
+}
+
+#[gpui::test]
+fn pull_request_enter_focuses_the_conversation_panel(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+
+    press(cx, "1 enter");
+    assert_eq!(focused(cx, &view), Some(History));
+    press(cx, "1 [");
+    sync_store_snapshot(cx, &view);
+    assert!(!cx.update(|_window, app| view.read(app).pull_request_content_active()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).main_pane.read(app).state.sidebar_mode),
+        gitcomet_state::model::SidebarMode::Files
+    );
+    press(cx, "4 j");
+    wait_until(cx, "normal diff to open", |cx| {
+        diff_path(cx, &view).is_some()
+    });
+    press(cx, "1 ]");
+    sync_store_snapshot(cx, &view);
+    wait_until(cx, "PR tab to clear the old diff", |cx| {
+        diff_path(cx, &view).is_none()
+    });
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).main_pane.read(app).state.sidebar_mode),
+        gitcomet_state::model::SidebarMode::PullRequests
+    );
+    press(cx, "1 [");
+    sync_store_snapshot(cx, &view);
+    press(cx, "2");
+    assert_eq!(focused(cx, &view), Some(History));
+    assert!(!cx.update(|_window, app| view.read(app).pull_request_content_active()));
+    assert!(diff_path(cx, &view).is_none());
 }
 
 #[gpui::test]
@@ -1033,6 +1071,8 @@ fn viewed_marks_follow_github_and_outdated_threads_take_replies(cx: &mut gpui::T
         side: ReviewSide::Right,
         line: None,
         original_line: Some(12),
+        is_resolved: false,
+        is_outdated: true,
         comments: vec![ThreadComment {
             author: "octo".into(),
             body: "Old point\nmore".into(),
@@ -1605,36 +1645,138 @@ fn files_past_the_first_page_append_in_order_into_the_list_and_the_review(
 }
 
 #[gpui::test]
-fn pull_request_files_move_only_the_highlight_until_a_diff_is_asked_for(
-    cx: &mut gpui::TestAppContext,
-) {
+fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppContext) {
+    use crate::github::{ConversationEntry, ReviewSide, ReviewThread, ThreadComment};
+    use crate::view::pull_requests::PrContentTab;
+
     let _guard = lock_visual_test();
     let (view, cx) = fixture(cx);
-    // Its commits are local already, as the prefetch leaves them.
     seed_three_file_pull_request(cx, &view);
-    let shown = |cx: &mut gpui::VisualTestContext| {
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            let mut detail =
+                (**this.active_pull_requests().unwrap().detail.ready().unwrap()).clone();
+            detail.body = "# Summary".into();
+            detail.conversation = vec![
+                ConversationEntry {
+                    author: "alice".into(),
+                    verb: "commented",
+                    at: "2025-01-01T00:00:00Z".into(),
+                    body: "First".into(),
+                },
+                ConversationEntry {
+                    author: "bob".into(),
+                    verb: "approved",
+                    at: "2025-01-02T00:00:00Z".into(),
+                    body: "Second".into(),
+                },
+            ];
+            this.seed_pull_request_detail_for_test(REPO, detail, "c".repeat(40));
+            let thread = |root_id, path: &str, line, resolved, outdated| ReviewThread {
+                root_id,
+                path: path.into(),
+                side: ReviewSide::Right,
+                line,
+                original_line: Some(12),
+                is_resolved: resolved,
+                is_outdated: outdated,
+                comments: vec![ThreadComment {
+                    author: "alice".into(),
+                    body: "**Review this**".into(),
+                    at: String::new(),
+                }],
+            };
+            this.seed_pull_request_threads_for_test(
+                REPO,
+                vec![
+                    thread(40, "a.rs", Some(12), false, false),
+                    thread(2, "b.rs", Some(12), true, false),
+                    thread(3, "c.rs", None, false, true),
+                    thread(4, "a.rs", Some(14), false, false),
+                ],
+            );
+        })
+    });
+    draw_and_drain_test_window(cx);
+
+    press(cx, "1 enter");
+    assert_eq!(focused(cx, &view), Some(History));
+    assert!(!cx.update(|_window, app| view.read(app).diff_is_open()));
+    press(cx, "j j k");
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .active_pull_requests()
+            .unwrap()
+            .selected_entry),
+        Some(0)
+    );
+    press(cx, "]");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_pull_requests().unwrap().content_tab),
+        PrContentTab::Comments
+    );
+    press(cx, "j j");
+    assert_eq!(
+        cx.update(|_window, app| {
+            let prs = view.read(app).active_pull_requests().unwrap();
+            (prs.selected_thread, prs.visible_thread_indexes())
+        }),
+        (Some(3), vec![0, 3])
+    );
+    press(cx, "shift-v j");
+    assert_eq!(
+        cx.update(|_window, app| {
+            let prs = view.read(app).active_pull_requests().unwrap();
+            (prs.selected_thread, prs.visible_thread_indexes())
+        }),
+        (Some(1), vec![0, 3, 1, 2])
+    );
+    press(cx, "enter");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_review().map(|review| review.file_ix)),
+        Some(1)
+    );
+    let review_target = |cx: &mut gpui::VisualTestContext| {
         sync_store_snapshot(cx, &view);
         cx.update(|_window, app| {
-            match view.read(app).main_pane.read(app).state.repos[0]
+            view.read(app).main_pane.read(app).state.repos[0]
                 .diff_state
                 .diff_target
-                .as_ref()
-            {
-                Some(DiffTarget::CommitRange { path, .. }) => path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                _ => None,
-            }
+                .clone()
         })
     };
-
-    press(cx, "1 3 j j");
-    assert_eq!(shown(cx), None);
-    press(cx, "enter");
-    assert_eq!(shown(cx).as_deref(), Some("b.rs"));
-    // Once asked for, the diff follows the highlight.
-    press(cx, "3 j");
-    assert_eq!(shown(cx).as_deref(), Some("c.rs"));
+    let target = review_target(cx).expect("review file diff is open");
+    cx.update(|_window, app| {
+        view.read(app).store.dispatch(Msg::SetSidebarMode {
+            mode: gitcomet_state::model::SidebarMode::Files,
+        });
+    });
+    wait_until(cx, "Files sidebar mode", |cx| {
+        cx.update(|_window, app| {
+            view.read(app).store.snapshot().sidebar_mode
+                == gitcomet_state::model::SidebarMode::Files
+        })
+    });
+    sync_store_snapshot(cx, &view);
+    assert!(cx.update(|_window, app| view.read(app).active_review().is_none()));
+    cx.update(|_window, app| {
+        view.read(app).store.dispatch(Msg::SetSidebarMode {
+            mode: gitcomet_state::model::SidebarMode::PullRequests,
+        });
+    });
+    wait_until(cx, "Pull requests sidebar mode", |cx| {
+        cx.update(|_window, app| {
+            view.read(app).store.snapshot().sidebar_mode
+                == gitcomet_state::model::SidebarMode::PullRequests
+        })
+    });
+    sync_store_snapshot(cx, &view);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_review().map(|review| review.file_ix)),
+        Some(1)
+    );
+    assert_eq!(review_target(cx), Some(target));
 }
 
 #[gpui::test]

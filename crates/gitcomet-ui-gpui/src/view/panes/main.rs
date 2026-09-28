@@ -16,6 +16,7 @@ mod helpers;
 mod interactive_rebase;
 mod markdown_state;
 mod preview;
+mod pull_request;
 mod review_cursor;
 pub(in crate::view) use review_cursor::{ReviewCommentScope, ReviewMark, SinceLines};
 pub(in crate::view) mod submodule_summary;
@@ -105,6 +106,13 @@ impl Render for MainPaneView {
             v.set_history_content_width(history_content_width);
         });
 
+        let show_pull_request = self
+            .root_view
+            .upgrade()
+            .is_some_and(|root| root.read(cx).pull_request_content_active());
+        if !show_pull_request {
+            self.pull_request_scroll_key = None;
+        }
         let show_diff = self
             .active_repo()
             .and_then(|r| r.diff_state.diff_target.as_ref())
@@ -116,10 +124,12 @@ impl Render for MainPaneView {
         // Keep blame in sync with the displayed file/revision while annotate is
         // on; the request is a no-op when the target is unchanged. Render must not
         // force a retry — a persistent error would re-dispatch every frame.
-        if self.annotate_enabled && show_diff {
+        if self.annotate_enabled && show_diff && !show_pull_request {
             self.request_blame_for_current_target(false, cx);
         }
-        let inner = if show_diff {
+        let inner = if show_pull_request {
+            self.pull_request_view(cx)
+        } else if show_diff {
             self.diff_view(window, cx).into_any_element()
         } else if in_rebase {
             self.interactive_rebase_view(window, cx).into_any_element()

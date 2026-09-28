@@ -506,6 +506,7 @@ impl GitCometView {
             );
             return;
         };
+        let cached_threads = prs.threads.ready().cloned();
         if detail.too_large_for_app() || detail.files.is_empty() {
             self.push_toast(
                 components::ToastKind::Warning,
@@ -557,8 +558,10 @@ impl GitCometView {
             armed_delete: None,
             write_seq: 0,
             written_seq: Default::default(),
-            threads: Vec::new(),
-            threads_loading: !cfg!(test),
+            threads: cached_threads
+                .as_ref()
+                .map_or_else(Vec::new, |threads| threads.as_ref().clone()),
+            threads_loading: cached_threads.is_none() && !cfg!(test),
             suggestions: Vec::new(),
             suggestion_generation: 0,
             last_review: Default::default(),
@@ -592,10 +595,35 @@ impl GitCometView {
             self.review_sync_viewed(cx);
             self.load_viewed_states(cx);
         }
-        self.load_review_threads(cx);
+        if cached_threads.is_some() {
+            self.sync_review_marks(cx);
+        } else {
+            self.load_review_threads(cx);
+        }
         self.load_last_review(cx);
         self.diff_return_panel = FocusPanel::Sidebar;
         self.focus_diff_when_open = true;
+    }
+
+    /// Enter on a conversation thread resumes the review on that file and line.
+    pub(super) fn start_review_at_thread(
+        &mut self,
+        thread: &ReviewThread,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.start_review(cx);
+        let Some(file_ix) = self
+            .active_review()
+            .and_then(|review| review.files.iter().position(|path| path == &thread.path))
+        else {
+            return;
+        };
+        self.review_open_file(file_ix, cx);
+        if let Some(line) = thread.line.or(thread.original_line)
+            && let Some(review) = self.review.as_mut()
+        {
+            review.pending_jump = Some((thread.side, line));
+        }
     }
 
     /// The diff shows the pull request's current head; a draft started on an
@@ -3037,6 +3065,8 @@ mod tests {
             side,
             line,
             original_line: line,
+            is_resolved: false,
+            is_outdated: false,
             comments: vec![ThreadComment {
                 author: "octo".into(),
                 body: "?".into(),

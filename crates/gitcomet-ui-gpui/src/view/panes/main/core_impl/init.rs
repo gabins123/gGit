@@ -627,6 +627,8 @@ impl MainPaneView {
             #[cfg(test)]
             conflict_resolved_outline_background_delay_override: None,
             history_view,
+            pull_request_scroll: ScrollHandle::new(),
+            pull_request_scroll_key: None,
             diff_scroll: UniformListScrollHandle::default(),
             diff_split_right_scroll: UniformListScrollHandle::default(),
             conflict_resolver_diff_scroll: UniformListScrollHandle::default(),

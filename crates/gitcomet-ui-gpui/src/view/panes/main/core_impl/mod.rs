@@ -158,6 +158,7 @@ impl MainPaneView {
 
         let mut hasher = FxHasher::default();
         state.active_repo.hash(&mut hasher);
+        std::mem::discriminant(&state.sidebar_mode).hash(&mut hasher);
 
         if let Some(repo_id) = state.active_repo
             && let Some(repo) = state.repos.iter().find(|r| r.id == repo_id)

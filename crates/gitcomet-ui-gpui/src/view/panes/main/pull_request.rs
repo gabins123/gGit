@@ -1,0 +1,618 @@
+use super::*;
+use crate::github::{ConversationEntry, PullRequestDetail, ReviewThread};
+use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
+use crate::view::RemoteMarkdownImagePolicy;
+use crate::view::markdown_preview::{
+    MarkdownInlineSpan, MarkdownInlineStyle, MarkdownPreviewDocument, MarkdownPreviewRowKind,
+};
+use crate::view::pull_requests::{PrContentTab, PrLoad, visible_pr_thread_indexes};
+
+impl MainPaneView {
+    pub(super) fn pull_request_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let Some(root) = self.root_view.upgrade() else {
+            return div().into_any_element();
+        };
+        let (number, detail, threads, tab, selected_entry, selected_thread, show_hidden) = {
+            let root = root.read(cx);
+            let Some(prs) = root.active_pull_requests() else {
+                return div().into_any_element();
+            };
+            (
+                prs.selected.unwrap_or_default(),
+                prs.detail.clone(),
+                prs.threads.clone(),
+                prs.content_tab,
+                prs.selected_entry,
+                prs.selected_thread,
+                prs.show_hidden_threads,
+            )
+        };
+        let detail = match detail {
+            PrLoad::Idle | PrLoad::Loading => {
+                return components::empty_state_message(theme, format!("Loading #{number}…"))
+                    .into_any_element();
+            }
+            PrLoad::Failed(err) => {
+                return components::empty_state(
+                    theme,
+                    format!("Couldn't load #{number}"),
+                    err.to_string(),
+                )
+                .into_any_element();
+            }
+            PrLoad::Ready(detail) => detail,
+        };
+
+        let selection = match tab {
+            PrContentTab::Conversation => selected_entry,
+            PrContentTab::Comments => selected_thread,
+        };
+        let scroll_key = (detail.number, tab, selection);
+        if self.pull_request_scroll_key != Some(scroll_key) {
+            let target = match tab {
+                PrContentTab::Conversation => selected_entry.map_or(0, |ix| ix + 2),
+                PrContentTab::Comments => selected_thread
+                    .and_then(|ix| pr_thread_scroll_index(&threads, show_hidden, ix))
+                    .unwrap_or(0),
+            };
+            self.pull_request_scroll.scroll_to_item(target);
+            self.pull_request_scroll_key = Some(scroll_key);
+        }
+
+        let focus = self
+            .history_view
+            .read(cx)
+            .history_panel_focus_handle
+            .clone();
+        let open_count = threads.ready().map_or(0, |threads| {
+            threads
+                .iter()
+                .filter(|thread| !thread.is_resolved && !thread.outdated())
+                .count()
+        });
+        let (state_icon, state_color) = if detail.is_draft {
+            ("◌", theme.colors.foreground.secondary)
+        } else {
+            match detail.state.as_str() {
+                "MERGED" => ("◆", theme.colors.status.info.foreground),
+                "CLOSED" => ("×", theme.colors.status.danger.foreground),
+                _ => ("●", theme.colors.status.success.foreground),
+            }
+        };
+        let root_for_github = self.root_view.clone();
+        let root_for_conversation = self.root_view.clone();
+        let root_for_comments = self.root_view.clone();
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.colors.stroke.subtle)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(theme.ui_text(14.0))
+                    .child(div().text_color(state_color).child(state_icon))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .child(detail.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.colors.foreground.secondary)
+                            .child(format!("#{}", detail.number)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_size(theme.ui_text(12.0))
+                    .child(
+                        div()
+                            .id("pr_conversation_tab")
+                            .cursor_pointer()
+                            .text_color(if tab == PrContentTab::Conversation {
+                                theme.colors.foreground.primary
+                            } else {
+                                theme.colors.foreground.secondary
+                            })
+                            .child("Conversation")
+                            .on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    let focus = this
+                                        .history_view
+                                        .read(cx)
+                                        .history_panel_focus_handle
+                                        .clone();
+                                    window.focus(&focus, cx);
+                                    let root = root_for_conversation.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = root.update(cx, |root, cx| {
+                                            root.set_pull_request_content_tab(
+                                                PrContentTab::Conversation,
+                                                cx,
+                                            )
+                                        });
+                                    });
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("pr_comments_tab")
+                            .cursor_pointer()
+                            .text_color(if tab == PrContentTab::Comments {
+                                theme.colors.foreground.primary
+                            } else {
+                                theme.colors.foreground.secondary
+                            })
+                            .child(format!("Comments ({open_count})"))
+                            .on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    let focus = this
+                                        .history_view
+                                        .read(cx)
+                                        .history_panel_focus_handle
+                                        .clone();
+                                    window.focus(&focus, cx);
+                                    let root = root_for_comments.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = root.update(cx, |root, cx| {
+                                            root.set_pull_request_content_tab(
+                                                PrContentTab::Comments,
+                                                cx,
+                                            )
+                                        });
+                                    });
+                                }),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("pr_open_on_github")
+                            .cursor_pointer()
+                            .text_color(theme.colors.foreground.secondary)
+                            .child("Open on GitHub  o")
+                            .on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    let focus = this
+                                        .history_view
+                                        .read(cx)
+                                        .history_panel_focus_handle
+                                        .clone();
+                                    window.focus(&focus, cx);
+                                    let root = root_for_github.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = root.update(cx, |root, cx| {
+                                            root.open_pull_request_on_github(cx)
+                                        });
+                                    });
+                                }),
+                            ),
+                    ),
+            );
+
+        let body = match tab {
+            PrContentTab::Conversation => self.pr_conversation(&detail, selected_entry, cx),
+            PrContentTab::Comments => self.pr_comments(&threads, selected_thread, show_hidden, cx),
+        };
+        div()
+            .size_full()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .track_focus(&focus)
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn pr_conversation(
+        &self,
+        detail: &PullRequestDetail,
+        selected_entry: Option<usize>,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let mut body = div()
+            .id("pr_content_scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_3()
+            .px_3()
+            .py_3()
+            .overflow_y_scroll()
+            .track_scroll(&self.pull_request_scroll);
+        body = body.child(
+            div()
+                .text_size(theme.ui_text(11.0))
+                .text_color(theme.colors.foreground.secondary)
+                .child(format!("{} opened this pull request", detail.author)),
+        );
+        body = body.child(if detail.body.trim().is_empty() {
+            div()
+                .text_size(theme.ui_text(12.0))
+                .text_color(theme.colors.foreground.secondary)
+                .child("No description")
+                .into_any_element()
+        } else {
+            self.pr_markdown(&detail.body, cx)
+        });
+        for (ix, entry) in detail.conversation.iter().enumerate() {
+            body = body.child(self.pr_conversation_entry(ix, entry, selected_entry, cx));
+        }
+        let checks = detail.checks;
+        body.child(
+            div()
+                .border_t_1()
+                .border_color(theme.colors.stroke.subtle)
+                .pt_2()
+                .text_size(theme.ui_text(12.0))
+                .child(if checks.total() == 0 {
+                    "No checks".to_owned()
+                } else {
+                    format!(
+                        "Checks: {} passing · {} failing · {} pending",
+                        checks.passing, checks.failing, checks.pending
+                    )
+                }),
+        )
+        .into_any_element()
+    }
+
+    fn pr_conversation_entry(
+        &self,
+        ix: usize,
+        entry: &ConversationEntry,
+        selected: Option<usize>,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let glyph = match entry.verb {
+            "approved" => "✓",
+            "requested changes" => "!",
+            "commented" => "●",
+            _ => "◌",
+        };
+        let mut row = div()
+            .id(SharedString::from(format!("pr_conversation_entry_{ix}")))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_2()
+            .rounded(px(theme.radii.control))
+            .bg(if selected == Some(ix) {
+                theme.colors.interaction.selected_background
+            } else {
+                theme.colors.surface.panel
+            })
+            .child(div().text_size(theme.ui_text(12.0)).child(format!(
+                "{glyph} {} {} · {}",
+                entry.author,
+                entry.verb,
+                entry.at.get(..10).unwrap_or(&entry.at)
+            )));
+        if !entry.body.is_empty() {
+            row = row.child(self.pr_markdown(&entry.body, cx));
+        }
+        let root = self.root_view.clone();
+        row.cursor_pointer()
+            .on_activate(
+                false,
+                controls::ControlActivation::Composite,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    let focus = this
+                        .history_view
+                        .read(cx)
+                        .history_panel_focus_handle
+                        .clone();
+                    window.focus(&focus, cx);
+                    let root = root.clone();
+                    cx.defer(move |cx| {
+                        let _ = root.update(cx, |root, cx| root.select_pull_request_entry(ix, cx));
+                    });
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn pr_comments(
+        &self,
+        threads: &PrLoad<Arc<Vec<ReviewThread>>>,
+        selected: Option<usize>,
+        show_hidden: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let threads = match threads {
+            PrLoad::Idle | PrLoad::Loading => {
+                return components::empty_state_message(theme, "Loading review threads…")
+                    .into_any_element();
+            }
+            PrLoad::Failed(err) => {
+                return components::empty_state(
+                    theme,
+                    "Couldn't load review threads",
+                    err.to_string(),
+                )
+                .into_any_element();
+            }
+            PrLoad::Ready(threads) => threads,
+        };
+        let mut body = div()
+            .id("pr_content_scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_2()
+            .px_3()
+            .py_3()
+            .overflow_y_scroll()
+            .track_scroll(&self.pull_request_scroll);
+        let mut last_path: Option<&str> = None;
+        let mut shown = 0;
+        for ix in visible_pr_thread_indexes(threads, show_hidden) {
+            let thread = &threads[ix];
+            shown += 1;
+            if last_path != Some(&thread.path) {
+                last_path = Some(&thread.path);
+                body = body.child(
+                    div()
+                        .pt_2()
+                        .text_size(theme.ui_text(12.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(thread.path.clone()),
+                );
+            }
+            let status = if thread.outdated() {
+                "Outdated"
+            } else if thread.is_resolved {
+                "Resolved"
+            } else {
+                "Open"
+            };
+            let first = thread.comments.first();
+            let line = thread
+                .line
+                .or(thread.original_line)
+                .map_or("File".to_owned(), |line| format!("Line {line}"));
+            let mut row = div()
+                .id(SharedString::from(format!("pr_thread_{ix}")))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2()
+                .py_2()
+                .rounded(px(theme.radii.control))
+                .bg(if selected == Some(ix) {
+                    theme.colors.interaction.selected_background
+                } else {
+                    theme.colors.surface.panel
+                })
+                .child(
+                    div()
+                        .text_size(theme.ui_text(11.0))
+                        .text_color(theme.colors.foreground.secondary)
+                        .child(format!(
+                            "{line} · {status} · {} {}",
+                            thread.comments.len().saturating_sub(1),
+                            if thread.comments.len() == 2 {
+                                "reply"
+                            } else {
+                                "replies"
+                            }
+                        )),
+                );
+            if let Some(first) = first {
+                row = row.child(
+                    div()
+                        .text_size(theme.ui_text(12.0))
+                        .child(first.author.clone()),
+                );
+                row = row.child(self.pr_markdown(&first.body, cx));
+            }
+            let root = self.root_view.clone();
+            body = body.child(row.cursor_pointer().on_activate(
+                false,
+                controls::ControlActivation::Composite,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    let focus = this
+                        .history_view
+                        .read(cx)
+                        .history_panel_focus_handle
+                        .clone();
+                    window.focus(&focus, cx);
+                    let root = root.clone();
+                    cx.defer(move |cx| {
+                        let _ = root.update(cx, |root, cx| root.select_pull_request_thread(ix, cx));
+                    });
+                }),
+            ));
+        }
+        if shown == 0 {
+            body = body.child(
+                div()
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(theme.colors.foreground.secondary)
+                    .child(if threads.is_empty() {
+                        "No review threads"
+                    } else {
+                        "No open threads · V shows resolved and outdated"
+                    }),
+            );
+        }
+        body.into_any_element()
+    }
+
+    fn pr_markdown(&self, source: &str, cx: &mut gpui::Context<Self>) -> AnyElement {
+        let Some(document) = pr_markdown_document(source).map(Arc::new) else {
+            return div()
+                .text_size(self.theme.ui_text(12.0))
+                .child(source.to_owned())
+                .into_any_element();
+        };
+        let ui_scale = crate::ui_scale::UiScale::current(cx);
+        rows::render_markdown_document(
+            &document,
+            &rows::MarkdownDocumentContext {
+                theme: self.theme,
+                ui_scale_percent: ui_scale.percent(),
+                editor_font_family: crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY.into(),
+                image_root: None,
+                remote_image_access: rows::MarkdownRemoteImageAccess {
+                    policy: RemoteMarkdownImagePolicy::NeverLoad,
+                    ..Default::default()
+                },
+                picture_sizes: Default::default(),
+                drawn_pictures: None,
+                row_boxes: Default::default(),
+                block_scrolls: Default::default(),
+                blocks: Default::default(),
+                layout: Default::default(),
+                view: None,
+                text_region: DiffTextRegion::Inline,
+                change_bar_color: None,
+                query: None,
+                reveal: Default::default(),
+                scroll: None,
+                hovered_link: None,
+                change_extents: None,
+                tasks_editable: false,
+            },
+        )
+    }
+}
+
+/// GitHub prose never loads a remote picture. Keep its URL visible in the
+/// Markdown layout; the read-only renderer deliberately has no link handlers.
+fn pr_markdown_document(source: &str) -> Option<MarkdownPreviewDocument> {
+    let mut document = crate::view::markdown_preview::parse_markdown(source)?;
+    for row in &mut document.rows {
+        if let Some(image) = row.image.as_ref()
+            && let Some(url) = rows::markdown_preview_remote_image_url(image.source.as_ref())
+        {
+            let alt = row.text.as_ref();
+            let prefix = if alt.is_empty() {
+                "Image: ".to_owned()
+            } else {
+                format!("Image: {alt} — ")
+            };
+            let start = prefix.len();
+            row.text = format!("{prefix}{url}").into();
+            row.inline_spans = Arc::new(vec![MarkdownInlineSpan {
+                byte_range: start..start + url.len(),
+                style: MarkdownInlineStyle::Link,
+                link_url: Some(url),
+            }]);
+            row.kind = MarkdownPreviewRowKind::Paragraph;
+            row.image = None;
+            row.styled_text_cache = Default::default();
+        }
+
+        let mut kept_images = Vec::with_capacity(row.inline_images.len());
+        let mut text: Option<String> = None;
+        let mut spans: Option<Vec<MarkdownInlineSpan>> = None;
+        for inline in row.inline_images.iter() {
+            if let Some(url) = rows::markdown_preview_remote_image_url(inline.image.source.as_ref())
+            {
+                let text = text.get_or_insert_with(|| row.text.to_string());
+                let spans = spans.get_or_insert_with(|| row.inline_spans.as_ref().clone());
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                if inline.alt.is_empty() {
+                    text.push_str("Image: ");
+                } else {
+                    text.push_str(&format!("Image: {} — ", inline.alt));
+                }
+                let start = text.len();
+                text.push_str(&url);
+                spans.push(MarkdownInlineSpan {
+                    byte_range: start..text.len(),
+                    style: MarkdownInlineStyle::Link,
+                    link_url: Some(url),
+                });
+            } else {
+                kept_images.push(inline.clone());
+            }
+        }
+        if let (Some(text), Some(spans)) = (text, spans) {
+            row.text = text.into();
+            row.inline_spans = Arc::new(spans);
+            row.inline_images = Arc::from(kept_images);
+            row.styled_text_cache = Default::default();
+        }
+    }
+    Some(document)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_markdown_images_become_url_links() {
+        let document = pr_markdown_document(
+            "![plot](https://example.com/plot.png)\n\nText ![icon](https://example.com/icon.png)",
+        )
+        .expect("Markdown parses");
+        assert!(document.rows.iter().all(|row| row.image.is_none()));
+        assert!(document.rows.iter().all(|row| row.inline_images.is_empty()));
+        for url in [
+            "https://example.com/plot.png",
+            "https://example.com/icon.png",
+        ] {
+            assert!(document.rows.iter().any(|row| {
+                row.inline_spans.iter().any(|span| {
+                    span.link_url
+                        .as_ref()
+                        .is_some_and(|link| link.as_ref() == url)
+                        && &row.text[span.byte_range.clone()] == url
+                })
+            }));
+        }
+    }
+}
+
+fn pr_thread_scroll_index(
+    threads: &PrLoad<Arc<Vec<ReviewThread>>>,
+    show_hidden: bool,
+    selected: usize,
+) -> Option<usize> {
+    let mut index = 0;
+    let mut last_path: Option<&str> = None;
+    let threads = threads.ready()?;
+    for ix in visible_pr_thread_indexes(threads, show_hidden) {
+        let thread = &threads[ix];
+        if last_path != Some(thread.path.as_str()) {
+            index += 1;
+            last_path = Some(&thread.path);
+        }
+        if ix == selected {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}

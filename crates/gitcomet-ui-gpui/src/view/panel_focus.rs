@@ -190,6 +190,9 @@ pub(super) fn panel_focus_ring(theme: AppTheme) -> gpui::Div {
 
 impl GitCometView {
     pub(super) fn diff_is_open(&self) -> bool {
+        if self.pull_request_content_active() {
+            return false;
+        }
         self.active_repo()
             .is_some_and(|repo| repo.diff_state.diff_target.is_some())
     }
@@ -486,21 +489,25 @@ impl GitCometView {
                 FocusPanel::Sidebar => {
                     return &[
                         ("j/k", "PR"),
-                        ("enter", "diff"),
+                        ("enter", "read"),
                         ("space", "checkout"),
                         ("r", "review"),
                         ("M", "merge"),
                         ("o", "GitHub"),
                     ];
                 }
-                FocusPanel::Details if self.pull_request_details_active() => {
+                FocusPanel::History if self.pull_request_content_active() => {
                     return &[
-                        ("j/k", "file"),
-                        ("J/K", "scroll"),
-                        ("enter", "diff"),
+                        ("j/k", "entry"),
+                        ("[/]", "tab"),
+                        ("enter", "thread"),
+                        ("V", "resolved"),
+                        ("o", "GitHub"),
                         ("r", "review"),
-                        ("M", "merge"),
                     ];
+                }
+                FocusPanel::Details if self.pull_request_details_active() => {
+                    return &[("space", "checkout"), ("r", "review"), ("M", "merge")];
                 }
                 _ => {}
             }
@@ -609,7 +616,7 @@ impl GitCometView {
                 FocusPanel::Sidebar => {
                     return &[
                         ("j / k", "Next / previous pull request"),
-                        ("enter", "Open its diff"),
+                        ("enter", "Read the pull request in the middle panel"),
                         ("space", "Check it out locally"),
                         ("n", "New pull request"),
                         ("r", "Review it: line comments, one submit"),
@@ -620,11 +627,18 @@ impl GitCometView {
                         ("[ / ]", "Branches / Files / Pull requests tab"),
                     ];
                 }
+                FocusPanel::History if self.pull_request_content_active() => {
+                    return &[
+                        ("j / k", "Next / previous entry or thread"),
+                        ("[ / ]", "Conversation / Comments tab"),
+                        ("enter", "Review at the selected thread's line"),
+                        ("V", "Show / hide resolved and outdated threads"),
+                        ("o", "Open on GitHub"),
+                        ("r", "Review the pull request"),
+                    ];
+                }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
-                        ("j / k", "Next / previous file"),
-                        ("J / K", "Scroll the checks and conversation"),
-                        ("enter", "Open the file's diff"),
                         ("space", "Check it out locally"),
                         ("r", "Review"),
                         ("M", "Merge it on GitHub"),
@@ -1247,8 +1261,13 @@ impl GitCometView {
         }
         let selected = self.active_pull_requests().and_then(|prs| prs.selected);
         let in_details = current == Some(FocusPanel::Details) && self.pull_request_details_active();
+        let in_content = current == Some(FocusPanel::History) && self.pull_request_content_active();
         if shift {
             return match key.to_ascii_lowercase().as_str() {
+                "v" if in_content => {
+                    self.toggle_pull_request_hidden_threads(cx);
+                    Some(true)
+                }
                 // Submit a review with no line comments: the quick verdict.
                 "s" => {
                     let number = selected?;
@@ -1276,14 +1295,6 @@ impl GitCometView {
                     );
                     Some(true)
                 }
-                // lazygit's main-panel scroll: checks and conversation.
-                direction @ ("j" | "k") if in_details => {
-                    let direction = if direction == "j" { 1 } else { -1 };
-                    self.details_pane.update(cx, |pane, cx| {
-                        pane.scroll_pull_request_details(direction, cx)
-                    });
-                    Some(true)
-                }
                 _ => None,
             };
         }
@@ -1293,25 +1304,41 @@ impl GitCometView {
             _ => 0,
         };
         match (current, key) {
-            (Some(FocusPanel::Sidebar), _) if direction != 0 => {
-                self.select_adjacent_pull_request(direction, cx);
+            (Some(FocusPanel::History), _) if direction != 0 && in_content => {
+                self.step_pull_request_content(direction, cx);
                 Some(true)
             }
-            (Some(FocusPanel::Details), _) if direction != 0 && in_details => {
-                self.select_adjacent_pull_request_file(direction, cx);
+            (Some(FocusPanel::History), "[") if in_content => {
+                self.set_pull_request_content_tab(
+                    super::pull_requests::PrContentTab::Conversation,
+                    cx,
+                );
+                Some(true)
+            }
+            (Some(FocusPanel::History), "]") if in_content => {
+                self.set_pull_request_content_tab(super::pull_requests::PrContentTab::Comments, cx);
+                Some(true)
+            }
+            (Some(FocusPanel::History), "enter") if in_content => {
+                if let Some(thread) = self.selected_pull_request_thread() {
+                    self.start_review_at_thread(&thread, cx);
+                }
+                Some(true)
+            }
+            (Some(FocusPanel::Sidebar), _) if direction != 0 => {
+                self.select_adjacent_pull_request(direction, cx);
                 Some(true)
             }
             (Some(FocusPanel::Sidebar | FocusPanel::Details), "space") if selected.is_some() => {
                 self.checkout_pull_request(cx);
                 Some(true)
             }
-            (Some(from @ (FocusPanel::Sidebar | FocusPanel::Details)), "enter")
-                if selected.is_some() =>
-            {
-                if self.open_pull_request_diff(None, cx) {
-                    self.diff_return_panel = from;
-                    self.focus_diff_when_open = true;
-                }
+            (Some(FocusPanel::Sidebar), "enter") if selected.is_some() => {
+                self.focus_panel(FocusPanel::History, window, cx);
+                Some(true)
+            }
+            (Some(FocusPanel::Details), "enter") if in_details => {
+                self.focus_panel(FocusPanel::History, window, cx);
                 Some(true)
             }
             (_, "n") => {

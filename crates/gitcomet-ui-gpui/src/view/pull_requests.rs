@@ -31,11 +31,23 @@ impl<T> PrLoad<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum PrContentTab {
+    #[default]
+    Conversation,
+    Comments,
+}
+
 #[derive(Default)]
 pub(super) struct RepoPullRequests {
     pub(super) list: PrLoad<Arc<Vec<PullRequestSummary>>>,
     pub(super) selected: Option<u64>,
     pub(super) detail: PrLoad<Arc<PullRequestDetail>>,
+    pub(super) threads: PrLoad<Arc<Vec<github::ReviewThread>>>,
+    pub(super) content_tab: PrContentTab,
+    pub(super) selected_entry: Option<usize>,
+    pub(super) selected_thread: Option<usize>,
+    pub(super) show_hidden_threads: bool,
     /// The selected PR's merge base, once its commits are local.
     pub(super) diff_base: PrLoad<String>,
     /// Index into the selected PR's files.
@@ -68,6 +80,7 @@ pub(super) struct RepoPullRequests {
     pub(super) files_error: Option<String>,
     list_seq: u64,
     detail_seq: u64,
+    threads_seq: u64,
     diff_seq: u64,
     files_seq: u64,
 }
@@ -77,6 +90,29 @@ impl RepoPullRequests {
     pub(super) fn files_listing(&self) -> bool {
         self.file_page_count > 0 && self.next_file_page <= self.file_page_count
     }
+
+    pub(super) fn visible_thread_indexes(&self) -> Vec<usize> {
+        self.threads
+            .ready()
+            .map(|threads| visible_pr_thread_indexes(threads, self.show_hidden_threads))
+            .unwrap_or_default()
+    }
+}
+
+pub(super) fn visible_pr_thread_indexes(
+    threads: &[github::ReviewThread],
+    show_hidden: bool,
+) -> Vec<usize> {
+    let mut visible: Vec<_> = threads
+        .iter()
+        .enumerate()
+        .filter(|(_, thread)| show_hidden || (!thread.is_resolved && !thread.outdated()))
+        .map(|(ix, _)| ix)
+        .collect();
+    // REST threads are already in line order within each file. Stable sorting
+    // only by path keeps that order when grouping interleaved test or cache data.
+    visible.sort_by(|&a, &b| threads[a].path.cmp(&threads[b].path));
+    visible
 }
 
 /// Pages of files fetched at once: enough to have the list long before
@@ -311,12 +347,17 @@ impl GitCometView {
                 .is_some_and(|prs| prs.selected.is_some())
     }
 
+    pub(super) fn pull_request_content_active(&self) -> bool {
+        self.pull_request_details_active() && self.active_review().is_none()
+    }
+
     /// The sidebar and details panes are cached views, so a change to pull
     /// request state has to reach them explicitly; so does an open dialog
     /// that shows it.
     pub(super) fn notify_pull_request_panes(&mut self, cx: &mut gpui::Context<Self>) {
         self.sidebar_pane.update(cx, |_, cx| cx.notify());
         self.details_pane.update(cx, |_, cx| cx.notify());
+        self.main_pane.update(cx, |_, cx| cx.notify());
         // Deferred: this also runs inside the host's own submit handler.
         let host = self.popover_host.clone();
         cx.defer(move |cx| host.update(cx, |_, cx| cx.notify()));
@@ -403,12 +444,24 @@ impl GitCometView {
         let Some(repo_id) = self.active_repo_id() else {
             return;
         };
+        if self
+            .active_repo()
+            .is_some_and(|repo| repo.diff_state.diff_target.is_some())
+        {
+            self.store.dispatch(Msg::ClearDiffSelection { repo_id });
+        }
         let entry = self.pull_requests.repo_mut(repo_id);
         if entry.selected == Some(number) && !matches!(entry.detail, PrLoad::Failed(_)) {
             return;
         }
         entry.selected = Some(number);
         entry.detail = PrLoad::Loading;
+        entry.threads = PrLoad::Idle;
+        entry.threads_seq += 1;
+        entry.content_tab = PrContentTab::Conversation;
+        entry.selected_entry = None;
+        entry.selected_thread = None;
+        entry.show_hidden_threads = false;
         entry.diff_base = PrLoad::Idle;
         entry.diff_seq += 1;
         entry.diff_asked = false;
@@ -484,6 +537,7 @@ impl GitCometView {
                             _ => false,
                         };
                         entry.detail = PrLoad::Ready(Arc::new(detail));
+                        this.load_pull_request_threads(repo_id, number, cx);
                         if !carried {
                             this.list_more_pull_request_files(repo_id, cx);
                         }
@@ -512,6 +566,42 @@ impl GitCometView {
         })
         .detach();
         self.notify_pull_request_panes(cx);
+    }
+
+    fn load_pull_request_threads(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.threads_seq += 1;
+        let seq = entry.threads_seq;
+        entry.threads = PrLoad::Loading;
+        let task = cx.background_spawn(async move {
+            github::list_review_threads(&target.workdir, &target.slug, number)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let entry = this.pull_requests.repo_mut(repo_id);
+                if entry.threads_seq != seq || entry.selected != Some(number) {
+                    return;
+                }
+                entry.threads = match result {
+                    Ok(threads) => PrLoad::Ready(Arc::new(threads)),
+                    Err(err) => PrLoad::Failed(err),
+                };
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
     }
 
     /// Pages in the files past the first 100, several pages at once, as soon
@@ -750,6 +840,115 @@ impl GitCometView {
         true
     }
 
+    pub(super) fn set_pull_request_content_tab(
+        &mut self,
+        tab: PrContentTab,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        self.pull_requests.repo_mut(repo_id).content_tab = tab;
+        self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn select_pull_request_entry(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if entry
+            .detail
+            .ready()
+            .is_some_and(|detail| ix < detail.conversation.len())
+        {
+            entry.selected_entry = Some(ix);
+            self.notify_pull_request_panes(cx);
+        }
+    }
+
+    pub(super) fn select_pull_request_thread(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if entry.visible_thread_indexes().contains(&ix) {
+            entry.selected_thread = Some(ix);
+            self.notify_pull_request_panes(cx);
+        }
+    }
+
+    pub(super) fn step_pull_request_content(
+        &mut self,
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let (selection, len) = match entry.content_tab {
+            PrContentTab::Conversation => (
+                &mut entry.selected_entry,
+                entry
+                    .detail
+                    .ready()
+                    .map_or(0, |detail| detail.conversation.len()),
+            ),
+            PrContentTab::Comments => {
+                let visible = entry.visible_thread_indexes();
+                let next = match entry
+                    .selected_thread
+                    .and_then(|ix| visible.iter().position(|item| *item == ix))
+                {
+                    Some(ix) if direction < 0 => ix.checked_sub(1),
+                    Some(ix) => Some(ix + 1).filter(|ix| *ix < visible.len()),
+                    None if direction < 0 => visible.len().checked_sub(1),
+                    None => (!visible.is_empty()).then_some(0),
+                };
+                if let Some(next) = next {
+                    entry.selected_thread = Some(visible[next]);
+                    self.notify_pull_request_panes(cx);
+                }
+                return;
+            }
+        };
+        let next = match (*selection, direction < 0) {
+            (Some(ix), true) => ix.checked_sub(1),
+            (Some(ix), false) => Some(ix + 1).filter(|ix| *ix < len),
+            (None, true) => len.checked_sub(1),
+            (None, false) => (len > 0).then_some(0),
+        };
+        if let Some(next) = next {
+            *selection = Some(next);
+            self.notify_pull_request_panes(cx);
+        }
+    }
+
+    pub(super) fn toggle_pull_request_hidden_threads(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.show_hidden_threads = !entry.show_hidden_threads;
+        if entry
+            .selected_thread
+            .is_some_and(|ix| !entry.visible_thread_indexes().contains(&ix))
+        {
+            entry.selected_thread = None;
+        }
+        self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn selected_pull_request_thread(&self) -> Option<github::ReviewThread> {
+        let prs = self.active_pull_requests()?;
+        let ix = prs.selected_thread?;
+        prs.visible_thread_indexes()
+            .contains(&ix)
+            .then(|| prs.threads.ready()?.get(ix).cloned())
+            .flatten()
+    }
+
     /// Shows the selected PR's current file as a merge-base..head range diff.
     /// Its commits must already be local (`diff_base` ready). Only for the
     /// active repository: a fetch that lands after a tab switch just waits.
@@ -833,37 +1032,6 @@ impl GitCometView {
             PrLoad::Idle | PrLoad::Failed(_) => {}
         }
         self.fetch_pull_request_commits(repo_id, cx);
-        self.notify_pull_request_panes(cx);
-        true
-    }
-
-    /// `j`/`k` over the selected PR's files. Moves the diff along once one is
-    /// open; before that it only moves the highlight.
-    pub(super) fn select_adjacent_pull_request_file(
-        &mut self,
-        direction: i8,
-        cx: &mut gpui::Context<Self>,
-    ) -> bool {
-        let Some(repo_id) = self.active_repo_id() else {
-            return false;
-        };
-        let entry = self.pull_requests.repo_mut(repo_id);
-        let Some(len) = entry.detail.ready().map(|detail| detail.files.len()) else {
-            return false;
-        };
-        let next = match (entry.selected_file, direction < 0) {
-            (Some(ix), false) => Some(ix + 1).filter(|ix| *ix < len),
-            (Some(ix), true) => ix.checked_sub(1),
-            (None, false) => (len > 0).then_some(0),
-            (None, true) => len.checked_sub(1),
-        };
-        let Some(next) = next else {
-            return false;
-        };
-        entry.selected_file = Some(next);
-        if entry.diff_asked && entry.diff_base.ready().is_some() {
-            self.show_pull_request_file(repo_id);
-        }
         self.notify_pull_request_panes(cx);
         true
     }
@@ -1526,6 +1694,15 @@ impl GitCometView {
         entry.detail = PrLoad::Ready(Arc::new(detail));
         entry.diff_base = PrLoad::Ready(merge_base);
         entry.next_file_page = 2;
+    }
+
+    #[cfg(test)]
+    pub(super) fn seed_pull_request_threads_for_test(
+        &mut self,
+        repo_id: RepoId,
+        threads: Vec<github::ReviewThread>,
+    ) {
+        self.pull_requests.repo_mut(repo_id).threads = PrLoad::Ready(Arc::new(threads));
     }
 
     /// A page of files as the background listing would hand it in.

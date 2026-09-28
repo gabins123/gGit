@@ -3703,6 +3703,9 @@ pub(crate) struct MainPaneView {
         Option<std::time::Duration>,
 
     pub(in crate::view) history_view: Entity<super::HistoryView>,
+    pub(in crate::view) pull_request_scroll: ScrollHandle,
+    pub(in crate::view) pull_request_scroll_key:
+        Option<(u64, crate::view::pull_requests::PrContentTab, Option<usize>)>,
     pub(in crate::view) diff_scroll: UniformListScrollHandle,
     pub(in crate::view) diff_split_right_scroll: UniformListScrollHandle,
     pub(in crate::view) conflict_resolver_diff_scroll: UniformListScrollHandle,

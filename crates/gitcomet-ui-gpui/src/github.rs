@@ -81,6 +81,45 @@ impl ReviewDecision {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrReviewerStatus {
+    Requested,
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+}
+
+impl PrReviewerStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "APPROVED" => Some(Self::Approved),
+            "CHANGES_REQUESTED" => Some(Self::ChangesRequested),
+            "COMMENTED" => Some(Self::Commented),
+            "DISMISSED" => Some(Self::Dismissed),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "Review requested",
+            Self::Approved => "Approved",
+            Self::ChangesRequested => "Changes requested",
+            Self::Commented => "Commented",
+            Self::Dismissed => "Dismissed",
+        }
+    }
+}
+
+/// A requested reviewer or the reviewer's latest submitted verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrReviewer {
+    /// The user's login, or a team's name when GitHub requested a team.
+    pub(crate) login: String,
+    pub(crate) status: PrReviewerStatus,
+}
+
 /// One entry of gh's `statusCheckRollup`: a check run (`name`, `status` +
 /// `conclusion`) or a commit status (`context`, `state`).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -248,9 +287,110 @@ struct RawReview {
     submitted_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewerIdentity {
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+impl RawReviewerIdentity {
+    fn display_name(&self) -> Option<String> {
+        self.login
+            .as_ref()
+            .or(self.name.as_ref())
+            .or(self.slug.as_ref())
+            .filter(|name| !name.is_empty())
+            .cloned()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewRequest {
+    #[serde(flatten)]
+    identity: RawReviewerIdentity,
+    #[serde(default)]
+    requested_reviewer: Option<RawReviewerIdentity>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLatestReview {
+    #[serde(default)]
+    author: Option<Author>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    submitted_at: Option<String>,
+}
+
+fn reviewers(requests: Vec<RawReviewRequest>, reviews: Vec<RawLatestReview>) -> Vec<PrReviewer> {
+    let mut result = Vec::new();
+    for request in requests {
+        let Some(login) = request
+            .requested_reviewer
+            .as_ref()
+            .and_then(RawReviewerIdentity::display_name)
+            .or_else(|| request.identity.display_name())
+        else {
+            continue;
+        };
+        if !result
+            .iter()
+            .any(|reviewer: &PrReviewer| reviewer.login.eq_ignore_ascii_case(&login))
+        {
+            result.push(PrReviewer {
+                login,
+                status: PrReviewerStatus::Requested,
+            });
+        }
+    }
+
+    let mut latest = Vec::<(String, String, PrReviewerStatus)>::new();
+    for review in reviews {
+        let (Some(author), Some(status)) = (review.author, PrReviewerStatus::parse(&review.state))
+        else {
+            continue;
+        };
+        let submitted_at = review.submitted_at.unwrap_or_default();
+        if let Some((login, latest_at, latest_status)) = latest
+            .iter_mut()
+            .find(|(login, _, _)| login.eq_ignore_ascii_case(&author.login))
+        {
+            if submitted_at >= *latest_at {
+                *login = author.login;
+                *latest_at = submitted_at;
+                *latest_status = status;
+            }
+        } else {
+            latest.push((author.login, submitted_at, status));
+        }
+    }
+    for (login, _, status) in latest {
+        match result
+            .iter_mut()
+            .find(|reviewer: &&mut PrReviewer| reviewer.login.eq_ignore_ascii_case(&login))
+        {
+            Some(reviewer) => reviewer.status = status,
+            None => result.push(PrReviewer { login, status }),
+        }
+    }
+    result.sort_by(|a, b| {
+        a.login
+            .to_ascii_lowercase()
+            .cmp(&b.login.to_ascii_lowercase())
+            .then_with(|| a.login.cmp(&b.login))
+    });
+    result
+}
+
 /// A comment or review on the pull request's conversation. The body is
-/// GitHub text from anyone who can comment: shown as plain text, never run
-/// or rendered as markup.
+/// untrusted GitHub text rendered only through the safe Markdown preview path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConversationEntry {
     pub(crate) author: String,
@@ -349,6 +489,10 @@ struct RawDetail {
     comments: Vec<RawComment>,
     #[serde(default)]
     reviews: Vec<RawReview>,
+    #[serde(default)]
+    review_requests: Vec<RawReviewRequest>,
+    #[serde(default)]
+    latest_reviews: Vec<RawLatestReview>,
 }
 
 /// Everything the Details panel shows for one pull request.
@@ -380,6 +524,7 @@ pub(crate) struct PullRequestDetail {
     /// Failing first, then pending, then passing.
     pub(crate) check_runs: Vec<CheckRun>,
     pub(crate) conversation: Vec<ConversationEntry>,
+    pub(crate) reviewers: Vec<PrReviewer>,
 }
 
 impl PullRequestDetail {
@@ -438,6 +583,7 @@ impl From<RawDetail> for PullRequestDetail {
                 runs
             },
             conversation: conversation(raw.comments, raw.reviews),
+            reviewers: reviewers(raw.review_requests, raw.latest_reviews),
         }
     }
 }
@@ -547,13 +693,17 @@ pub(crate) struct ReviewThread {
     pub(crate) line: Option<u32>,
     /// The line it was written on, in the commit it was written on.
     pub(crate) original_line: Option<u32>,
+    /// GitHub's authoritative conversation status.
+    pub(crate) is_resolved: bool,
+    /// GitHub's authoritative changed-line status.
+    pub(crate) is_outdated: bool,
     pub(crate) comments: Vec<ThreadComment>,
 }
 
 impl ReviewThread {
-    /// The lines it was on changed since: GitHub shows it as outdated.
+    /// Whether GitHub considers this thread outdated.
     pub(crate) fn outdated(&self) -> bool {
-        self.line.is_none() && self.original_line.is_some()
+        self.is_outdated
     }
 }
 
@@ -604,6 +754,10 @@ fn review_threads(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
             side: root.side.unwrap_or(ReviewSide::Right),
             line: root.line,
             original_line: root.original_line,
+            is_resolved: false,
+            // Filled authoritatively by the GraphQL thread query; retain the
+            // REST heuristic until then for callers that only parse REST.
+            is_outdated: root.line.is_none() && root.original_line.is_some(),
             comments: vec![comment(root)],
         })
         .collect();
@@ -837,7 +991,7 @@ pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullReques
         "--json=number,title,body,url,author,headRefName,headRefOid,baseRefName,baseRefOid,\
          isDraft,isCrossRepository,state,reviewDecision,mergeable,additions,deletions,\
          changedFiles,files,\
-         statusCheckRollup,comments,reviews",
+         statusCheckRollup,comments,reviews,reviewRequests,latestReviews",
     ]);
     let raw: RawDetail = parse_json(&run(command, None)?)?;
     Ok(raw.into())
@@ -1050,7 +1204,146 @@ pub(crate) fn list_review_threads(
         "--slurp",
     ]);
     let pages: Vec<Vec<RawReviewComment>> = parse_json(&run(command, None)?)?;
-    Ok(review_threads(pages.into_iter().flatten().collect()))
+    let mut threads = review_threads(pages.into_iter().flatten().collect());
+    let statuses = review_thread_statuses(workdir, repo, number)?;
+    apply_review_thread_statuses(&mut threads, &statuses)?;
+    Ok(threads)
+}
+
+fn apply_review_thread_statuses(
+    threads: &mut [ReviewThread],
+    statuses: &std::collections::HashMap<u64, ReviewThreadStatus>,
+) -> Result<(), PrError> {
+    for thread in threads {
+        let Some(status) = statuses.get(&thread.root_id) else {
+            return Err(PrError::Failed(format!(
+                "GitHub returned no status for review thread {}",
+                thread.root_id
+            )));
+        };
+        thread.is_resolved = status.is_resolved;
+        thread.is_outdated = status.is_outdated;
+    }
+    Ok(())
+}
+
+const REVIEW_THREAD_STATUSES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId } } } } } } }";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewThreadStatus {
+    is_resolved: bool,
+    is_outdated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusPage {
+    data: RawReviewThreadStatusData,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusData {
+    repository: RawReviewThreadStatusRepository,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusRepository {
+    pull_request: RawReviewThreadStatusPullRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusPullRequest {
+    review_threads: RawReviewThreadStatusConnection,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThreadStatusConnection {
+    #[serde(default)]
+    nodes: Vec<RawReviewThreadStatusNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusNode {
+    is_resolved: bool,
+    is_outdated: bool,
+    comments: RawReviewThreadRootComments,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThreadRootComments {
+    #[serde(default)]
+    nodes: Vec<RawReviewThreadRootComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadRootComment {
+    #[serde(default)]
+    database_id: Option<u64>,
+}
+
+fn parse_review_thread_statuses(
+    stdout: &[u8],
+) -> Result<std::collections::HashMap<u64, ReviewThreadStatus>, PrError> {
+    let unexpected =
+        |err: serde_json::Error| PrError::Failed(format!("unexpected gh output: {err}"));
+    let mut statuses = std::collections::HashMap::new();
+    let mut has_page = false;
+    for value in serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>() {
+        let value = value.map_err(unexpected)?;
+        let pages = match value {
+            serde_json::Value::Array(pages) => pages,
+            page => vec![page],
+        };
+        for value in pages {
+            let page: RawReviewThreadStatusPage =
+                serde_json::from_value(value).map_err(unexpected)?;
+            has_page = true;
+            for node in page.data.repository.pull_request.review_threads.nodes {
+                if let Some(database_id) = node.comments.nodes.first().and_then(|c| c.database_id) {
+                    statuses.insert(
+                        database_id,
+                        ReviewThreadStatus {
+                            is_resolved: node.is_resolved,
+                            is_outdated: node.is_outdated,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if !has_page {
+        return Err(PrError::Failed(
+            "unexpected gh output: no review thread status pages".to_string(),
+        ));
+    }
+    Ok(statuses)
+}
+
+/// The resolved and outdated state of every review thread, fetched with
+/// GitHub's paginated GraphQL connection and keyed by the REST root comment id.
+fn review_thread_statuses(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+) -> Result<std::collections::HashMap<u64, ReviewThreadStatus>, PrError> {
+    let (owner, name) = graphql_target(repo, number)?;
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "graphql",
+        "--hostname=github.com",
+        "--paginate",
+        &format!("--raw-field=query={REVIEW_THREAD_STATUSES_QUERY}"),
+        &format!("--raw-field=owner={owner}"),
+        &format!("--raw-field=name={name}"),
+        &format!("--field=number={number}"),
+    ]);
+    parse_review_thread_statuses(&run(command, None)?)
 }
 
 /// A review you submitted on a pull request, as GitHub's REST API lists it.
@@ -1805,6 +2098,45 @@ mod tests {
     }
 
     #[test]
+    fn graphql_thread_statuses_match_rest_roots_and_override_the_rest_heuristic() {
+        let raw: Vec<super::RawReviewComment> = serde_json::from_str(
+            r#"[
+                {"id": 1, "path": "a.rs", "line": null, "original_line": 12, "body": "old"},
+                {"id": 2, "path": "b.rs", "line": 4, "original_line": 4, "body": "current"}
+            ]"#,
+        )
+        .expect("REST comments");
+        let mut threads = super::review_threads(raw);
+        assert!(threads[0].outdated());
+        let page = |id, is_resolved, is_outdated| {
+            serde_json::json!({
+                "data": {"repository": {"pullRequest": {"reviewThreads": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [{
+                        "isResolved": is_resolved,
+                        "isOutdated": is_outdated,
+                        "comments": {"nodes": [{"databaseId": id}]}
+                    }]
+                }}}}
+            })
+            .to_string()
+        };
+        let pages = format!("{}\n{}", page(1, true, false), page(2, false, true));
+        let statuses = super::parse_review_thread_statuses(pages.as_bytes()).expect("statuses");
+        super::apply_review_thread_statuses(&mut threads, &statuses).expect("matched roots");
+
+        let first = threads.iter().find(|thread| thread.root_id == 1).unwrap();
+        assert!(first.is_resolved);
+        assert!(!first.is_outdated);
+        assert!(!first.outdated());
+        let second = threads.iter().find(|thread| thread.root_id == 2).unwrap();
+        assert!(!second.is_resolved);
+        assert!(second.is_outdated);
+        assert!(second.outdated());
+        assert!(super::apply_review_thread_statuses(&mut threads, &Default::default()).is_err());
+    }
+
+    #[test]
     fn changed_paths_read_nul_separated() {
         let files = super::parse_name_list(b"a.rs\0dir/b c.rs\0\0");
         assert_eq!(
@@ -1894,6 +2226,43 @@ mod tests {
         // but reviewable here, a page of files at a time.
         assert!(detail.too_large_for_codex());
         assert!(!detail.too_large_for_app());
+    }
+
+    #[test]
+    fn detail_json_maps_and_deduplicates_reviewers() {
+        let json = r#"{
+            "number": 9, "title": "t", "url": "u", "headRefName": "h", "headRefOid": "a",
+            "baseRefName": "b", "baseRefOid": "c",
+            "reviewRequests": [
+                {"__typename": "User", "login": "Octo"},
+                {"requestedReviewer": {"__typename": "Team", "name": "Platform"}}
+            ],
+            "latestReviews": [
+                {"author": {"login": "octo"}, "state": "APPROVED", "submittedAt": "2026-09-01T00:00:00Z"},
+                {"author": {"login": "zed"}, "state": "COMMENTED", "submittedAt": "2026-09-02T00:00:00Z"},
+                {"author": null, "state": "CHANGES_REQUESTED", "submittedAt": "2026-09-03T00:00:00Z"},
+                {"author": {"login": "pending"}, "state": "PENDING", "submittedAt": null}
+            ]
+        }"#;
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.as_bytes())
+            .expect("valid detail")
+            .into();
+        assert_eq!(
+            detail
+                .reviewers
+                .iter()
+                .map(|reviewer| (reviewer.login.as_str(), reviewer.status))
+                .collect::<Vec<_>>(),
+            [
+                ("Octo", PrReviewerStatus::Approved),
+                ("Platform", PrReviewerStatus::Requested),
+                ("zed", PrReviewerStatus::Commented),
+            ]
+        );
+        assert_eq!(
+            PrReviewerStatus::ChangesRequested.label(),
+            "Changes requested"
+        );
     }
 
     #[test]
