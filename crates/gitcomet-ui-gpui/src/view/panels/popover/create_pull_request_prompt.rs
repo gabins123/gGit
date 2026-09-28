@@ -1,6 +1,8 @@
 use super::*;
-use crate::github::BranchPush;
-use crate::view::pull_requests::{HeadProblem, pull_request_head, remote_branch_head};
+use crate::view::pull_requests::{
+    HeadProblem, own_upstream, pull_request_head_into, remote_branch_head,
+};
+use gitcomet_core::services::BranchPushRequest;
 
 /// Where the pull request's branch stands on GitHub, and what "push first"
 /// would do about it.
@@ -12,7 +14,7 @@ pub(super) struct HeadState {
     /// The branch's name on the remote it's pushed to.
     pub(super) remote_branch: String,
     /// The push that brings GitHub up to date; `None` when it is.
-    pub(super) push: Option<BranchPush>,
+    pub(super) push: Option<BranchPushRequest>,
     /// Local commits GitHub doesn't have; `None` when it has never seen the
     /// branch.
     pub(super) unpushed: Option<usize>,
@@ -26,38 +28,47 @@ impl HeadState {
     }
 }
 
-/// `None` for a detached HEAD, which can't head a pull request.
-pub(super) fn head_state(repo: &RepoState, branch: Option<&str>) -> Option<HeadState> {
+/// `None` for a detached HEAD, which can't head a pull request. `base` is the
+/// base typed so far: an upstream by that name is where the pull request
+/// goes, never the branch's own.
+pub(super) fn head_state(repo: &RepoState, branch: Option<&str>, base: &str) -> Option<HeadState> {
     let name = match (branch, &repo.head_branch) {
         (Some(name), _) => name.to_string(),
         (None, Loadable::Ready(head)) if head != "HEAD" => head.clone(),
         _ => return None,
     };
+    let base = Some(base).filter(|base| !base.is_empty());
     let local = repo
         .branches
         .ready()
         .and_then(|branches| branches.iter().find(|candidate| candidate.name == name));
-    // Only a same-named upstream is the branch's own: `git switch -c feat
-    // origin/main` tracks main, and pushing there would land on main.
-    let upstream = local
-        .and_then(|branch| branch.upstream.clone())
-        .filter(|upstream| upstream.branch == name);
-    match pull_request_head(repo, Some(&name)) {
+    let upstream = own_upstream(repo, &name, base);
+    // Pushed as it stands when asked: a branch that moves meanwhile isn't.
+    let push = |remote: String, branch: String, set_upstream: bool| {
+        local.map(|local| BranchPushRequest {
+            remote,
+            local_branch: name.clone(),
+            branch,
+            head: local.target.clone(),
+            set_upstream,
+        })
+    };
+    match pull_request_head_into(repo, Some(&name), base) {
         Ok(head) => {
+            // Its own upstream is on the remote, or there'd be no head.
+            let upstream = upstream?;
             let ahead = local
                 .and_then(|branch| branch.divergence.as_ref())
                 .map_or(0, |divergence| divergence.ahead);
-            let push = upstream.filter(|_| ahead > 0).map(|upstream| BranchPush {
-                remote: upstream.remote,
-                local: name.clone(),
-                remote_branch: name.clone(),
-                set_upstream: false,
-            });
             Some(HeadState {
-                remote_branch: name.clone(),
+                push: if ahead > 0 {
+                    push(upstream.remote.clone(), upstream.branch.clone(), false)
+                } else {
+                    None
+                },
+                remote_branch: upstream.branch,
                 branch: name,
                 head,
-                push,
                 unpushed: Some(ahead),
             })
         }
@@ -65,11 +76,11 @@ pub(super) fn head_state(repo: &RepoState, branch: Option<&str>) -> Option<HeadS
             // Back to its own upstream when that branch is gone; a new branch
             // goes to origin when origin is on GitHub (a fork's usual name),
             // else to the pull requests' own remote.
-            let remote = match upstream {
-                Some(upstream) => upstream.remote,
+            let (remote, remote_branch) = match upstream {
+                Some(upstream) => (upstream.remote, upstream.branch),
                 None => {
                     let remotes = repo.remotes.ready()?;
-                    remotes
+                    let remote = remotes
                         .iter()
                         .find(|remote| {
                             remote.name == "origin"
@@ -82,18 +93,14 @@ pub(super) fn head_state(repo: &RepoState, branch: Option<&str>) -> Option<HeadS
                         .map(|remote| remote.name.clone())
                         .or_else(|| {
                             crate::view::permalink::github_remote(remotes).map(|(name, _)| name)
-                        })?
+                        })?;
+                    (remote, name.clone())
                 }
             };
             Some(HeadState {
-                head: remote_branch_head(repo, &remote, &name),
-                push: Some(BranchPush {
-                    remote,
-                    local: name.clone(),
-                    remote_branch: name.clone(),
-                    set_upstream: true,
-                }),
-                remote_branch: name.clone(),
+                head: remote_branch_head(repo, &remote, &remote_branch),
+                push: push(remote, remote_branch.clone(), true),
+                remote_branch,
                 branch: name,
                 unpushed: None,
             })
@@ -180,10 +187,10 @@ pub(super) fn panel(
     let push_first = this.pull_request_push_first;
     let existing = this.existing_pull_request(cx);
     let repo = this.state.repos.iter().find(|repo| repo.id == repo_id);
-    let state = repo.and_then(|repo| head_state(repo, branch.as_deref()));
     let base = this
         .pull_request_base_input
         .read_with(cx, |input, _| input.text().trim().to_string());
+    let state = repo.and_then(|repo| head_state(repo, branch.as_deref(), &base));
     let candidates = repo.map(base_candidates).unwrap_or_default();
 
     let mut notices = Vec::new();
@@ -201,7 +208,7 @@ pub(super) fn panel(
                     false,
                     format!(
                         "{name} isn't on GitHub yet: creating pushes it to {}/{} first (Alt+P: don't).",
-                        push.remote, push.remote_branch
+                        push.remote, push.branch
                     ),
                 )),
                 (Some(_), None, false) => notices.push(notice(
@@ -217,7 +224,7 @@ pub(super) fn panel(
                         if ahead == 1 { "" } else { "s" },
                         if ahead == 1 { "is" } else { "are" },
                         push.remote,
-                        push.remote_branch,
+                        push.branch,
                     ),
                 )),
                 (Some(_), Some(ahead), false) => notices.push(notice(
@@ -556,20 +563,25 @@ mod tests {
         }
     }
 
+    /// Where the push goes: remote, remote branch, and whether it becomes
+    /// the upstream. Always the local branch's tip.
+    fn push_of(state: &HeadState) -> Option<(String, String, bool)> {
+        state.push.as_ref().map(|push| {
+            assert_eq!(push.local_branch, "feature");
+            assert_eq!(push.head, CommitId("1".repeat(40).into()));
+            (push.remote.clone(), push.branch.clone(), push.set_upstream)
+        })
+    }
+
     #[test]
     fn a_new_branch_is_pushed_with_its_upstream_set() {
         let repo = repo(vec![branch(None, 0)], vec![remote_branch("main")]);
-        let state = head_state(&repo, None).expect("a branch is checked out");
+        let state = head_state(&repo, None, "main").expect("a branch is checked out");
         assert_eq!(state.head, "feature");
         assert_eq!(state.unpushed, None);
         assert_eq!(
-            state.push,
-            Some(BranchPush {
-                remote: "origin".into(),
-                local: "feature".into(),
-                remote_branch: "feature".into(),
-                set_upstream: true,
-            })
+            push_of(&state),
+            Some(("origin".into(), "feature".into(), true))
         );
     }
 
@@ -579,16 +591,47 @@ mod tests {
             vec![branch(Some(("origin", "main")), 2)],
             vec![remote_branch("main")],
         );
-        let state = head_state(&repo, None).expect("checked out");
+        let state = head_state(&repo, None, "").expect("checked out");
         assert_eq!(state.head, "feature");
         assert_eq!(
-            state.push,
-            Some(BranchPush {
-                remote: "origin".into(),
-                local: "feature".into(),
-                remote_branch: "feature".into(),
-                set_upstream: true,
-            })
+            push_of(&state),
+            Some(("origin".into(), "feature".into(), true))
+        );
+    }
+
+    #[test]
+    fn a_branch_started_from_a_shared_branch_never_pushes_onto_it() {
+        let repo = repo(
+            vec![branch(Some(("origin", "release")), 3)],
+            vec![remote_branch("release"), remote_branch("main")],
+        );
+        let state = head_state(&repo, None, "main").expect("checked out");
+        assert_eq!(state.head, "feature");
+        assert_eq!(
+            push_of(&state),
+            Some(("origin".into(), "feature".into(), true))
+        );
+    }
+
+    #[test]
+    fn a_differently_named_upstream_of_its_own_heads_it_unless_it_is_the_base() {
+        let repo = repo(
+            vec![branch(Some(("origin", "me/feature")), 1)],
+            vec![remote_branch("me/feature"), remote_branch("main")],
+        );
+        let state = head_state(&repo, None, "main").expect("checked out");
+        assert_eq!(state.head, "me/feature");
+        assert_eq!(state.remote_branch, "me/feature");
+        assert_eq!(
+            push_of(&state),
+            Some(("origin".into(), "me/feature".into(), false))
+        );
+        // Opened into that branch, it's the base: the branch goes up as itself.
+        let state = head_state(&repo, None, "me/feature").expect("checked out");
+        assert_eq!(state.head, "feature");
+        assert_eq!(
+            push_of(&state),
+            Some(("origin".into(), "feature".into(), true))
         );
     }
 
@@ -621,7 +664,7 @@ mod tests {
             vec![branch(Some(("origin", "feature")), 2)],
             vec![remote_branch("feature"), remote_branch("main")],
         );
-        let state = head_state(&ahead, None).expect("checked out");
+        let state = head_state(&ahead, None, "main").expect("checked out");
         assert_eq!(state.unpushed, Some(2));
         assert_eq!(state.push.map(|push| push.set_upstream), Some(false));
 
@@ -629,7 +672,7 @@ mod tests {
             vec![branch(Some(("origin", "feature")), 0)],
             vec![remote_branch("feature")],
         );
-        let state = head_state(&even, None).expect("checked out");
+        let state = head_state(&even, None, "main").expect("checked out");
         assert_eq!(state.push, None);
         assert_eq!(state.remote_branch, "feature");
     }
@@ -638,7 +681,7 @@ mod tests {
     fn a_detached_head_has_no_head_state_and_bases_lead_with_the_default() {
         let mut detached = repo(vec![], vec![]);
         detached.head_branch = Loadable::Ready("HEAD".into());
-        assert!(head_state(&detached, None).is_none());
+        assert!(head_state(&detached, None, "main").is_none());
 
         let repo = repo(
             vec![],

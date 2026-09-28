@@ -824,6 +824,10 @@ pub enum Msg {
         target: SafePushAfterCommitTarget,
         set_upstream: bool,
     },
+    PushBranch {
+        repo_id: RepoId,
+        request: gitcomet_core::services::BranchPushRequest,
+    },
     ForcePush {
         repo_id: RepoId,
     },

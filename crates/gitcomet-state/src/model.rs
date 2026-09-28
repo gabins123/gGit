@@ -920,6 +920,18 @@ pub enum CloneOpStatus {
     FinishedErr(String),
 }
 
+/// How the last `PushBranch` of a repository finished: whoever asked for it
+/// learns the outcome here, whatever else the command log holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchPushOutcome {
+    pub request: gitcomet_core::services::BranchPushRequest,
+    /// Why it failed, worded for the user.
+    pub error: Option<String>,
+    /// It failed for want of credentials: the store asks for them, then
+    /// pushes again.
+    pub auth_prompted: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandLogEntry {
     pub time: SystemTime,
@@ -1705,6 +1717,8 @@ pub struct RepoState {
     /// The pulls among `pull_in_flight`: those also merge into the checkout.
     pub worktree_pull_in_flight: u32,
     pub push_in_flight: u32,
+    /// The last `PushBranch` to finish.
+    pub last_branch_push: Option<Arc<BranchPushOutcome>>,
     pub worktrees_in_flight: u32,
     pub local_actions_in_flight: u32,
     /// Commands that write sequencer state or move HEAD. Continue and Abort
@@ -1839,6 +1853,7 @@ impl RepoState {
             pull_in_flight: 0,
             worktree_pull_in_flight: 0,
             push_in_flight: 0,
+            last_branch_push: None,
             worktrees_in_flight: 0,
             local_actions_in_flight: 0,
             sequencer_actions_in_flight: 0,

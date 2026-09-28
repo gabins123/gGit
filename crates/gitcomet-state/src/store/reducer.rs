@@ -325,6 +325,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::PushWithTags { .. }
             | Msg::Push { .. }
             | Msg::PushAfterCommit { .. }
+            | Msg::PushBranch { .. }
             | Msg::ForcePush { .. }
             | Msg::ForcePushWithLease { .. }
             | Msg::PushSetUpstream { .. }
@@ -518,6 +519,7 @@ fn retry_msg_for_repo_command(repo_id: RepoId, command: RepoCommandKind) -> Opti
             target,
             set_upstream,
         },
+        RepoCommandKind::PushBranch { request } => Msg::PushBranch { repo_id, request },
         RepoCommandKind::ForcePush => Msg::ForcePush { repo_id },
         RepoCommandKind::ForcePushWithLease { lease } => Msg::ForcePushWithLease { repo_id, lease },
         RepoCommandKind::PushSetUpstream { remote, branch } => Msg::PushSetUpstream {
@@ -733,6 +735,7 @@ fn attach_git_auth_to_effects(mut effects: Vec<Effect>, auth: StagedGitAuth) -> 
         | Effect::PushWithTags { auth: slot, .. }
         | Effect::Push { auth: slot, .. }
         | Effect::PushAfterCommit { auth: slot, .. }
+        | Effect::PushBranch { auth: slot, .. }
         | Effect::ForcePush { auth: slot, .. }
         | Effect::ForcePushWithLease { auth: slot, .. }
         | Effect::PushSetUpstream { auth: slot, .. }
@@ -2043,6 +2046,9 @@ fn reduce_inner(
             target,
             set_upstream,
         } => actions_emit_effects::push_after_commit(repos, state, repo_id, target, set_upstream),
+        Msg::PushBranch { repo_id, request } => {
+            actions_emit_effects::push_branch(repos, state, repo_id, request)
+        }
         Msg::ForcePush { repo_id } => actions_emit_effects::force_push(repos, state, repo_id),
         Msg::ForcePushWithLease { repo_id, lease } => {
             actions_emit_effects::force_push_with_lease(repos, state, repo_id, lease)
@@ -2929,8 +2935,23 @@ fn reduce_inner(
                 refresh_selected_head_gitlink(repos, state, repo_id);
             }
 
+            let branch_push = match &command {
+                RepoCommandKind::PushBranch { request } => Some(crate::model::BranchPushOutcome {
+                    request: request.clone(),
+                    error: result.as_ref().err().map(util::format_error_for_user),
+                    auth_prompted: auth_prompt.is_some(),
+                }),
+                _ => None,
+            };
+
             let effects =
                 actions_emit_effects::repo_command_finished(state, repo_id, command, result);
+
+            if let Some(outcome) = branch_push
+                && let Some(repo_state) = state.repos.iter_mut().find(|repo| repo.id == repo_id)
+            {
+                repo_state.last_branch_push = Some(Arc::new(outcome));
+            }
 
             if let Some(path) = removed_worktree_path {
                 let repo_ids_to_close = state

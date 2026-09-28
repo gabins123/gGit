@@ -783,10 +783,12 @@ fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, PrError
 }
 
 /// The open pull requests, and whether gh could say which wait on your review.
+/// The open pull requests, whether gh could say which wait on you, and
+/// whether the list is every open one (not cut at the limit).
 pub(crate) fn list_open(
     workdir: &Path,
     repo: &str,
-) -> Result<(Vec<PullRequestSummary>, bool), PrError> {
+) -> Result<(Vec<PullRequestSummary>, bool, bool), PrError> {
     let mut command = gh(workdir);
     command.args([
         "pr",
@@ -797,6 +799,7 @@ pub(crate) fn list_open(
         "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup",
     ]);
     let raw: Vec<RawSummary> = parse_json(&run(command, None)?)?;
+    let complete = raw.len() < LIST_LIMIT as usize;
     let mut list: Vec<PullRequestSummary> = raw.into_iter().map(Into::into).collect();
     // Which ones wait on you, including any past the list's limit. Only a
     // marker: if gh can't answer, the list still shows (and says so).
@@ -821,7 +824,7 @@ pub(crate) fn list_open(
             }),
         }
     }
-    Ok((list, known))
+    Ok((list, known, complete))
 }
 
 pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullRequestDetail, PrError> {
@@ -1389,38 +1392,6 @@ pub(crate) fn create(workdir: &Path, repo: &str, pr: &NewPullRequest) -> Result<
     }
     let stdout = run(command, Some(&pr.body))?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
-}
-
-/// A local branch pushed ahead of opening its pull request.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BranchPush {
-    pub(crate) remote: String,
-    pub(crate) local: String,
-    pub(crate) remote_branch: String,
-    /// Records the pushed branch as the local one's upstream: for a branch
-    /// GitHub has never seen.
-    pub(crate) set_upstream: bool,
-}
-
-/// Pushes a branch for a pull request. Runs only from the create dialog's
-/// explicit "push and create", with the branch and remote it names.
-pub(crate) fn push_branch(workdir: &Path, push: &BranchPush) -> Result<(), PrError> {
-    let mut command = git(workdir);
-    command.arg("push");
-    if push.set_upstream {
-        command.arg("--set-upstream");
-    }
-    command.args([
-        "--",
-        &push.remote,
-        &format!(
-            "refs/heads/{}:refs/heads/{}",
-            push.local, push.remote_branch
-        ),
-    ]);
-    run_git(command)
-        .map(|_| ())
-        .map_err(|err| PrError::Failed(format!("git push failed: {err}")))
 }
 
 /// What `gh pr create --fill` would put in the form, worked out from local

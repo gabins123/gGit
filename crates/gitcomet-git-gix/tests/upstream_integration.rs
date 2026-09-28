@@ -1,6 +1,7 @@
 use gitcomet_core::domain::CommitId;
 use gitcomet_core::services::{
-    GitBackend, PullMode, SafePushAfterCommitContext, SafePushAfterCommitDecision,
+    BranchPushRequest, GitBackend, PullMode, SafePushAfterCommitContext,
+    SafePushAfterCommitDecision,
 };
 use gitcomet_core::test_support::git_fixture::{FixtureTimer, append_config};
 use gitcomet_git_gix::GixBackend;
@@ -764,5 +765,93 @@ fn safe_push_after_commit_remote_advance_does_not_refresh_force_lease_tracking_r
     assert_eq!(
         commit_id(&remote_repo, &format!("refs/heads/{branch}")),
         remote_advanced
+    );
+}
+
+#[test]
+fn push_branch_pushes_a_branch_that_is_not_checked_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let remote_repo = root.join("remote.git");
+    let work_repo = root.join("work");
+    fs::create_dir_all(&remote_repo).unwrap();
+    fs::create_dir_all(&work_repo).unwrap();
+
+    run_git(&remote_repo, &["init", "--bare"]);
+    run_git(&work_repo, &["init", "-b", "main"]);
+    append_config(
+        &work_repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
+    run_git(
+        &work_repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_repo.to_str().expect("remote path"),
+        ],
+    );
+
+    fs::write(work_repo.join("file.txt"), "base\n").unwrap();
+    run_git(&work_repo, &["add", "file.txt"]);
+    run_git(
+        &work_repo,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+    );
+    run_git(&work_repo, &["checkout", "-b", "feature"]);
+    fs::write(work_repo.join("file.txt"), "feature\n").unwrap();
+    run_git(&work_repo, &["add", "file.txt"]);
+    run_git(
+        &work_repo,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "feature"],
+    );
+    let feature_tip = commit_id(&work_repo, "refs/heads/feature");
+    run_git(&work_repo, &["checkout", "main"]);
+
+    let backend = GixBackend;
+    let opened = backend.open(&work_repo).unwrap();
+    let mut request = BranchPushRequest {
+        remote: "origin".to_string(),
+        local_branch: "feature".to_string(),
+        branch: "pr-feature".to_string(),
+        head: commit_id(&work_repo, "refs/heads/main"),
+        set_upstream: true,
+    };
+
+    let stale = opened.push_branch_with_output(&request).unwrap_err();
+    assert!(format!("{stale:?}").contains("stale branch push"));
+    assert!(
+        git_command_for_repo(&remote_repo)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/pr-feature"])
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty()
+    );
+
+    request.head = feature_tip.clone();
+    let output = opened.push_branch_with_output(&request).unwrap();
+    assert_eq!(output.command, request.log_command());
+    assert_eq!(
+        commit_id(&remote_repo, "refs/heads/pr-feature"),
+        feature_tip
+    );
+    assert_eq!(
+        run_git_capture(
+            &work_repo,
+            &["rev-parse", "--abbrev-ref", "feature@{upstream}"]
+        )
+        .trim(),
+        "origin/pr-feature"
+    );
+    assert_eq!(
+        run_git_capture(&work_repo, &["branch", "--show-current"]).trim(),
+        "main"
     );
 }

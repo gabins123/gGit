@@ -31,6 +31,9 @@ pub enum RepoCommandKind {
         target: SafePushAfterCommitTarget,
         set_upstream: bool,
     },
+    PushBranch {
+        request: gitcomet_core::services::BranchPushRequest,
+    },
     ForcePush,
     ForcePushWithLease {
         lease: ForcePushLease,
@@ -228,6 +231,7 @@ impl RepoCommandKind {
             | Self::Push
             | Self::PushWithTags { .. }
             | Self::PushAfterCommit { .. }
+            | Self::PushBranch { .. }
             | Self::ForcePush
             | Self::ForcePushWithLease { .. }
             | Self::PushSetUpstream { .. }
@@ -259,7 +263,7 @@ impl RepoCommandKind {
             Self::Pull { .. } | Self::PullBranch { .. } => "Pull",
             Self::MergeRef { .. } => "Merge",
             Self::SquashRef { .. } | Self::SquashCommits { .. } => "Squash",
-            Self::Push | Self::PushAfterCommit { .. } => "Push",
+            Self::Push | Self::PushAfterCommit { .. } | Self::PushBranch { .. } => "Push",
             Self::PushWithTags { request } => request.mode.label(),
             Self::ForcePush | Self::ForcePushWithLease { .. } => "Force push",
             Self::PushSetUpstream { .. } => "Push and set upstream",

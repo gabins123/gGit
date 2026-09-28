@@ -368,7 +368,7 @@ codegen-units = 1
 # `split-debuginfo = "packed"` puts the DWARF in a `.dSYM` bundle, and Windows
 # needs none because MSVC keeps debug info in the `.pdb` regardless — what
 # produces that file is `CARGO_PROFILE_RELEASE_DEBUG`, not `strip`.
-# See `.github/workflows/build-release-artifacts.yml`.
+# That job is upstream GitComet's; this fork builds Windows only.
 strip = "debuginfo"
 
 [profile.release-with-debug]

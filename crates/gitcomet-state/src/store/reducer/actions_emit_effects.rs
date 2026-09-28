@@ -466,6 +466,20 @@ fn push_after_commit_with_auth(
     }]
 }
 
+pub(super) fn push_branch(
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+    request: gitcomet_core::services::BranchPushRequest,
+) -> Vec<Effect> {
+    bump_in_flight(repos, state, repo_id, InFlightKind::Push);
+    vec![Effect::PushBranch {
+        repo_id,
+        request,
+        auth: None,
+    }]
+}
+
 pub(super) fn force_push(
     repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
@@ -1083,6 +1097,7 @@ fn command_clears_pending_force_push_lease(command: &RepoCommandKind) -> bool {
             | RepoCommandKind::PushWithTags { .. }
             | RepoCommandKind::Push
             | RepoCommandKind::PushAfterCommit { .. }
+            | RepoCommandKind::PushBranch { .. }
             | RepoCommandKind::ForcePush
             | RepoCommandKind::ForcePushWithLease { .. }
             | RepoCommandKind::PushSetUpstream { .. }
@@ -1208,6 +1223,7 @@ pub(super) fn repo_command_finished(
         RepoCommandKind::PushWithTags { .. }
         | RepoCommandKind::Push
         | RepoCommandKind::PushAfterCommit { .. }
+        | RepoCommandKind::PushBranch { .. }
         | RepoCommandKind::ForcePush
         | RepoCommandKind::ForcePushWithLease { .. }
         | RepoCommandKind::PushSetUpstream { .. }

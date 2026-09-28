@@ -114,6 +114,18 @@ impl GitCometView {
         }
 
         for next_repo in &next.repos {
+            if let Some(outcome) = next_repo.last_branch_push.as_ref() {
+                let seen = self
+                    .state
+                    .repos
+                    .iter()
+                    .find(|repo| repo.id == next_repo.id)
+                    .and_then(|repo| repo.last_branch_push.as_ref())
+                    .is_some_and(|previous| Arc::ptr_eq(previous, outcome));
+                if !seen {
+                    self.pull_request_push_landed(next_repo.id, outcome, cx);
+                }
+            }
             let (old_diag_len, old_cmd_len) = self
                 .state
                 .repos

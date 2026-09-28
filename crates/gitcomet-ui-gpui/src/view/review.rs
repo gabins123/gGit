@@ -2496,15 +2496,24 @@ fn draft_file_prefix(repo: &str) -> String {
 
 /// Pending comment counts of the reviews saved on this computer for `repo`,
 /// by pull request number. Only files that read back with comments count.
-pub(super) fn pending_review_counts(repo: &str) -> rustc_hash::FxHashMap<u64, usize> {
+///
+/// With `open`, every open pull request, the saved reviews of the others go
+/// when all they keep is viewed marks GitHub already has: a submitted review
+/// leaves its marks behind, and a merged pull request never needs them again.
+/// Unsent comments and marks GitHub hasn't taken stay.
+pub(super) fn pending_review_counts(
+    repo: &str,
+    open: Option<&rustc_hash::FxHashSet<u64>>,
+) -> rustc_hash::FxHashMap<u64, usize> {
     gitcomet_state::session::review_drafts_dir()
-        .map(|dir| pending_review_counts_in(&dir, repo))
+        .map(|dir| pending_review_counts_in(&dir, repo, open))
         .unwrap_or_default()
 }
 
 fn pending_review_counts_in(
     dir: &std::path::Path,
     repo: &str,
+    open: Option<&rustc_hash::FxHashSet<u64>>,
 ) -> rustc_hash::FxHashMap<u64, usize> {
     let mut counts = rustc_hash::FxHashMap::default();
     let prefix = draft_file_prefix(repo);
@@ -2521,10 +2530,13 @@ fn pending_review_counts_in(
         else {
             continue;
         };
-        if let Some(draft) = ReviewDraft::peek(&entry.path(), repo, number)
-            && !draft.comments.is_empty()
-        {
+        let Some(draft) = ReviewDraft::peek(&entry.path(), repo, number) else {
+            continue;
+        };
+        if !draft.comments.is_empty() {
             counts.insert(number, draft.comments.len());
+        } else if draft.unsynced.is_empty() && open.is_some_and(|open| !open.contains(&number)) {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
     counts
@@ -2695,7 +2707,7 @@ mod tests {
         write("o~r~10.json", "someone/else", 10, 1);
         std::fs::write(dir.path().join("o~r~11.json"), "not json").unwrap();
         std::fs::write(dir.path().join("o~r~12.json.unreadable"), "{}").unwrap();
-        let counts = pending_review_counts_in(dir.path(), "o/r");
+        let counts = pending_review_counts_in(dir.path(), "o/r", None);
         assert_eq!(counts.len(), 1, "{counts:?}");
         assert_eq!(counts.get(&7), Some(&2));
         // Counting never moves an unreadable file aside.
@@ -2747,7 +2759,62 @@ mod tests {
             serde_json::to_vec(&draft).unwrap(),
         )
         .unwrap();
-        assert!(pending_review_counts_in(dir.path(), "o/r").is_empty());
+        assert!(pending_review_counts_in(dir.path(), "o/r", None).is_empty());
+    }
+
+    #[test]
+    fn saved_reviews_of_closed_pull_requests_go_once_only_synced_marks_are_left() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |number: u64, comments: usize, unsynced: bool| {
+            let draft = ReviewDraft {
+                repo: "o/r".into(),
+                number,
+                head_oid: "a".repeat(40),
+                comments: (0..comments)
+                    .map(|n| ReviewComment {
+                        anchor: ReviewAnchor {
+                            path: "a.rs".into(),
+                            side: ReviewSide::Right,
+                            line: n as u32 + 1,
+                            start: None,
+                        },
+                        body: "?".into(),
+                        reply_to: None,
+                    })
+                    .collect(),
+                viewed: ["a.rs".to_string()].into(),
+                unsynced: if unsynced {
+                    [(
+                        "a.rs".to_string(),
+                        UnsyncedMark {
+                            viewed: true,
+                            head: "a".repeat(40),
+                        },
+                    )]
+                    .into()
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            };
+            let path = dir.path().join(format!("o~r~{number}.json"));
+            std::fs::write(&path, serde_json::to_vec(&draft).unwrap()).unwrap();
+            path
+        };
+        let open_marks = write(1, 0, false);
+        let closed_marks = write(2, 0, false);
+        let closed_comments = write(3, 1, false);
+        let closed_unsynced = write(4, 0, true);
+        // A list cut at its limit can't say what's closed: nothing goes.
+        pending_review_counts_in(dir.path(), "o/r", None);
+        assert!(closed_marks.exists());
+        let open: rustc_hash::FxHashSet<u64> = [1].into_iter().collect();
+        let counts = pending_review_counts_in(dir.path(), "o/r", Some(&open));
+        assert_eq!(counts.get(&3), Some(&1));
+        assert!(open_marks.exists());
+        assert!(!closed_marks.exists());
+        assert!(closed_comments.exists());
+        assert!(closed_unsynced.exists());
     }
 
     /// A review of a.rs, b.rs and c.rs at head `h1`, with nothing loaded.

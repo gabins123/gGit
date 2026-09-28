@@ -1636,3 +1636,44 @@ fn pull_request_files_move_only_the_highlight_until_a_diff_is_asked_for(
     press(cx, "3 j");
     assert_eq!(shown(cx).as_deref(), Some("c.rs"));
 }
+
+#[gpui::test]
+fn push_and_create_waits_for_its_own_push(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let push = gitcomet_core::services::BranchPushRequest {
+        remote: "origin".into(),
+        local_branch: "feat".into(),
+        branch: "feat".into(),
+        head: CommitId("1".repeat(40).into()),
+        set_upstream: true,
+    };
+    let outcome = |request: &gitcomet_core::services::BranchPushRequest| {
+        gitcomet_state::model::BranchPushOutcome {
+            request: request.clone(),
+            error: Some("rejected".into()),
+            auth_prompted: true,
+        }
+    };
+    let landed = |cx: &mut gpui::VisualTestContext, outcome| {
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.pull_request_push_landed(REPO, &outcome, cx);
+                this.pull_request_awaits_push_for_test(REPO)
+            })
+        })
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.await_pull_request_push_for_test(REPO, &push);
+        })
+    });
+    // Another branch's push finishing isn't it.
+    let other = gitcomet_core::services::BranchPushRequest {
+        local_branch: "main".into(),
+        ..push.clone()
+    };
+    assert!(landed(cx, outcome(&other)));
+    // Its own push failing on credentials ends the wait; the store asks.
+    assert!(!landed(cx, outcome(&push)));
+}

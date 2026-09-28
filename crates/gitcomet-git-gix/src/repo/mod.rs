@@ -11,11 +11,11 @@ use gitcomet_core::domain::{
 use gitcomet_core::git_ops_trace::{self, GitOpTraceKind};
 use gitcomet_core::remote_url::RemoteUrlPolicy;
 use gitcomet_core::services::{
-    BlameLine, CancellationToken, CheckoutRemoteBranchMode, CommandOutput, CommitOperationOutcome,
-    ConflictFileStages, ConflictSide, ForcePushLease, GitRepository, InteractiveRebaseEntry,
-    MergetoolResult, PullMode, RemoteUrlKind, ResetMode, Result, SafePushAfterCommitContext,
-    SafePushAfterCommitDecision, SafePushAfterCommitTarget, SequencerState, SubmoduleTrustDecision,
-    SubmoduleTrustTarget,
+    BlameLine, BranchPushRequest, CancellationToken, CheckoutRemoteBranchMode, CommandOutput,
+    CommitOperationOutcome, ConflictFileStages, ConflictSide, ForcePushLease, GitRepository,
+    InteractiveRebaseEntry, MergetoolResult, PullMode, RemoteUrlKind, ResetMode, Result,
+    SafePushAfterCommitContext, SafePushAfterCommitDecision, SafePushAfterCommitTarget,
+    SequencerState, SubmoduleTrustDecision, SubmoduleTrustTarget,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1206,6 +1206,10 @@ impl GitRepository for GixRepo {
         target: &SafePushAfterCommitTarget,
     ) -> Result<CommandOutput> {
         self.push_after_commit_set_upstream_with_output_impl(target)
+    }
+
+    fn push_branch_with_output(&self, request: &BranchPushRequest) -> Result<CommandOutput> {
+        self.push_branch_with_output_impl(request)
     }
 
     fn push_force_with_lease_with_output(&self, lease: &ForcePushLease) -> Result<CommandOutput> {
