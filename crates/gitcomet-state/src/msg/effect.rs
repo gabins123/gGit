@@ -542,6 +542,11 @@ pub enum Effect {
         set_upstream: bool,
         auth: Option<StagedGitAuth>,
     },
+    PushBranch {
+        repo_id: RepoId,
+        request: gitcomet_core::services::BranchPushRequest,
+        auth: Option<StagedGitAuth>,
+    },
     ForcePush {
         repo_id: RepoId,
         auth: Option<StagedGitAuth>,

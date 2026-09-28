@@ -395,6 +395,37 @@ pub struct SafePushAfterCommitTarget {
     pub local_head: CommitId,
 }
 
+/// A local branch pushed as it stands, whichever branch is checked out: a
+/// pull request's head, pushed before the pull request is opened.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct BranchPushRequest {
+    pub remote: String,
+    pub local_branch: String,
+    /// The branch's name on the remote.
+    pub branch: String,
+    /// The local branch's tip when the push was asked for; a branch that has
+    /// moved since isn't pushed.
+    pub head: CommitId,
+    /// Records `remote`/`branch` as the local branch's upstream.
+    pub set_upstream: bool,
+}
+
+impl BranchPushRequest {
+    /// The command-log line for this push, the same on success and failure:
+    /// how a caller finds its outcome in the log.
+    pub fn log_command(&self) -> String {
+        let upstream = if self.set_upstream {
+            "--set-upstream "
+        } else {
+            ""
+        };
+        format!(
+            "git push {upstream}{} refs/heads/{}:refs/heads/{}",
+            self.remote, self.local_branch, self.branch
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForcePushLease {
     pub remote: String,
@@ -1326,6 +1357,13 @@ pub trait GitRepository: Send + Sync {
     ) -> Result<CommandOutput> {
         validate_safe_push_after_commit_target(self, target)?;
         self.push_set_upstream_with_output(&target.remote, &target.branch)
+    }
+
+    fn push_branch_with_output(&self, request: &BranchPushRequest) -> Result<CommandOutput> {
+        let _ = request;
+        Err(Error::new(ErrorKind::Unsupported(
+            "branch push is not implemented for this backend",
+        )))
     }
 
     fn push_force_with_lease_with_output(&self, lease: &ForcePushLease) -> Result<CommandOutput> {

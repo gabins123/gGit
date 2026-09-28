@@ -5224,3 +5224,66 @@ fn cherry_pick_setup_never_enables_rewording_after_partial_or_stale_message_load
     assert!(matches!(setup.full_messages, Loadable::Error(_)));
     assert_eq!(setup.entries[0].message, "subject");
 }
+
+#[test]
+fn push_branch_tracks_push_in_flight_and_logs_its_command_line() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+
+    let repo_id = RepoId(1);
+    repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    let request = gitcomet_core::services::BranchPushRequest {
+        remote: "origin".to_string(),
+        local_branch: "feature".to_string(),
+        branch: "pr-feature".to_string(),
+        head: CommitId("2222222222222222222222222222222222222222".into()),
+        set_upstream: true,
+    };
+
+    for result in [
+        Ok(CommandOutput::empty_success("git push")),
+        Err(Error::new(ErrorKind::Backend(
+            "git push origin feature failed: rejected".to_string(),
+        ))),
+    ] {
+        let effects = reduce(
+            &mut repos,
+            &id_alloc,
+            &mut state,
+            Msg::PushBranch {
+                repo_id,
+                request: request.clone(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PushBranch { repo_id: RepoId(1), request: r, auth: None }] if r == &request
+        ));
+        assert_eq!(state.repos[0].push_in_flight, 1);
+
+        let ok = result.is_ok();
+        reduce(
+            &mut repos,
+            &id_alloc,
+            &mut state,
+            Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+                repo_id,
+                command: RepoCommandKind::PushBranch {
+                    request: request.clone(),
+                },
+                result,
+            }),
+        );
+        assert_eq!(state.repos[0].push_in_flight, 0);
+        let entry = state.repos[0].feedback.command_log.last().unwrap();
+        assert_eq!(entry.ok, ok);
+        assert_eq!(entry.command, request.log_command());
+    }
+}

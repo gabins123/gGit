@@ -48,6 +48,9 @@ pub(super) struct RepoPullRequests {
     pub(super) submitting: bool,
     /// gh's refusal of the last review, create or merge, shown in its dialog.
     pub(super) submit_error: Option<String>,
+    /// "Push and create": the pull request to open once the store's push
+    /// lands.
+    awaiting_push: Option<(gitcomet_core::services::BranchPushRequest, NewPullRequest)>,
     /// The pull request `gh pr checkout` is working on.
     checking_out: Option<u64>,
     /// Pending comments of the reviews saved on this computer, by pull
@@ -96,31 +99,53 @@ pub(super) fn pull_request_head(
     repo: &RepoState,
     branch: Option<&str>,
 ) -> Result<String, HeadProblem> {
+    pull_request_head_into(repo, branch, None)
+}
+
+/// `pull_request_head` for a pull request into `base`, when that's known.
+pub(super) fn pull_request_head_into(
+    repo: &RepoState,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<String, HeadProblem> {
     let name = match (branch, &repo.head_branch) {
         (Some(name), _) => name.to_string(),
         (None, Loadable::Ready(head)) if head != "HEAD" => head.clone(),
         _ => return Err(HeadProblem::Detached),
     };
-    let upstream = repo
-        .branches
-        .ready()
-        .and_then(|branches| branches.iter().find(|candidate| candidate.name == name))
-        .and_then(|branch| branch.upstream.clone());
-    // Configured isn't pushed: the remote-tracking ref has to exist. And only
-    // a same-named upstream is the branch's own; `git switch -c feat
-    // origin/main` tracks main, which is the base, not the head.
-    let live = upstream.as_ref().is_some_and(|upstream| {
-        upstream.branch == name
-            && repo.remote_branches.ready().is_some_and(|remote_branches| {
+    // Configured isn't pushed: the remote-tracking ref has to exist.
+    match own_upstream(repo, &name, base) {
+        Some(upstream)
+            if repo.remote_branches.ready().is_some_and(|remote_branches| {
                 remote_branches.iter().any(|candidate| {
                     candidate.remote == upstream.remote && candidate.name == upstream.branch
                 })
-            })
-    });
-    match upstream {
-        Some(upstream) if live => Ok(remote_branch_head(repo, &upstream.remote, &upstream.branch)),
+            }) =>
+        {
+            Ok(remote_branch_head(repo, &upstream.remote, &upstream.branch))
+        }
         _ => Err(HeadProblem::NotPushed),
     }
+}
+
+/// `name`'s upstream when it's the branch's own: named the same, or the same
+/// name under a prefix (`fix` pushed as `me/fix`), unless that's the base
+/// asked for. Any other is where the branch started: `git switch -c feat
+/// origin/release` tracks release, and pushing there would land on release.
+pub(super) fn own_upstream(
+    repo: &RepoState,
+    name: &str,
+    base: Option<&str>,
+) -> Option<gitcomet_core::domain::Upstream> {
+    repo.branches
+        .ready()
+        .and_then(|branches| branches.iter().find(|candidate| candidate.name == name))
+        .and_then(|branch| branch.upstream.clone())
+        .filter(|upstream| {
+            upstream.branch == name
+                || (upstream.branch.ends_with(&format!("/{name}"))
+                    && base != Some(upstream.branch.as_str()))
+        })
 }
 
 /// `branch` on `remote` as a pull request head: bare on the pull requests' own
@@ -325,12 +350,23 @@ impl GitCometView {
         if entry.list.ready().is_none() {
             entry.list = PrLoad::Loading;
         }
+        // Its saved review is being written to: it stays, merged or not.
+        let reviewing = self
+            .review
+            .as_ref()
+            .filter(|review| review.repo_id == repo_id)
+            .map(|review| review.number);
         let task = cx.background_spawn(async move {
-            let drafts = super::review::pending_review_counts(&target.slug);
-            github::list_open(&target.workdir, &target.slug).map(|(mut list, requested_known)| {
-                inbox_order(&mut list, &drafts);
-                (list, drafts, requested_known)
-            })
+            github::list_open(&target.workdir, &target.slug).map(
+                |(mut list, requested_known, complete)| {
+                    // Only a whole list says which pull requests aren't open.
+                    let open: Option<rustc_hash::FxHashSet<u64>> = complete
+                        .then(|| list.iter().map(|pr| pr.number).chain(reviewing).collect());
+                    let drafts = super::review::pending_review_counts(&target.slug, open.as_ref());
+                    inbox_order(&mut list, &drafts);
+                    (list, drafts, requested_known)
+                },
+            )
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
@@ -1293,39 +1329,99 @@ impl GitCometView {
 
     /// Opens a pull request, pushing its branch first when the dialog says
     /// so. Runs only from the create dialog's explicit submit.
+    /// Opens the pull request, after pushing its branch when `push` says so.
+    /// The push is the store's, as every other: its credential prompt, its
+    /// log. The pull request opens once the push lands.
     pub(super) fn submit_new_pull_request(
         &mut self,
         repo_id: RepoId,
         pr: NewPullRequest,
-        push: Option<github::BranchPush>,
+        push: Option<gitcomet_core::services::BranchPushRequest>,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some(target) = self.github_target_for(repo_id) else {
+        if self.github_target_for(repo_id).is_none() {
             return;
-        };
-        let repo_id = target.repo_id;
+        }
         let entry = self.pull_requests.repo_mut(repo_id);
         if entry.submitting {
             return;
         }
         entry.submitting = true;
         entry.submit_error = None;
-        let pushes = push.is_some();
-        let task = cx.background_spawn(async move {
-            if let Some(push) = &push {
-                github::push_branch(&target.workdir, push)?;
-            }
-            github::create(&target.workdir, &target.slug, &pr)
+        let Some(push) = push else {
+            self.create_pull_request_now(repo_id, pr, cx);
+            return;
+        };
+        // The store drops a push while git isn't there, without a word.
+        if !self.state.git_runtime.is_available() {
+            entry.submitting = false;
+            let message = format!("Couldn't push {}: git isn't available.", push.local_branch);
+            self.report_pull_request_error(repo_id, PrDialog::Create, message.clone(), message, cx);
+            return;
+        }
+        entry.awaiting_push = Some((push.clone(), pr));
+        self.store.dispatch(Msg::PushBranch {
+            repo_id,
+            request: push,
         });
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// A branch push finished in `repo_id`: if it's the one a pull request
+    /// waits on, opens the pull request, or says why it can't.
+    pub(super) fn pull_request_push_landed(
+        &mut self,
+        repo_id: RepoId,
+        outcome: &gitcomet_state::model::BranchPushOutcome,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(prs) = self.pull_requests.repos.get_mut(&repo_id) else {
+            return;
+        };
+        if prs
+            .awaiting_push
+            .as_ref()
+            .is_none_or(|(request, _)| *request != outcome.request)
+        {
+            return;
+        }
+        let Some((request, pr)) = prs.awaiting_push.take() else {
+            return;
+        };
+        let Some(error) = &outcome.error else {
+            self.create_pull_request_now(repo_id, pr, cx);
+            return;
+        };
+        prs.submitting = false;
+        let branch = request.local_branch;
+        // The store asks for them and pushes again; the pull request is one
+        // more enter away, with nothing left to push.
+        let message = if outcome.auth_prompted {
+            format!("Pushing {branch} needs your credentials. Once it's pushed, create again.")
+        } else {
+            format!("Couldn't push {branch}: {error}")
+        };
+        self.report_pull_request_error(repo_id, PrDialog::Create, message.clone(), message, cx);
+    }
+
+    /// `gh pr create`, the branch already on GitHub. `submitting` is set.
+    fn create_pull_request_now(
+        &mut self,
+        repo_id: RepoId,
+        pr: NewPullRequest,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
+            self.pull_requests.repo_mut(repo_id).submitting = false;
+            return;
+        };
+        let task =
+            cx.background_spawn(async move { github::create(&target.workdir, &target.slug, &pr) });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
                 let entry = this.pull_requests.repo_mut(repo_id);
                 entry.submitting = false;
-                if pushes {
-                    // The branch and its upstream moved under the store.
-                    this.store.dispatch(Msg::RefreshBranches { repo_id });
-                }
                 match result {
                     Ok(url) => {
                         this.close_pull_request_prompt(repo_id, PrDialog::Create, cx);
@@ -1374,6 +1470,35 @@ impl GitCometView {
                 });
             });
         });
+    }
+
+    /// "Push and create" as submitted with `push`, before the push lands.
+    #[cfg(test)]
+    pub(super) fn await_pull_request_push_for_test(
+        &mut self,
+        repo_id: RepoId,
+        push: &gitcomet_core::services::BranchPushRequest,
+    ) {
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.submitting = true;
+        entry.awaiting_push = Some((
+            push.clone(),
+            NewPullRequest {
+                base: "main".into(),
+                head: push.branch.clone(),
+                title: "t".into(),
+                body: String::new(),
+                draft: false,
+            },
+        ));
+    }
+
+    /// Whether a pull request still waits on its push, submitting.
+    #[cfg(test)]
+    pub(super) fn pull_request_awaits_push_for_test(&self, repo_id: RepoId) -> bool {
+        self.pull_requests
+            .repo(repo_id)
+            .is_some_and(|prs| prs.awaiting_push.is_some() && prs.submitting)
     }
 
     #[cfg(test)]

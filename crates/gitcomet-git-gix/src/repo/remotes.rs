@@ -9,8 +9,8 @@ use gitcomet_core::domain::{CommitId, Remote, RemoteBranch, Upstream};
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::remote_url::{RemoteUrlPolicy, validate_remote_url_with_policy};
 use gitcomet_core::services::{
-    CancellationToken, CommandOutput, ForcePushLease, PullMode, RemoteUrlKind, Result,
-    SafePushAfterCommitContext, SafePushAfterCommitDecision, SafePushAfterCommitTarget,
+    BranchPushRequest, CancellationToken, CommandOutput, ForcePushLease, PullMode, RemoteUrlKind,
+    Result, SafePushAfterCommitContext, SafePushAfterCommitDecision, SafePushAfterCommitTarget,
 };
 use gitcomet_core::text_utils::redact_url_userinfo;
 use gix::bstr::ByteSlice as _;
@@ -1600,6 +1600,71 @@ impl GixRepo {
         target: &SafePushAfterCommitTarget,
     ) -> Result<CommandOutput> {
         self.push_after_commit_target_with_optional_output_impl(target, true, true)
+    }
+
+    pub(super) fn push_branch_with_output_impl(
+        &self,
+        request: &BranchPushRequest,
+    ) -> Result<CommandOutput> {
+        validate_ref_like_arg(&request.remote, "remote name")?;
+        validate_ref_like_arg(&request.branch, "branch name")?;
+        validate_ref_like_arg(&request.local_branch, "local branch name")?;
+        validate_hex_commit_id(&request.head)?;
+
+        let local_ref = format!("refs/heads/{}", request.local_branch);
+        let tip = {
+            let repo = self.reopen_repo()?;
+            let reference = repo.try_find_reference(local_ref.as_str()).map_err(|e| {
+                Error::new(ErrorKind::Backend(format!("gix try_find_reference: {e}")))
+            })?;
+            match reference {
+                Some(mut reference) => Some(CommitId(oid_to_arc_str(
+                    &reference
+                        .peel_to_id()
+                        .map_err(|e| Error::new(ErrorKind::Backend(format!("gix peel: {e}"))))?
+                        .detach(),
+                ))),
+                None => None,
+            }
+        };
+        match tip {
+            Some(tip) if tip == request.head => {}
+            Some(tip) => {
+                return Err(Error::new(ErrorKind::Backend(format!(
+                    "stale branch push: expected {} at {}, but it is at {}",
+                    request.local_branch, request.head, tip
+                ))));
+            }
+            None => {
+                return Err(Error::new(ErrorKind::Backend(format!(
+                    "stale branch push: local branch {} no longer exists",
+                    request.local_branch
+                ))));
+            }
+        }
+
+        let source = if request.set_upstream {
+            local_ref
+        } else {
+            request.head.to_string()
+        };
+        let refspec = format!("{source}:refs/heads/{}", request.branch);
+
+        let mut cmd = self.git_workdir_cmd();
+        cmd.arg("push");
+        if request.set_upstream {
+            cmd.arg("--set-upstream");
+        }
+        cmd.arg("--").arg(&request.remote).arg(refspec);
+        let output = run_git_command_with_optional_output(cmd, &request.log_command(), true)?;
+        self.clear_pending_upstream_if_matches(
+            &request.local_branch,
+            &Upstream {
+                remote: request.remote.clone(),
+                branch: request.branch.clone(),
+            },
+        );
+        Ok(output)
     }
 
     fn fetch_remote_branch_tip_with_output(

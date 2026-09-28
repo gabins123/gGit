@@ -1279,6 +1279,12 @@ fn summarize_command(
 ) -> (String, String) {
     use gitcomet_core::services::ConflictSide;
 
+    // A branch push's caller finds its outcome by this exact log line.
+    let log_command = match command {
+        RepoCommandKind::PushBranch { request } => Some(request.log_command()),
+        _ => None,
+    };
+
     if !ok {
         let label = match command {
             RepoCommandKind::FetchAll => "Fetch",
@@ -1291,6 +1297,7 @@ fn summarize_command(
             RepoCommandKind::PushWithTags { request } => request.mode.label(),
             RepoCommandKind::Push => "Push",
             RepoCommandKind::PushAfterCommit { .. } => "Push after commit",
+            RepoCommandKind::PushBranch { .. } => "Push",
             RepoCommandKind::ForcePush => "Force push",
             RepoCommandKind::ForcePushWithLease { .. } => "Force push with lease",
             RepoCommandKind::PushSetUpstream { .. } => "Push",
@@ -1352,11 +1359,15 @@ fn summarize_command(
         if let Some(error) = error
             && let Some((git_command, details)) = try_format_git_backend_error(error)
         {
-            return (git_command, format!("{label} failed:\n\n{details}"));
+            return (
+                log_command.unwrap_or(git_command),
+                format!("{label} failed:\n\n{details}"),
+            );
         }
 
         return (
-            output.command.clone().if_empty_else(|| label.to_string()),
+            log_command
+                .unwrap_or_else(|| output.command.clone().if_empty_else(|| label.to_string())),
             error
                 .map(|e| format!("{label} failed:\n\n{}", format_error_for_user(e)))
                 .unwrap_or_else(|| format!("{label} failed")),
@@ -1444,6 +1455,14 @@ fn summarize_command(
             } else {
                 format!("Push after commit: {base}")
             }
+        }
+        RepoCommandKind::PushBranch { request } => {
+            let base = if output.stderr.contains("Everything up-to-date") {
+                "Everything up-to-date"
+            } else {
+                "Completed"
+            };
+            format!("Push {}: {base}", request.local_branch)
         }
         RepoCommandKind::ForcePush => {
             if output.stderr.contains("Everything up-to-date") {
@@ -1698,7 +1717,10 @@ fn summarize_command(
         }
     };
 
-    (output.command.clone(), summary)
+    (
+        log_command.unwrap_or_else(|| output.command.clone()),
+        summary,
+    )
 }
 
 pub(super) fn format_error_for_user(error: &Error) -> String {

@@ -2091,18 +2091,25 @@ impl PopoverHost {
     /// The open create dialog's branch, where it stands on GitHub.
     fn create_pull_request_state(
         &self,
+        cx: &App,
     ) -> Option<(RepoId, super::create_pull_request_prompt::HeadState)> {
         let Some(PopoverKind::CreatePullRequest { repo_id, branch }) = &self.popover else {
             return None;
         };
         let repo = self.state.repos.iter().find(|repo| repo.id == *repo_id)?;
-        super::create_pull_request_prompt::head_state(repo, branch.as_deref())
+        let base = self
+            .pull_request_base_input
+            .read(cx)
+            .text()
+            .trim()
+            .to_string();
+        super::create_pull_request_prompt::head_state(repo, branch.as_deref(), &base)
             .map(|state| (*repo_id, state))
     }
 
     /// The open pull request already coming from the dialog's branch.
     pub(super) fn existing_pull_request(&self, cx: &mut gpui::Context<Self>) -> Option<u64> {
-        let (repo_id, state) = self.create_pull_request_state()?;
+        let (repo_id, state) = self.create_pull_request_state(cx)?;
         let owner = self
             .state
             .repos
@@ -2125,7 +2132,7 @@ impl PopoverHost {
 
     /// The base typed so far, when it names the branch itself.
     pub(super) fn pull_request_base_is_head(&self, cx: &mut gpui::Context<Self>) -> bool {
-        let Some((_, state)) = self.create_pull_request_state() else {
+        let Some((_, state)) = self.create_pull_request_state(cx) else {
             return false;
         };
         self.pull_request_base_input
@@ -2206,7 +2213,7 @@ impl PopoverHost {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some((repo_id, state)) = self.create_pull_request_state() else {
+        let Some((repo_id, state)) = self.create_pull_request_state(cx) else {
             return;
         };
         let slug = self
@@ -2244,8 +2251,12 @@ impl PopoverHost {
     fn create_pull_request_plan(
         &self,
         cx: &mut gpui::Context<Self>,
-    ) -> Option<(RepoId, String, Option<crate::github::BranchPush>)> {
-        let (repo_id, state) = self.create_pull_request_state()?;
+    ) -> Option<(
+        RepoId,
+        String,
+        Option<gitcomet_core::services::BranchPushRequest>,
+    )> {
+        let (repo_id, state) = self.create_pull_request_state(cx)?;
         let push = if self.pull_request_push_first {
             state.push
         } else {

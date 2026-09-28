@@ -59,6 +59,10 @@ fn repo_command_context(command: &RepoCommandKind) -> Option<String> {
                 target.local_branch, target.remote, target.branch
             )
         }
+        RepoCommandKind::PushBranch { request } => format!(
+            "{} → {}/{}",
+            request.local_branch, request.remote, request.branch
+        ),
         RepoCommandKind::ForcePushWithLease { lease } => {
             format!("{} → {}/{}", lease.local_branch, lease.remote, lease.branch)
         }
@@ -1055,6 +1059,27 @@ pub(super) fn schedule_push_after_commit(
                 }
             })
         },
+    );
+}
+
+pub(super) fn schedule_push_branch(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    request: gitcomet_core::services::BranchPushRequest,
+    auth: Option<StagedGitAuth>,
+) {
+    let command_request = request.clone();
+    schedule_repo_command(
+        executor,
+        repos,
+        msg_tx,
+        repo_id,
+        RepoCommandKind::PushBranch {
+            request: command_request,
+        },
+        move |repo| run_with_git_auth(auth, || repo.push_branch_with_output(&request)),
     );
 }
 
