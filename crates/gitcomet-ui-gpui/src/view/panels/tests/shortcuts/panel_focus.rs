@@ -820,6 +820,66 @@ fn pull_request_enter_focuses_the_conversation_panel(cx: &mut gpui::TestAppConte
 }
 
 #[gpui::test]
+fn leaving_review_clears_its_diff_before_history_returns(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+
+    press(cx, "1 r");
+    sync_store_snapshot(cx, &view);
+    assert!(cx.update(|_window, app| {
+        view.read(app).store.snapshot().repos[0]
+            .diff_state
+            .diff_target
+            .is_some()
+    }));
+    press(cx, "q");
+    sync_store_snapshot(cx, &view);
+    assert!(cx.update(|_window, app| {
+        view.read(app).store.snapshot().repos[0]
+            .diff_state
+            .diff_target
+            .is_none()
+    }));
+    press(cx, "1 [");
+    sync_store_snapshot(cx, &view);
+    press(cx, "2");
+    assert_eq!(focused(cx, &view), Some(History));
+    assert!(!cx.update(|_window, app| view.read(app).diff_is_open()));
+}
+
+#[gpui::test]
+fn pull_request_details_keys_keep_the_hidden_diff_closed(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+
+    press(cx, "3 j k shift-j shift-k");
+    sync_store_snapshot(cx, &view);
+    assert_eq!(focused(cx, &view), Some(Details));
+    assert!(cx.update(|_window, app| {
+        view.read(app).store.snapshot().repos[0]
+            .diff_state
+            .diff_target
+            .is_none()
+    }));
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .key_hints(Details)
+            .iter()
+            .any(|(key, _)| *key == "enter")
+    }));
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .key_help(Details)
+            .iter()
+            .any(|(key, _)| *key == "enter")
+    }));
+    press(cx, "enter");
+    assert_eq!(focused(cx, &view), Some(History));
+}
+
+#[gpui::test]
 fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpui::TestAppContext) {
     use crate::view::panes::main::{ReviewCommentScope, SinceLines};
     use crate::view::review::SinceReview;
@@ -1659,12 +1719,14 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
             detail.body = "# Summary".into();
             detail.conversation = vec![
                 ConversationEntry {
+                    id: "first".into(),
                     author: "alice".into(),
                     verb: "commented",
                     at: "2025-01-01T00:00:00Z".into(),
                     body: "First".into(),
                 },
                 ConversationEntry {
+                    id: "second".into(),
                     author: "bob".into(),
                     verb: "approved",
                     at: "2025-01-02T00:00:00Z".into(),
@@ -1724,6 +1786,15 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
         }),
         (Some(3), vec![0, 3])
     );
+    press(cx, "[");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_pull_requests().unwrap().content_tab),
+        PrContentTab::Conversation
+    );
+    press(cx, "enter shift-c t g shift-t m escape");
+    assert!(cx.update(|_window, app| view.read(app).active_review().is_none()));
+    assert!(!cx.update(|_window, app| view.read(app).diff_is_open()));
+    press(cx, "]");
     press(cx, "shift-v j");
     assert_eq!(
         cx.update(|_window, app| {

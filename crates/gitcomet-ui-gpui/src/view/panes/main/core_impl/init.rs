@@ -628,6 +628,7 @@ impl MainPaneView {
             conflict_resolved_outline_background_delay_override: None,
             history_view,
             pull_request_scroll: ScrollHandle::new(),
+            pr_markdown_cache: Default::default(),
             pull_request_scroll_key: None,
             diff_scroll: UniformListScrollHandle::default(),
             diff_split_right_scroll: UniformListScrollHandle::default(),

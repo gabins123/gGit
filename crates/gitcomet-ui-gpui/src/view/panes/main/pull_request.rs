@@ -1,11 +1,58 @@
 use super::*;
-use crate::github::{ConversationEntry, PullRequestDetail, ReviewThread};
+use crate::github::{ConversationEntry, PrReviewerStatus, PullRequestDetail, ReviewThread};
 use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use crate::view::RemoteMarkdownImagePolicy;
 use crate::view::markdown_preview::{
     MarkdownInlineSpan, MarkdownInlineStyle, MarkdownPreviewDocument, MarkdownPreviewRowKind,
 };
-use crate::view::pull_requests::{PrContentTab, PrLoad, visible_pr_thread_indexes};
+use crate::view::pull_requests::{
+    MAX_PR_VISIBLE_THREADS, PrContentTab, PrLoad, visible_pr_thread_indexes,
+};
+use rustc_hash::FxHashMap;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(in crate::view) enum PrMarkdownKey {
+    Body,
+    Entry(String),
+    Thread(u64),
+}
+
+#[derive(Default)]
+pub(in crate::view) struct PrMarkdownCache {
+    number: Option<u64>,
+    documents: FxHashMap<PrMarkdownKey, (String, Option<Arc<MarkdownPreviewDocument>>)>,
+}
+
+impl PrMarkdownCache {
+    fn document(
+        &mut self,
+        number: u64,
+        key: PrMarkdownKey,
+        source: &str,
+    ) -> Option<Arc<MarkdownPreviewDocument>> {
+        if self.number != Some(number) {
+            self.documents.clear();
+            self.number = Some(number);
+        }
+        if self
+            .documents
+            .get(&key)
+            .is_some_and(|(cached, _)| cached == source)
+        {
+            return self
+                .documents
+                .get(&key)
+                .and_then(|(_, document)| document.clone());
+        }
+        if self.documents.len() >= 512 {
+            self.documents.clear();
+        }
+        let document = pr_markdown_document(source).map(Arc::new);
+        self.documents
+            .insert(key, (source.to_owned(), document.clone()));
+        document
+    }
+}
 
 impl MainPaneView {
     pub(super) fn pull_request_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
@@ -211,7 +258,9 @@ impl MainPaneView {
 
         let body = match tab {
             PrContentTab::Conversation => self.pr_conversation(&detail, selected_entry, cx),
-            PrContentTab::Comments => self.pr_comments(&threads, selected_thread, show_hidden, cx),
+            PrContentTab::Comments => {
+                self.pr_comments(number, &threads, selected_thread, show_hidden, cx)
+            }
         };
         div()
             .size_full()
@@ -225,7 +274,7 @@ impl MainPaneView {
     }
 
     fn pr_conversation(
-        &self,
+        &mut self,
         detail: &PullRequestDetail,
         selected_entry: Option<usize>,
         cx: &mut gpui::Context<Self>,
@@ -255,10 +304,16 @@ impl MainPaneView {
                 .child("No description")
                 .into_any_element()
         } else {
-            self.pr_markdown(&detail.body, cx)
+            self.pr_markdown(detail.number, PrMarkdownKey::Body, &detail.body, cx)
         });
         for (ix, entry) in detail.conversation.iter().enumerate() {
-            body = body.child(self.pr_conversation_entry(ix, entry, selected_entry, cx));
+            body = body.child(self.pr_conversation_entry(
+                detail.number,
+                ix,
+                entry,
+                selected_entry,
+                cx,
+            ));
         }
         let checks = detail.checks;
         body.child(
@@ -280,7 +335,8 @@ impl MainPaneView {
     }
 
     fn pr_conversation_entry(
-        &self,
+        &mut self,
+        number: u64,
         ix: usize,
         entry: &ConversationEntry,
         selected: Option<usize>,
@@ -288,10 +344,11 @@ impl MainPaneView {
     ) -> AnyElement {
         let theme = self.theme;
         let glyph = match entry.verb {
-            "approved" => "✓",
-            "requested changes" => "!",
-            "commented" => "●",
-            _ => "◌",
+            "approved" => PrReviewerStatus::Approved.glyph(),
+            "requested changes" => PrReviewerStatus::ChangesRequested.glyph(),
+            "commented" | "reviewed" => PrReviewerStatus::Commented.glyph(),
+            "reviewed (dismissed)" => PrReviewerStatus::Dismissed.glyph(),
+            _ => PrReviewerStatus::Requested.glyph(),
         };
         let mut row = div()
             .id(SharedString::from(format!("pr_conversation_entry_{ix}")))
@@ -313,7 +370,12 @@ impl MainPaneView {
                 entry.at.get(..10).unwrap_or(&entry.at)
             )));
         if !entry.body.is_empty() {
-            row = row.child(self.pr_markdown(&entry.body, cx));
+            row = row.child(self.pr_markdown(
+                number,
+                PrMarkdownKey::Entry(entry.id.clone()),
+                &entry.body,
+                cx,
+            ));
         }
         let root = self.root_view.clone();
         row.cursor_pointer()
@@ -337,7 +399,8 @@ impl MainPaneView {
     }
 
     fn pr_comments(
-        &self,
+        &mut self,
+        number: u64,
         threads: &PrLoad<Arc<Vec<ReviewThread>>>,
         selected: Option<usize>,
         show_hidden: bool,
@@ -430,7 +493,12 @@ impl MainPaneView {
                         .text_size(theme.ui_text(12.0))
                         .child(first.author.clone()),
                 );
-                row = row.child(self.pr_markdown(&first.body, cx));
+                row = row.child(self.pr_markdown(
+                    number,
+                    PrMarkdownKey::Thread(thread.root_id),
+                    &first.body,
+                    cx,
+                ));
             }
             let root = self.root_view.clone();
             body = body.child(row.cursor_pointer().on_activate(
@@ -450,6 +518,21 @@ impl MainPaneView {
                 }),
             ));
         }
+        let available = threads
+            .iter()
+            .filter(|thread| show_hidden || (!thread.is_resolved && !thread.outdated()))
+            .count();
+        if available > shown {
+            body = body.child(
+                div()
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(theme.colors.foreground.secondary)
+                    .child(format!(
+                        "{} more threads not shown (showing first {MAX_PR_VISIBLE_THREADS})",
+                        available - shown
+                    )),
+            );
+        }
         if shown == 0 {
             body = body.child(
                 div()
@@ -465,8 +548,14 @@ impl MainPaneView {
         body.into_any_element()
     }
 
-    fn pr_markdown(&self, source: &str, cx: &mut gpui::Context<Self>) -> AnyElement {
-        let Some(document) = pr_markdown_document(source).map(Arc::new) else {
+    fn pr_markdown(
+        &mut self,
+        number: u64,
+        key: PrMarkdownKey,
+        source: &str,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let Some(document) = self.pr_markdown_cache.document(number, key, source) else {
             return div()
                 .text_size(self.theme.ui_text(12.0))
                 .child(source.to_owned())
@@ -592,6 +681,19 @@ mod tests {
                 })
             }));
         }
+    }
+
+    #[test]
+    fn pr_markdown_cache_reuses_documents_only_for_the_same_pr_item_and_source() {
+        let mut cache = PrMarkdownCache::default();
+        let key = PrMarkdownKey::Entry("comment-1".into());
+        let first = cache.document(7, key.clone(), "# First").unwrap();
+        let again = cache.document(7, key.clone(), "# First").unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        let edited = cache.document(7, key.clone(), "# Edited").unwrap();
+        assert!(!Arc::ptr_eq(&first, &edited));
+        let other_pr = cache.document(8, key, "# Edited").unwrap();
+        assert!(!Arc::ptr_eq(&edited, &other_pr));
     }
 }
 

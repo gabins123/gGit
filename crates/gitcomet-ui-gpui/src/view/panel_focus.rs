@@ -507,7 +507,12 @@ impl GitCometView {
                     ];
                 }
                 FocusPanel::Details if self.pull_request_details_active() => {
-                    return &[("space", "checkout"), ("r", "review"), ("M", "merge")];
+                    return &[
+                        ("enter", "read"),
+                        ("space", "checkout"),
+                        ("r", "review"),
+                        ("M", "merge"),
+                    ];
                 }
                 _ => {}
             }
@@ -537,7 +542,7 @@ impl GitCometView {
         panel.status_hints()
     }
 
-    fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+    pub(super) fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
         if self.active_review().is_some() {
             return match panel {
                 FocusPanel::Sidebar => &[
@@ -639,6 +644,7 @@ impl GitCometView {
                 }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
+                        ("enter", "Read the pull request in the middle panel"),
                         ("space", "Check it out locally"),
                         ("r", "Review"),
                         ("M", "Merge it on GitHub"),
@@ -1264,6 +1270,8 @@ impl GitCometView {
         let in_content = current == Some(FocusPanel::History) && self.pull_request_content_active();
         if shift {
             return match key.to_ascii_lowercase().as_str() {
+                "j" | "k" if in_details => Some(true),
+                "c" | "t" if in_content => Some(true),
                 "v" if in_content => {
                     self.toggle_pull_request_hidden_threads(cx);
                     Some(true)
@@ -1304,6 +1312,8 @@ impl GitCometView {
             _ => 0,
         };
         match (current, key) {
+            (Some(FocusPanel::Details), _) if direction != 0 && in_details => Some(true),
+            (Some(FocusPanel::History), "t" | "g" | "m" | "escape") if in_content => Some(true),
             (Some(FocusPanel::History), _) if direction != 0 && in_content => {
                 self.step_pull_request_content(direction, cx);
                 Some(true)
@@ -1320,8 +1330,12 @@ impl GitCometView {
                 Some(true)
             }
             (Some(FocusPanel::History), "enter") if in_content => {
-                if let Some(thread) = self.selected_pull_request_thread() {
-                    self.start_review_at_thread(&thread, cx);
+                if self.active_pull_requests().is_some_and(|prs| {
+                    prs.content_tab == super::pull_requests::PrContentTab::Comments
+                }) {
+                    if let Some(thread) = self.selected_pull_request_thread() {
+                        self.start_review_at_thread(&thread, cx);
+                    }
                 }
                 Some(true)
             }

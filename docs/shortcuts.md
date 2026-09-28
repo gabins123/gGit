@@ -115,7 +115,7 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Action | Key | Notes |
 | --- | --- | --- |
 | Next / previous pull request | `j` / `k` | Sidebar. Selecting one shows its conversation in the middle panel and its facts in Details. |
-| Read the pull request | `Enter` | Sidebar: focuses the selected pull request in the middle panel. Reading code starts with `r` (review mode). |
+| Read the pull request | `Enter` | Sidebar or Details: focuses the selected pull request in the middle panel. Reading code starts with `r` (review mode). |
 | Next / previous entry or thread | `j` / `k` | Middle panel: moves through conversation entries or visible review threads. |
 | Conversation / Comments | `[` / `]` | Middle panel: switches tabs. Comments counts open threads. |
 | Show resolved and outdated threads | `Shift+V` | Middle panel's Comments tab; these threads are hidden by default. |

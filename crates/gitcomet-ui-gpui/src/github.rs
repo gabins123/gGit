@@ -110,6 +110,16 @@ impl PrReviewerStatus {
             Self::Dismissed => "Dismissed",
         }
     }
+
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Self::Requested => "?",
+            Self::Approved => "✓",
+            Self::ChangesRequested => "!",
+            Self::Commented => "●",
+            Self::Dismissed => "×",
+        }
+    }
 }
 
 /// A requested reviewer or the reviewer's latest submitted verdict.
@@ -263,6 +273,8 @@ pub(crate) struct PullRequestFile {
 #[serde(rename_all = "camelCase")]
 struct RawComment {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     author: Author,
     #[serde(default)]
     body: String,
@@ -276,6 +288,8 @@ struct RawComment {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawReview {
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     author: Author,
     #[serde(default)]
@@ -376,6 +390,7 @@ fn reviewers(requests: Vec<RawReviewRequest>, reviews: Vec<RawLatestReview>) -> 
             .iter_mut()
             .find(|reviewer: &&mut PrReviewer| reviewer.login.eq_ignore_ascii_case(&login))
         {
+            Some(reviewer) if reviewer.status == PrReviewerStatus::Requested => {}
             Some(reviewer) => reviewer.status = status,
             None => result.push(PrReviewer { login, status }),
         }
@@ -393,6 +408,7 @@ fn reviewers(requests: Vec<RawReviewRequest>, reviews: Vec<RawLatestReview>) -> 
 /// untrusted GitHub text rendered only through the safe Markdown preview path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConversationEntry {
+    pub(crate) id: String,
     pub(crate) author: String,
     /// "commented", "approved", "requested changes", …
     pub(crate) verb: &'static str,
@@ -410,6 +426,7 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
         .filter(|comment| !comment.is_minimized)
         .map(|comment| {
             (
+                comment.id,
                 comment.author,
                 "commented",
                 comment.created_at,
@@ -426,6 +443,7 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
             _ => "reviewed",
         };
         Some((
+            review.id,
             review.author,
             verb,
             review.submitted_at.unwrap_or_default(),
@@ -434,7 +452,12 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
     });
     let mut entries: Vec<ConversationEntry> = comments
         .chain(reviews)
-        .map(|(author, verb, at, body)| ConversationEntry {
+        .map(|(id, author, verb, at, body)| ConversationEntry {
+            id: if id.is_empty() {
+                format!("{verb}:{}:{at}", author.login)
+            } else {
+                id
+            },
             author: author.login,
             verb,
             at,
@@ -545,7 +568,12 @@ impl From<RawDetail> for PullRequestDetail {
         Self {
             number: raw.number,
             title: raw.title,
-            body: raw.body,
+            body: raw
+                .body
+                .trim()
+                .chars()
+                .take(MAX_CONVERSATION_BODY_CHARS)
+                .collect(),
             url: raw.url,
             author: raw.author.login,
             head: raw.head_ref_name,
@@ -1205,26 +1233,34 @@ pub(crate) fn list_review_threads(
     ]);
     let pages: Vec<Vec<RawReviewComment>> = parse_json(&run(command, None)?)?;
     let mut threads = review_threads(pages.into_iter().flatten().collect());
-    let statuses = review_thread_statuses(workdir, repo, number)?;
-    apply_review_thread_statuses(&mut threads, &statuses)?;
+    match review_thread_statuses(workdir, repo, number) {
+        Ok(statuses) => {
+            let missing = apply_review_thread_statuses(&mut threads, &statuses);
+            if !missing.is_empty() {
+                eprintln!(
+                    "GitHub returned no status for review threads {missing:?} of {repo}#{number}"
+                );
+            }
+        }
+        Err(err) => eprintln!("Couldn't load review thread statuses for {repo}#{number}: {err}"),
+    }
     Ok(threads)
 }
 
 fn apply_review_thread_statuses(
     threads: &mut [ReviewThread],
     statuses: &std::collections::HashMap<u64, ReviewThreadStatus>,
-) -> Result<(), PrError> {
+) -> Vec<u64> {
+    let mut missing = Vec::new();
     for thread in threads {
         let Some(status) = statuses.get(&thread.root_id) else {
-            return Err(PrError::Failed(format!(
-                "GitHub returned no status for review thread {}",
-                thread.root_id
-            )));
+            missing.push(thread.root_id);
+            continue;
         };
         thread.is_resolved = status.is_resolved;
         thread.is_outdated = status.is_outdated;
     }
-    Ok(())
+    missing
 }
 
 const REVIEW_THREAD_STATUSES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId } } } } } } }";
@@ -2123,7 +2159,7 @@ mod tests {
         };
         let pages = format!("{}\n{}", page(1, true, false), page(2, false, true));
         let statuses = super::parse_review_thread_statuses(pages.as_bytes()).expect("statuses");
-        super::apply_review_thread_statuses(&mut threads, &statuses).expect("matched roots");
+        assert!(super::apply_review_thread_statuses(&mut threads, &statuses).is_empty());
 
         let first = threads.iter().find(|thread| thread.root_id == 1).unwrap();
         assert!(first.is_resolved);
@@ -2133,7 +2169,27 @@ mod tests {
         assert!(!second.is_resolved);
         assert!(second.is_outdated);
         assert!(second.outdated());
-        assert!(super::apply_review_thread_statuses(&mut threads, &Default::default()).is_err());
+        let raw: Vec<super::RawReviewComment> = serde_json::from_str(
+            r#"[{"id": 1, "path": "a.rs", "line": null, "original_line": 12, "body": "old"},
+                {"id": 2, "path": "b.rs", "line": 4, "original_line": 4, "body": "current"}]"#,
+        )
+        .expect("REST comments");
+        let mut partial = super::review_threads(raw);
+        let statuses = std::collections::HashMap::from([(
+            2,
+            super::ReviewThreadStatus {
+                is_resolved: true,
+                is_outdated: true,
+            },
+        )]);
+        assert_eq!(
+            super::apply_review_thread_statuses(&mut partial, &statuses),
+            vec![1]
+        );
+        assert!(!partial[0].is_resolved);
+        assert!(partial[0].outdated());
+        assert!(partial[1].is_resolved);
+        assert!(partial[1].is_outdated);
     }
 
     #[test]
@@ -2254,7 +2310,7 @@ mod tests {
                 .map(|reviewer| (reviewer.login.as_str(), reviewer.status))
                 .collect::<Vec<_>>(),
             [
-                ("Octo", PrReviewerStatus::Approved),
+                ("Octo", PrReviewerStatus::Requested),
                 ("Platform", PrReviewerStatus::Requested),
                 ("zed", PrReviewerStatus::Commented),
             ]

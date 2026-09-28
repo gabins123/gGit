@@ -3704,6 +3704,7 @@ pub(crate) struct MainPaneView {
 
     pub(in crate::view) history_view: Entity<super::HistoryView>,
     pub(in crate::view) pull_request_scroll: ScrollHandle,
+    pub(in crate::view) pr_markdown_cache: super::pull_request::PrMarkdownCache,
     pub(in crate::view) pull_request_scroll_key:
         Option<(u64, crate::view::pull_requests::PrContentTab, Option<usize>)>,
     pub(in crate::view) diff_scroll: UniformListScrollHandle,

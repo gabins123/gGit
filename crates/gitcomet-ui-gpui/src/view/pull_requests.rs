@@ -112,8 +112,11 @@ pub(super) fn visible_pr_thread_indexes(
     // REST threads are already in line order within each file. Stable sorting
     // only by path keeps that order when grouping interleaved test or cache data.
     visible.sort_by(|&a, &b| threads[a].path.cmp(&threads[b].path));
+    visible.truncate(MAX_PR_VISIBLE_THREADS);
     visible
 }
+
+pub(super) const MAX_PR_VISIBLE_THREADS: usize = 200;
 
 /// Pages of files fetched at once: enough to have the list long before
 /// the first file is reviewed, few enough to stay clear of GitHub's limits
@@ -537,6 +540,7 @@ impl GitCometView {
                             _ => false,
                         };
                         entry.detail = PrLoad::Ready(Arc::new(detail));
+                        entry.selected_entry = None;
                         this.load_pull_request_threads(repo_id, number, cx);
                         if !carried {
                             this.list_more_pull_request_files(repo_id, cx);
@@ -583,7 +587,9 @@ impl GitCometView {
         let entry = self.pull_requests.repo_mut(repo_id);
         entry.threads_seq += 1;
         let seq = entry.threads_seq;
-        entry.threads = PrLoad::Loading;
+        if !matches!(&entry.threads, PrLoad::Ready(_)) {
+            entry.threads = PrLoad::Loading;
+        }
         let task = cx.background_spawn(async move {
             github::list_review_threads(&target.workdir, &target.slug, number)
         });
@@ -594,10 +600,20 @@ impl GitCometView {
                 if entry.threads_seq != seq || entry.selected != Some(number) {
                     return;
                 }
-                entry.threads = match result {
-                    Ok(threads) => PrLoad::Ready(Arc::new(threads)),
-                    Err(err) => PrLoad::Failed(err),
-                };
+                match result {
+                    Ok(threads) => {
+                        entry.selected_thread = None;
+                        entry.threads = PrLoad::Ready(Arc::new(threads));
+                    }
+                    Err(err) if matches!(&entry.threads, PrLoad::Ready(_)) => {
+                        this.push_toast(
+                            components::ToastKind::Warning,
+                            format!("Couldn't reload review threads of #{number}: {err}"),
+                            cx,
+                        );
+                    }
+                    Err(err) => entry.threads = PrLoad::Failed(err),
+                }
                 this.notify_pull_request_panes(cx);
             });
         })

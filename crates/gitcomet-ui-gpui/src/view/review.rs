@@ -597,9 +597,8 @@ impl GitCometView {
         }
         if cached_threads.is_some() {
             self.sync_review_marks(cx);
-        } else {
-            self.load_review_threads(cx);
         }
+        self.load_review_threads(cx);
         self.load_last_review(cx);
         self.diff_return_panel = FocusPanel::Sidebar;
         self.focus_diff_when_open = true;
@@ -683,7 +682,10 @@ impl GitCometView {
             pane.review_marks.clear();
             cx.notify();
         });
-        if self.diff_is_open() {
+        if self
+            .active_repo()
+            .is_some_and(|repo| repo.diff_state.diff_target.is_some())
+        {
             self.store.dispatch(Msg::ClearDiffSelection {
                 repo_id: review.repo_id,
             });
@@ -751,7 +753,10 @@ impl GitCometView {
             cx.notify();
         });
         if self.active_repo_id() == Some(repo_id) {
-            if self.diff_is_open() {
+            if self
+                .active_repo()
+                .is_some_and(|repo| repo.diff_state.diff_target.is_some())
+            {
                 self.store.dispatch(Msg::ClearDiffSelection { repo_id });
             }
             let window_handle = self.window_handle;

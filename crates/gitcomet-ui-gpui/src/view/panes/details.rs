@@ -2934,11 +2934,23 @@ impl DetailsPaneView {
                 "{} wants to merge {} into {}",
                 detail.author, detail.head, detail.base
             )))
-            .child(line(checks_line))
-            .child(line(format!(
-                "{} files · +{} −{}",
-                detail.changed_files, detail.additions, detail.deletions
-            )));
+            .child(line(checks_line));
+        for run in detail
+            .check_runs
+            .iter()
+            .filter(|run| run.state != crate::github::CheckState::Passing)
+        {
+            let status = match run.state {
+                crate::github::CheckState::Failing => "Failing",
+                crate::github::CheckState::Pending => "Pending",
+                crate::github::CheckState::Passing => unreachable!(),
+            };
+            panel = panel.child(line(format!("  {status}: {}", run.name)));
+        }
+        panel = panel.child(line(format!(
+            "{} files · +{} −{}",
+            detail.changed_files, detail.additions, detail.deletions
+        )));
         if detail.too_large_for_app() {
             panel = panel.child(line(format!(
                 "GitHub lists only the first {} of its {} files; o opens it there.",
@@ -2968,25 +2980,25 @@ impl DetailsPaneView {
             panel = panel.child(line("No reviewers yet".to_owned()));
         } else {
             for reviewer in &detail.reviewers {
-                let (glyph, color) = match reviewer.status {
+                let color = match reviewer.status {
                     crate::github::PrReviewerStatus::Requested => {
-                        ("◌", theme.colors.status.warning.foreground)
+                        theme.colors.status.warning.foreground
                     }
                     crate::github::PrReviewerStatus::Approved => {
-                        ("✓", theme.colors.status.success.foreground)
+                        theme.colors.status.success.foreground
                     }
                     crate::github::PrReviewerStatus::ChangesRequested => {
-                        ("!", theme.colors.status.danger.foreground)
+                        theme.colors.status.danger.foreground
                     }
-                    crate::github::PrReviewerStatus::Commented => ("●", secondary),
-                    crate::github::PrReviewerStatus::Dismissed => ("×", secondary),
+                    crate::github::PrReviewerStatus::Commented
+                    | crate::github::PrReviewerStatus::Dismissed => secondary,
                 };
                 panel = panel.child(
                     div()
                         .flex()
                         .gap_2()
                         .text_size(theme.ui_text(12.0))
-                        .child(div().text_color(color).child(glyph))
+                        .child(div().text_color(color).child(reviewer.status.glyph()))
                         .child(format!("{} · {}", reviewer.login, reviewer.status.label())),
                 );
             }
