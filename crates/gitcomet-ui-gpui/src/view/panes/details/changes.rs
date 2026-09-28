@@ -1013,7 +1013,7 @@ impl DetailsPaneView {
                         format!("Changes · {}", counts[0])
                     }),
             )
-            .child(svg_icon("icons/chevron_down.svg", icon_muted, px(12.0)))
+            .child(svg_icon("icons/chevron_down.svg", icon_muted, ui_scale.px(12.0)))
             .on_activate(
                 false,
                 controls::ControlActivation::Action,
@@ -1057,7 +1057,7 @@ impl DetailsPaneView {
                 header.child(svg_spinner(
                     ("changes_busy", repo_id.0),
                     icon_muted,
-                    px(14.0),
+                    ui_scale.px(14.0),
                 ))
             })
             .child(self.file_list_controls(FileListId::Changes, repo_id, "changes", false, cx))

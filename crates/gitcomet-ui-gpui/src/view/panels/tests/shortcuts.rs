@@ -1639,7 +1639,7 @@ fn file_and_diff_context_menu_shortcuts_match_expected_actions(cx: &mut gpui::Te
             },
         )
     });
-    assert_declared_shortcuts(&commit_model, &["T", "D", "P", "R", "B", "I", "M"]);
+    assert_declared_shortcuts(&commit_model, &["C", "T", "D", "P", "R", "B", "I", "M"]);
     assert_shortcut_action!(
         commit_model,
         "Enter",
@@ -1650,6 +1650,11 @@ fn file_and_diff_context_menu_shortcuts_match_expected_actions(cx: &mut gpui::Te
                 path: None
             }
         } if *rid == repo_id && cid == &commit_id
+    );
+    assert_shortcut_action!(
+        commit_model,
+        "C",
+        ContextMenuAction::CopyText { text } if text == commit_id.as_ref()
     );
     assert_shortcut_action!(
         commit_model,
@@ -3746,6 +3751,318 @@ fn diff_search_overlay_does_not_reflow_action_bar_or_content(cx: &mut gpui::Test
     );
 }
 
+/// Opens diff search (`secondary-f`) over a two-hunk working tree diff.
+fn open_diff_search_on_two_hunk_diff(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<super::super::GitCometView>,
+    repo_id: RepoId,
+    name: &str,
+) {
+    let commit_id = CommitId("1122334455667748".into());
+    let workdir =
+        std::env::temp_dir().join(format!("gitcomet_ui_test_{}_{name}", std::process::id()));
+    let path = std::path::PathBuf::from("src/lib.rs");
+
+    let mut repo = simple_worktree_repo(
+        repo_id,
+        &workdir,
+        &commit_id,
+        std::slice::from_ref(&path),
+        &path,
+    );
+    repo.diff_state.diff = Loadable::Ready(
+        two_hunk_diff(DiffTarget::WorkingTree {
+            path: path.clone(),
+            area: DiffArea::Unstaged,
+        })
+        .into(),
+    );
+    apply_state(cx, view, app_state_with_active_repo(repo));
+    cx.simulate_resize(gpui::size(px(1000.0), px(640.0)));
+
+    cx.update(|window, app| {
+        app.clear_key_bindings();
+        crate::app::bind_app_keys_for_test(app);
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                pane.rebuild_diff_cache(cx);
+                pane.ensure_diff_visible_indices();
+                let focus = pane.diff_panel_focus_handle.clone();
+                window.focus(&focus, cx);
+                cx.notify();
+            });
+        });
+        let _ = window.draw(app);
+    });
+    draw_and_drain_test_window(cx);
+
+    cx.simulate_keystrokes("secondary-f");
+    draw_and_drain_test_window(cx);
+    assert!(
+        cx.debug_bounds("diff_search_overlay").is_some(),
+        "expected diff search overlay after secondary-f"
+    );
+}
+
+fn set_diff_search_text(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<super::super::GitCometView>,
+    text: &'static str,
+) {
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                pane.diff_search_input
+                    .update(cx, |input, cx| input.set_text(text, cx));
+                cx.notify();
+            });
+        });
+        let _ = window.draw(app);
+    });
+    draw_and_drain_test_window(cx);
+    wait_for_diff_search_debounce(cx);
+}
+
+fn diff_search_match_state(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<super::super::GitCometView>,
+) -> (usize, Option<usize>) {
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        (pane.diff_search_matches.len(), pane.diff_search_match_ix)
+    })
+}
+
+#[gpui::test]
+fn diff_search_arrow_buttons_step_through_matches(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    open_diff_search_on_two_hunk_diff(cx, &view, RepoId(70941), "diff_search_arrow_buttons");
+
+    let prev = cx
+        .debug_bounds("diff_search_prev")
+        .expect("expected a previous-match button in diff search");
+    let next = cx
+        .debug_bounds("diff_search_next")
+        .expect("expected a next-match button in diff search");
+    let label = cx
+        .debug_bounds("diff_search_match_label")
+        .expect("expected the diff search match label");
+    let close = cx
+        .debug_bounds("diff_search_close")
+        .expect("expected the diff search close button");
+    assert!(
+        label.right() <= prev.left() && prev.right() <= next.left() && next.right() <= close.left(),
+        "expected the arrow buttons between the match label and the close button"
+    );
+
+    set_diff_search_text(cx, &view, "new");
+    let (total, first_ix) = diff_search_match_state(cx, &view);
+    assert_eq!(total, 2, "expected the query to match both hunks");
+    let first_ix = first_ix.unwrap_or(0);
+
+    let next = cx.debug_bounds("diff_search_next").expect("next button");
+    cx.simulate_click(next.center(), Modifiers::default());
+    draw_and_drain_test_window(cx);
+    assert_eq!(
+        diff_search_match_state(cx, &view),
+        (2, Some((first_ix + 1) % 2)),
+        "expected the down arrow to step to the next match"
+    );
+    assert!(
+        diff_search_input_is_focused(cx, &view),
+        "expected the search input to keep focus after stepping"
+    );
+
+    let next = cx.debug_bounds("diff_search_next").expect("next button");
+    cx.simulate_click(next.center(), Modifiers::default());
+    draw_and_drain_test_window(cx);
+    assert_eq!(
+        diff_search_match_state(cx, &view),
+        (2, Some(first_ix)),
+        "expected the down arrow to wrap to the first match"
+    );
+
+    let prev = cx.debug_bounds("diff_search_prev").expect("prev button");
+    cx.simulate_click(prev.center(), Modifiers::default());
+    draw_and_drain_test_window(cx);
+    assert_eq!(
+        diff_search_match_state(cx, &view),
+        (2, Some((first_ix + 1) % 2)),
+        "expected the up arrow to wrap to the last match"
+    );
+}
+
+#[gpui::test]
+fn diff_search_arrow_buttons_are_disabled_without_matches(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    open_diff_search_on_two_hunk_diff(cx, &view, RepoId(70942), "diff_search_arrow_disabled");
+
+    set_diff_search_text(cx, &view, "new");
+    let found = cx.update(|_window, app| {
+        view.read(app)
+            .main_pane
+            .read(app)
+            .diff_search_matches
+            .clone()
+    });
+    assert_eq!(found.len(), 2, "expected the query to match both hunks");
+
+    set_diff_search_text(cx, &view, "absent_from_the_diff");
+    assert_eq!(diff_search_match_state(cx, &view), (0, None));
+
+    for selector in ["diff_search_next", "diff_search_prev"] {
+        // Draw the arrows for "no matches", then hand the pane matches without
+        // re-rendering: a click on the arrows on screen must not reach it.
+        cx.update(|window, app| {
+            view.update(app, |this, cx| {
+                this.main_pane.update(cx, |pane, cx| {
+                    pane.diff_search_matches.clear();
+                    pane.diff_search_match_ix = None;
+                    cx.notify();
+                });
+            });
+            let _ = window.draw(app);
+        });
+        draw_and_drain_test_window(cx);
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("expected {selector} while search is open"));
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.main_pane.update(cx, |pane, _cx| {
+                    pane.diff_search_matches = found.clone();
+                });
+            });
+        });
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        assert_eq!(
+            diff_search_match_state(cx, &view),
+            (2, None),
+            "expected {selector} to be disabled when there are no matches"
+        );
+    }
+}
+
+#[gpui::test]
+fn diff_search_shift_enter_inserts_a_newline(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    open_diff_search_on_two_hunk_diff(cx, &view, RepoId(70943), "diff_search_shift_enter");
+    assert!(diff_search_input_is_focused(cx, &view));
+
+    cx.simulate_input("new");
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("x");
+    draw_and_drain_test_window(cx);
+
+    let text = cx.update(|_window, app| {
+        view.read(app)
+            .main_pane
+            .read(app)
+            .diff_search_input
+            .read(app)
+            .text()
+            .to_string()
+    });
+    assert_eq!(text, "new\nx", "expected Shift+Enter to insert a newline");
+    assert!(
+        cx.debug_bounds("diff_search_overlay").is_some(),
+        "expected diff search to stay open"
+    );
+}
+
+/// Icons are sized in design px, which only zoom through the UI scale; a bare
+/// `px()` holds them at 100% while the buttons around them grow.
+#[gpui::test]
+fn diff_toolbar_and_commit_box_icons_follow_ui_scale(cx: &mut gpui::TestAppContext) {
+    let _guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(70547);
+    let commit_id = CommitId("1122334455667747".into());
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_icons_follow_ui_scale",
+        std::process::id()
+    ));
+    let path = std::path::PathBuf::from("src/lib.rs");
+    let mut repo = simple_worktree_repo(
+        repo_id,
+        &workdir,
+        &commit_id,
+        std::slice::from_ref(&path),
+        &path,
+    );
+    repo.diff_state.diff = Loadable::Ready(
+        two_hunk_diff(DiffTarget::WorkingTree {
+            path: path.clone(),
+            area: DiffArea::Unstaged,
+        })
+        .into(),
+    );
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    // Wide and tall enough that nothing collapses into an overflow at 200%.
+    cx.simulate_resize(gpui::size(px(2400.0), px(1400.0)));
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                pane.rebuild_diff_cache(cx);
+                pane.ensure_diff_visible_indices();
+                cx.notify();
+            });
+        });
+        let _ = window.draw(app);
+    });
+    draw_and_drain_test_window(cx);
+
+    const ICONS: [&str; 8] = [
+        "diff_prev_hunk_icon",
+        "diff_next_hunk_icon",
+        "diff_action_menu_icon",
+        "diff_close_icon",
+        "commit_button_icon",
+        "commit_options_icon",
+        "previous_commit_messages_icon",
+        "change_tracking_unstaged_header_chevron",
+    ];
+    let sizes = |cx: &mut gpui::VisualTestContext| {
+        ICONS.map(|selector| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("expected {selector} to render"))
+                .size
+        })
+    };
+    let normal = sizes(cx);
+
+    set_ui_scale_percent_for_test(cx, &view, 200);
+    draw_and_drain_test_window(cx);
+    let zoomed = sizes(cx);
+
+    let unscaled: Vec<String> = ICONS
+        .into_iter()
+        .enumerate()
+        .filter(|(ix, _)| {
+            (zoomed[*ix].width, zoomed[*ix].height)
+                != (normal[*ix].width * 2.0, normal[*ix].height * 2.0)
+        })
+        .map(|(ix, selector)| format!("{selector}: {:?} -> {:?}", normal[ix], zoomed[ix]))
+        .collect();
+    assert!(
+        unscaled.is_empty(),
+        "icons must double at 200% UI scale: {unscaled:#?}"
+    );
+}
+
 #[gpui::test]
 fn reveal_whitespace_toggle_invalidates_wrapped_diff_rows(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
@@ -5699,7 +6016,7 @@ fn space_stages_a_resolved_conflict_without_asking(cx: &mut gpui::TestAppContext
 }
 
 #[gpui::test]
-fn space_stages_every_ctrl_selected_file(cx: &mut gpui::TestAppContext) {
+fn space_keeps_the_diff_when_the_selected_files_cannot_be_staged(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
@@ -5758,18 +6075,22 @@ fn space_stages_every_ctrl_selected_file(cx: &mut gpui::TestAppContext) {
         "staging the selection must consume it"
     );
 
-    // The single-file path would advance the diff to the next unstaged file;
-    // acting on the whole selection clears it instead.
-    wait_until(cx, "the diff selection to be cleared", |cx| {
+    // This fixture has no repository handle, so staging fails. Consuming the
+    // selection must not close the diff or advance it to another file.
+    wait_until(cx, "the staging failure", |cx| {
         cx.update(|_window, app| {
             let snapshot = view.read(app).store.snapshot();
             snapshot
                 .repos
                 .iter()
                 .find(|repo| repo.id == repo_id)
-                .is_some_and(|repo| repo.diff_state.diff_target.is_none())
+                .is_some_and(|repo| {
+                    repo.local_actions_in_flight == 0 && repo.feedback.last_error.is_some()
+                })
         })
     });
+    sync_store_snapshot(cx, &view);
+    assert_eq!(active_worktree_diff_target_path(cx, &view), Some(first));
 }
 
 /// Ctrl+S must resolve the multi-file selection before confirming, the way

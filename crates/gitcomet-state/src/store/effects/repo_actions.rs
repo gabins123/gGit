@@ -808,7 +808,8 @@ pub(super) fn schedule_stage_path(
     path: PathBuf,
 ) {
     let context = path_context(&path);
-    schedule_repo_action(
+    let completed_paths = vec![path.clone()].into();
+    schedule_repo_action_with_hook(
         executor,
         repos,
         msg_tx,
@@ -818,6 +819,13 @@ pub(super) fn schedule_stage_path(
         move |repo| {
             let path_ref: &Path = &path;
             repo.stage(&[path_ref])
+        },
+        |_msg_tx, _repo_id, _result| {},
+        move |repo_id, result| InternalMsg::RepoPathsActionFinished {
+            repo_id,
+            action: RepoActionKind::StagePath,
+            paths: completed_paths,
+            result,
         },
     );
 }
@@ -830,7 +838,8 @@ pub(super) fn schedule_stage_paths(
     paths: RepoPathList,
 ) {
     let context = paths_context(paths.as_slice(), "files");
-    schedule_repo_action(
+    let completed_paths = paths.clone();
+    schedule_repo_action_with_hook(
         executor,
         repos,
         msg_tx,
@@ -841,6 +850,13 @@ pub(super) fn schedule_stage_paths(
             let unique = dedup_paths(paths.as_slice().to_vec());
             let refs = unique.iter().map(|p| p.as_path()).collect::<Vec<_>>();
             repo.stage(&refs)
+        },
+        |_msg_tx, _repo_id, _result| {},
+        move |repo_id, result| InternalMsg::RepoPathsActionFinished {
+            repo_id,
+            action: RepoActionKind::StagePaths,
+            paths: completed_paths,
+            result,
         },
     );
 }
@@ -853,7 +869,8 @@ pub(super) fn schedule_unstage_path(
     path: PathBuf,
 ) {
     let context = path_context(&path);
-    schedule_repo_action(
+    let completed_paths = vec![path.clone()].into();
+    schedule_repo_action_with_hook(
         executor,
         repos,
         msg_tx,
@@ -863,6 +880,13 @@ pub(super) fn schedule_unstage_path(
         move |repo| {
             let path_ref: &Path = &path;
             repo.unstage(&[path_ref])
+        },
+        |_msg_tx, _repo_id, _result| {},
+        move |repo_id, result| InternalMsg::RepoPathsActionFinished {
+            repo_id,
+            action: RepoActionKind::UnstagePath,
+            paths: completed_paths,
+            result,
         },
     );
 }
@@ -875,7 +899,8 @@ pub(super) fn schedule_unstage_paths(
     paths: RepoPathList,
 ) {
     let context = paths_context(paths.as_slice(), "files");
-    schedule_repo_action(
+    let completed_paths = paths.clone();
+    schedule_repo_action_with_hook(
         executor,
         repos,
         msg_tx,
@@ -886,6 +911,13 @@ pub(super) fn schedule_unstage_paths(
             let unique = dedup_paths(paths.as_slice().to_vec());
             let refs = unique.iter().map(|p| p.as_path()).collect::<Vec<_>>();
             repo.unstage(&refs)
+        },
+        |_msg_tx, _repo_id, _result| {},
+        move |repo_id, result| InternalMsg::RepoPathsActionFinished {
+            repo_id,
+            action: RepoActionKind::UnstagePaths,
+            paths: completed_paths,
+            result,
         },
     );
 }
@@ -898,7 +930,8 @@ pub(super) fn schedule_discard_worktree_changes_path(
     path: PathBuf,
 ) {
     let context = path_context(&path);
-    schedule_repo_action(
+    let completed_paths = vec![path.clone()].into();
+    schedule_repo_action_with_hook(
         executor,
         repos,
         msg_tx,
@@ -908,6 +941,13 @@ pub(super) fn schedule_discard_worktree_changes_path(
         move |repo| {
             let path_ref: &Path = &path;
             repo.discard_worktree_changes(&[path_ref])
+        },
+        |_msg_tx, _repo_id, _result| {},
+        move |repo_id, result| InternalMsg::RepoPathsActionFinished {
+            repo_id,
+            action: RepoActionKind::DiscardWorktreeChangesPath,
+            paths: completed_paths,
+            result,
         },
     );
 }
@@ -920,7 +960,8 @@ pub(super) fn schedule_discard_worktree_changes_paths(
     paths: Vec<PathBuf>,
 ) {
     let context = paths_context(&paths, "files");
-    schedule_repo_action(
+    let completed_paths = paths.clone().into();
+    schedule_repo_action_with_hook(
         executor,
         repos,
         msg_tx,
@@ -931,6 +972,13 @@ pub(super) fn schedule_discard_worktree_changes_paths(
             let unique = dedup_paths(paths);
             let refs = unique.iter().map(|p| p.as_path()).collect::<Vec<_>>();
             repo.discard_worktree_changes(&refs)
+        },
+        |_msg_tx, _repo_id, _result| {},
+        move |repo_id, result| InternalMsg::RepoPathsActionFinished {
+            repo_id,
+            action: RepoActionKind::DiscardWorktreeChangesPaths,
+            paths: completed_paths,
+            result,
         },
     );
 }

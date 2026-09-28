@@ -3560,7 +3560,7 @@ impl SidebarPaneView {
                                     check.bg(success).child(crate::view::icons::svg_icon(
                                         "icons/check.svg",
                                         theme.colors.surface.chrome,
-                                        px(10.0),
+                                        scale.px(10.0),
                                     ))
                                 }),
                         )
@@ -3638,7 +3638,7 @@ impl SidebarPaneView {
                                     .child(crate::view::icons::svg_icon(
                                         "icons/pencil.svg",
                                         warning,
-                                        px(11.0),
+                                        scale.px(11.0),
                                     ))
                                     .child(comments.to_string()),
                             )
@@ -4138,7 +4138,7 @@ fn unsaved_file_row(
     } = ctx;
     let ui_scale_percent = crate::ui_scale::current(cx).percent;
     let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
-    let icon_px = crate::ui_scale::design_px_from_percent(12.0, 100);
+    let icon_px = scaled_px(12.0);
     // The full repo-relative path, not just the file name: two `mod.rs` under
     // different folders are indistinguishable here, and this row is the only
     // place they appear side by side.

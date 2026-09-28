@@ -95,6 +95,23 @@ impl MainPaneView {
         }
     }
 
+    /// Every preview load has a new rev, so the parse under `key` supersedes the
+    /// file's older ones: drop them rather than let them fill the map, whose
+    /// eviction picks an arbitrary, possibly live, entry.
+    fn insert_worktree_preview_syntax_document(
+        &mut self,
+        key: PreparedSyntaxDocumentKey,
+        document: rows::PreparedDiffSyntaxDocument,
+    ) -> bool {
+        self.prepared_syntax_documents.retain(|cached, _| {
+            cached.view_mode != PreparedSyntaxViewMode::WorktreePreview
+                || cached.repo_id != key.repo_id
+                || cached.file_path != key.file_path
+                || cached.target_rev == key.target_rev
+        });
+        self.insert_prepared_syntax_document(key, document)
+    }
+
     pub(in crate::view) fn full_document_syntax_budget(&self) -> rows::DiffSyntaxBudget {
         #[cfg(test)]
         if let Some(budget) = self.diff_syntax_budget_override {
@@ -728,18 +745,18 @@ impl MainPaneView {
             return;
         }
 
-        let cache_matches = self.worktree_markdown_preview_path.as_ref() == Some(&path)
-            && self.worktree_markdown_preview_source_rev == source_rev;
+        let cache_matches = self.worktree_markdown.path.as_ref() == Some(&path)
+            && self.worktree_markdown.source_rev == source_rev;
         if cache_matches {
-            match &self.worktree_markdown_preview {
+            match &self.worktree_markdown.document {
                 Loadable::Ready(_) | Loadable::Error(_) => return,
-                Loadable::Loading if self.worktree_markdown_preview_inflight.is_some() => return,
+                Loadable::Loading if self.worktree_markdown.inflight.is_some() => return,
                 _ => {}
             }
         }
 
-        self.worktree_markdown_preview_path = Some(path.clone());
-        self.worktree_markdown_preview_source_rev = source_rev;
+        self.worktree_markdown.path = Some(path.clone());
+        self.worktree_markdown.source_rev = source_rev;
 
         let source_len = if self.worktree_preview_text.is_empty() {
             self.worktree_preview_source_len
@@ -747,21 +764,21 @@ impl MainPaneView {
             self.worktree_preview_text.len()
         };
         if source_len > markdown_preview::MAX_PREVIEW_SOURCE_BYTES {
-            self.worktree_markdown_preview = Loadable::Error(
+            self.worktree_markdown.document = Loadable::Error(
                 markdown_preview::single_preview_unavailable_reason(source_len).to_string(),
             );
-            self.worktree_markdown_preview_inflight = None;
+            self.worktree_markdown.inflight = None;
             return;
         }
 
-        self.worktree_markdown_preview = Loadable::Loading;
-        self.worktree_markdown_preview_seq = self.worktree_markdown_preview_seq.wrapping_add(1);
-        let seq = self.worktree_markdown_preview_seq;
-        self.worktree_markdown_preview_inflight = Some(seq);
+        self.worktree_markdown.document = Loadable::Loading;
+        self.worktree_markdown.seq = self.worktree_markdown.seq.wrapping_add(1);
+        let seq = self.worktree_markdown.seq;
+        self.worktree_markdown.inflight = Some(seq);
         let source_text =
             (!self.worktree_preview_text.is_empty()).then_some(self.worktree_preview_text.clone());
         let source_path = self.worktree_preview_source_path.clone();
-        let image_base_dir = self.markdown_preview_image_base_dir();
+        let image_root = self.markdown_preview_image_root();
 
         cx.spawn(
             async move |view: WeakEntity<MainPaneView>, cx: &mut gpui::AsyncApp| {
@@ -796,7 +813,7 @@ impl MainPaneView {
                         // files, and this is already the thread that does that.
                         let picture_sizes = measure_markdown_preview_pictures(
                             document.as_ref(),
-                            image_base_dir.as_deref(),
+                            image_root.as_ref(),
                         );
                         Ok((document, picture_sizes))
                     };
@@ -807,7 +824,7 @@ impl MainPaneView {
                 };
 
                 let _ = view.update(cx, |this, cx| {
-                    if this.worktree_markdown_preview_inflight != Some(seq) {
+                    if this.worktree_markdown.inflight != Some(seq) {
                         return;
                     }
                     if this.worktree_preview_path.as_ref() != Some(&path)
@@ -816,14 +833,14 @@ impl MainPaneView {
                         return;
                     }
 
-                    this.worktree_markdown_preview_inflight = None;
+                    this.worktree_markdown.inflight = None;
                     match result {
                         Ok((document, picture_sizes)) => {
-                            this.worktree_markdown_preview_picture_sizes = picture_sizes;
+                            this.worktree_markdown.picture_sizes = picture_sizes;
                             // The blocks these positions belonged to are gone
                             // with the document that described them.
-                            this.worktree_markdown_preview_block_scrolls.clear();
-                            this.worktree_markdown_preview = Loadable::Ready(document);
+                            this.worktree_markdown.block_scrolls.clear();
+                            this.worktree_markdown.document = Loadable::Ready(document);
                             // An open search scanned nothing while this was
                             // parsing, so without a rescan it would keep
                             // reporting "no matches" over a document that
@@ -833,20 +850,17 @@ impl MainPaneView {
                         Err(refusal) => {
                             // The document these described is gone too, so they
                             // are cleared here for the same reason as above.
-                            this.worktree_markdown_preview_picture_sizes = Default::default();
-                            this.worktree_markdown_preview_block_scrolls.clear();
+                            this.worktree_markdown.picture_sizes = Default::default();
+                            this.worktree_markdown.block_scrolls.clear();
                             let prefers_source = refusal.prefers_source();
-                            this.worktree_markdown_preview =
+                            this.worktree_markdown.document =
                                 Loadable::Error(refusal.into_message());
                             // A document that parsed but is too big to lay out
                             // still reads fine as source, so the reader is
                             // taken there rather than left on an empty pane
                             // with a message and a toggle to find.
                             if prefers_source {
-                                this.rendered_preview_modes.set(
-                                    RenderedPreviewKind::Markdown,
-                                    RenderedPreviewMode::Source,
-                                );
+                                this.rendered_preview_modes.fall_back_to_markdown_source();
                             }
                         }
                     }
@@ -899,10 +913,7 @@ impl MainPaneView {
             self.worktree_preview_style_cache_epoch =
                 self.worktree_preview_style_cache_epoch.wrapping_add(1);
             self.clear_diff_text_projected_highlights();
-            self.worktree_markdown_preview_path = None;
-            self.worktree_markdown_preview_source_rev = 0;
-            self.worktree_markdown_preview = Loadable::NotLoaded;
-            self.worktree_markdown_preview_inflight = None;
+            self.worktree_markdown.invalidate();
         }
 
         if same_path_source_refresh {
@@ -1040,7 +1051,7 @@ impl MainPaneView {
             None,
         ) {
             rows::PrepareDiffSyntaxDocumentResult::Ready(document) => {
-                if self.insert_prepared_syntax_document(key, document) {
+                if self.insert_worktree_preview_syntax_document(key, document) {
                     // A click made before this landed is waiting on exactly this
                     // document -- the same replay the file-diff paths run.
                     self.retry_pending_diff_text_syntax_click();
@@ -1070,17 +1081,21 @@ impl MainPaneView {
                             let Some(parsed_document) = parsed_document else {
                                 return;
                             };
-
-                            let inserted = this.insert_prepared_syntax_document(
-                                key.clone(),
-                                rows::inject_background_prepared_diff_syntax_document(
-                                    parsed_document,
-                                ),
+                            // Cached by content whatever happens next, so coming
+                            // back to the same text reuses it instead of reparsing.
+                            let document = rows::inject_background_prepared_diff_syntax_document(
+                                parsed_document,
                             );
-                            if inserted
-                                && this.worktree_preview_prepared_syntax_key().as_ref()
-                                    == Some(&key)
+                            // Only the preview still showing the parsed text may
+                            // take it; after another file or mid-reload it is stale.
+                            if !matches!(this.worktree_preview, Loadable::Ready(_))
+                                || this.worktree_preview_prepared_syntax_key().as_ref()
+                                    != Some(&key)
                             {
+                                return;
+                            }
+
+                            if this.insert_worktree_preview_syntax_document(key, document) {
                                 this.worktree_preview_style_cache_epoch =
                                     this.worktree_preview_style_cache_epoch.wrapping_add(1);
                                 this.retry_pending_diff_text_syntax_click();
