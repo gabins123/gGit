@@ -1162,9 +1162,15 @@ pub struct GitCometView {
     /// `.reviewer/` configs, one per PR base commit; see `reviewer_menu.rs`.
     pub(super) reviewer_cache: super::reviewer_menu::ReviewerCache,
     /// Set by the reviewer menu's `q` (Ask) when the question box was empty:
-    /// the scope to run it at once a question is typed and `Enter` pressed,
-    /// so that `Enter` routes to the reviewer Ask instead of the plain one.
-    pub(super) pending_reviewer_ask: Option<super::reviewer_menu::ReviewScope>,
+    /// the pull request and scope to run it at once a question is typed and
+    /// `Enter` pressed, so that `Enter` routes to the reviewer Ask instead of
+    /// the plain one. Keyed by repo and PR number (not just the scope) so a
+    /// stale ask from a PR that's no longer on screen is never run against
+    /// whatever is selected now; cleared as soon as any of that changes
+    /// (`reviewer_menu.rs`'s `clear_pending_reviewer_ask_if_stale`, called
+    /// from `state_apply.rs`), when a plain Ask starts, or when the ask box
+    /// loses focus — Enter still double-checks the match before using it.
+    pub(super) pending_reviewer_ask: Option<(RepoId, u64, super::reviewer_menu::ReviewScope)>,
     /// The panel `esc` returns to from the Codex panel.
     pub(super) codex_return_panel: super::panel_focus::FocusPanel,
     /// The panel that last held focus, where focus returns when the element

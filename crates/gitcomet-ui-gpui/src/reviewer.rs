@@ -79,10 +79,14 @@ impl ReviewerConfig {
             && self.agents.is_empty()
     }
 
-    /// The `.reviewer` files whose content applies to `paths` (an empty
-    /// slice means "the whole PR": every area applies). Areas are filtered
-    /// by their `paths` globs; README and the checklist always apply. What
-    /// the menu's chips list and what `instructions_text` actually sends.
+    /// The `.reviewer` files whose content applies to `paths` — the scope's
+    /// actual touched files (the whole PR's changed-file list for "Whole
+    /// PR", not an empty placeholder for it). An empty `paths` means no
+    /// files are in scope, so no area applies, never "every area applies":
+    /// callers that mean "the whole PR" pass its real file list. Areas are
+    /// filtered by their `paths` globs; README and the checklist always
+    /// apply. What the menu's chips list and what `instructions_text`
+    /// actually sends.
     pub(crate) fn files_for(&self, paths: &[String]) -> Vec<&str> {
         let mut names = Vec::new();
         if self.readme.is_some() {
@@ -92,7 +96,7 @@ impl ReviewerConfig {
             names.push("checklist.md");
         }
         for area in &self.areas {
-            if paths.is_empty() || paths.iter().any(|path| area_matches(&area.paths, path)) {
+            if paths.iter().any(|path| area_matches(&area.paths, path)) {
                 names.push(area.name.as_str());
             }
         }
@@ -100,8 +104,9 @@ impl ReviewerConfig {
     }
 
     /// The trusted instructions text built from README, checklist and the
-    /// areas that apply to `paths`. Agent bodies are added by the caller
-    /// (only one agent ever runs per request).
+    /// areas that apply to `paths` (see [`Self::files_for`] on what an empty
+    /// `paths` means). Agent bodies are added by the caller (only one agent
+    /// ever runs per request).
     pub(crate) fn instructions_text(&self, paths: &[String]) -> String {
         let mut parts = Vec::new();
         if let Some(readme) = &self.readme {
@@ -120,7 +125,7 @@ impl ReviewerConfig {
             ));
         }
         for area in &self.areas {
-            if paths.is_empty() || paths.iter().any(|path| area_matches(&area.paths, path)) {
+            if paths.iter().any(|path| area_matches(&area.paths, path)) {
                 parts.push(format!("From .reviewer/{}:\n{}", area.name, area.body));
             }
         }
@@ -778,8 +783,13 @@ mod tests {
             vec!["areas/rust.md"]
         );
         assert!(config.files_for(&["docs/readme.md".to_string()]).is_empty());
-        // Whole-PR scope (no path filter) includes every area.
-        assert_eq!(config.files_for(&[]), vec!["areas/rust.md"]);
+        // Whole PR passes its real changed-file list, never an empty
+        // placeholder; an actually empty scope means no area applies.
+        assert_eq!(
+            config.files_for(&["crates/foo/src/lib.rs".to_string(), "docs/readme.md".to_string()]),
+            vec!["areas/rust.md"]
+        );
+        assert!(config.files_for(&[]).is_empty());
     }
 
     #[test]

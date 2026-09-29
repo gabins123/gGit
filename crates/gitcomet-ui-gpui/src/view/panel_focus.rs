@@ -456,16 +456,19 @@ impl GitCometView {
             return &[
                 ("j/k", "line"),
                 ("shift+j/k", "select"),
-                ("c", "comment"),
-                ("a/x", "suggestion"),
                 ("}/{", "change"),
                 ("]/[", "file"),
                 ("space", "viewed"),
+                ("/", "filter"),
+                ("V", "show viewed"),
                 ("G", "show generated"),
                 ("alt+p", "preview"),
+                ("alt+v", "image mode"),
+                (",/.", "divider/opacity"),
                 ("L", "changed since"),
                 ("C", "commits"),
                 ("S", "submit"),
+                ("q", "leave"),
             ];
         }
         if self.active_review().is_some() {
@@ -586,14 +589,14 @@ impl GitCometView {
             return &[
                 ("j / k", "Line cursor down / up"),
                 ("shift+j / k", "Select lines from the cursor"),
-                (
-                    "c",
-                    "Line comments require a range ending at the current head",
-                ),
-                ("a / x", "Adopt / drop a Codex suggestion"),
                 ("} / {", "Next / previous change"),
                 ("] / [", "Next / previous file"),
                 ("space", "Mark viewed"),
+                (
+                    "/",
+                    "Filter the file list: fuzzy words, .rs for a type; esc clears",
+                ),
+                ("V", "Show / hide viewed files (hidden by default)"),
                 (
                     "Shift+G",
                     "Show / hide generated files (hidden by default; don't count toward viewed progress)",
@@ -602,6 +605,8 @@ impl GitCometView {
                     "Alt+P",
                     "Toggle the rendered Preview / Text switch, where it shows",
                 ),
+                ("Alt+V", "Cycle an image diff's view mode"),
+                (",/.", "Move the Swipe divider or the Onion skin opacity"),
                 ("L", "Changes since your last review"),
                 ("C", "Pick a commit range"),
                 ("S", "Submit the review"),
@@ -1385,9 +1390,9 @@ impl GitCometView {
             return Some(true);
         }
         let selected = self.active_pull_requests().and_then(|prs| prs.selected);
-        let in_details = current == Some(FocusPanel::Details) && self.pull_request_details_active();
+        let in_details = current == Some(FocusPanel::Details) && self.pull_request_content_active();
         let in_content = current == Some(FocusPanel::History) && self.pull_request_content_active();
-        let in_sidebar = current == Some(FocusPanel::Sidebar);
+        let in_sidebar = current == Some(FocusPanel::Sidebar) && self.active_review().is_none();
         // `<`/`>` move to the pull request below/above the selected one in
         // its stack, in the list, panel 2 and Details. US layouts send them
         // as shift+`,`/`.`; ISO/DE layouts have `<`/`>` as their own key
@@ -1482,10 +1487,9 @@ impl GitCometView {
             (Some(FocusPanel::History), "enter") if in_content => {
                 if self.active_pull_requests().is_some_and(|prs| {
                     prs.content_tab == super::pull_requests::PrContentTab::Comments
-                }) {
-                    if let Some(thread) = self.selected_pull_request_thread() {
-                        self.start_review_at_thread(&thread, cx);
-                    }
+                }) && let Some(thread) = self.selected_pull_request_thread()
+                {
+                    self.start_review_at_thread(&thread, cx);
                 }
                 Some(true)
             }

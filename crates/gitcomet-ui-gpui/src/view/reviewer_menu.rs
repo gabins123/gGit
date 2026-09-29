@@ -172,6 +172,24 @@ impl GitCometView {
                     .is_some())
     }
 
+    /// Drops a `q` (Ask) left pending on a pull request that's no longer the
+    /// one an Ask would actually run against — the sidebar left the PR tab
+    /// (and review mode too), the repo changed, or a different pull request
+    /// is now selected or being reviewed. Called on every state application
+    /// and pull request selection, so `Enter` in the ask box never has a
+    /// stale target to (mis)match against in the first place.
+    pub(super) fn clear_pending_reviewer_ask_if_stale(&mut self) {
+        let Some((repo_id, number, _)) = self.pending_reviewer_ask else {
+            return;
+        };
+        let matches = self.pr_reviewer_context_active()
+            && self.active_repo_id() == Some(repo_id)
+            && self.reviewer_context().is_some_and(|context| context.number == number);
+        if !matches {
+            self.pending_reviewer_ask = None;
+        }
+    }
+
     fn reviewer_context(&self) -> Option<ReviewerContext> {
         let repo_id = self.active_repo_id()?;
         let repo = self.active_repo()?;
@@ -207,7 +225,13 @@ impl GitCometView {
         cx: &mut gpui::Context<Self>,
     ) -> Option<ReviewerLoad> {
         let cached = self.reviewer_cache.get(&context.base_oid);
-        if cached.is_none() && !self.reviewer_cache.loading.contains(&context.base_oid) {
+        // Test builds never run the real load: gpui's test scheduler aborts the
+        // process when a background git task settles mid-test. Tests seed the
+        // cache instead (`seed_reviewer_config_for_test`).
+        if !cfg!(test)
+            && cached.is_none()
+            && !self.reviewer_cache.loading.contains(&context.base_oid)
+        {
             self.reviewer_cache.loading.insert(context.base_oid.clone());
             let workdir = context.workdir.clone();
             let base_oid = context.base_oid.clone();
@@ -289,10 +313,10 @@ impl GitCometView {
         cx.notify();
     }
 
-    /// The scope's own touched paths, for `.reviewer/areas` and agent
-    /// `paths` matching, and the generated-file exemption — the current
-    /// file for Lines/File, nothing (meaning "the whole PR") for
-    /// Commits/Pr.
+    /// Lines/File's one open file, for `reviewer_scope_material`'s diff
+    /// (Commits/Pr build their material from a base/head range instead, so
+    /// they have no single path here — see `scope_files` for what they use
+    /// for `.reviewer/areas` and agent `paths` matching).
     fn scope_path(&self, scope: ReviewScope) -> Option<String> {
         match scope {
             ReviewScope::Lines | ReviewScope::File => self
@@ -306,6 +330,26 @@ impl GitCometView {
 
     fn thread_under_cursor_path(&self) -> Option<String> {
         self.selected_pull_request_thread().map(|thread| thread.path)
+    }
+
+    /// The scope's own touched files, for `.reviewer/areas` and agent
+    /// `paths` matching: the current file for Lines/File, the on-screen
+    /// commit range's files for Commits, the pull request's full
+    /// changed-file list for Pr ("Whole PR" genuinely means every file, not
+    /// "unknown, so match everything"). An empty result means no files are
+    /// in scope, so `ReviewerConfig::files_for`/`instructions_text` and the
+    /// agent-disabling check below must treat it as "no areas apply", never
+    /// as the old "empty means unrestricted".
+    fn scope_files(&self, context: &ReviewerContext, scope: ReviewScope) -> Vec<String> {
+        match scope {
+            ReviewScope::Lines | ReviewScope::File => self.scope_path(scope).into_iter().collect(),
+            ReviewScope::Commits => self
+                .active_review()
+                .filter(|review| review.repo_id == context.repo_id && review.number == context.number)
+                .map(|review| review.files.clone())
+                .unwrap_or_default(),
+            ReviewScope::Pr => context.changed_files.clone(),
+        }
     }
 
     /// The base/head a Lines, File or Commits scope's diff runs between:
@@ -352,6 +396,7 @@ impl GitCometView {
     fn reviewer_menu_rows(
         &self,
         load: Option<&ReviewerLoad>,
+        context: Option<&ReviewerContext>,
         scope: ReviewScope,
         cx: &App,
     ) -> Vec<ReviewerMenuRow> {
@@ -371,11 +416,9 @@ impl GitCometView {
             })
             .collect();
         if let Some(config) = load.and_then(ReviewerLoad::config) {
-            let scope_path = self.scope_path(scope);
-            let paths: Vec<String> = scope_path.into_iter().collect();
+            let paths = context.map(|context| self.scope_files(context, scope)).unwrap_or_default();
             for (ix, agent) in config.agents.iter().enumerate() {
                 let disabled = (!agent.paths.is_empty()
-                    && !paths.is_empty()
                     && !paths.iter().any(|path| reviewer::area_matches(&agent.paths, path)))
                 .then_some("Doesn't apply to this scope's files.");
                 rows.push(ReviewerMenuRow {
@@ -423,7 +466,7 @@ impl GitCometView {
             .as_ref()
             .and_then(|context| self.reviewer_cache.get(&context.base_oid));
         let scope = self.reviewer_menu.map_or(ReviewScope::Pr, |state| state.scope);
-        let rows = self.reviewer_menu_rows(load.as_ref(), scope, cx);
+        let rows = self.reviewer_menu_rows(load.as_ref(), context.as_ref(), scope, cx);
         if rows.is_empty() {
             return true;
         }
@@ -508,7 +551,7 @@ impl GitCometView {
         };
 
         let scope_path = self.scope_path(scope);
-        let paths: Vec<String> = scope_path.iter().cloned().collect();
+        let paths = self.scope_files(&context, scope);
         let reviewer_text = config.map(|config| config.instructions_text(&paths)).unwrap_or_default();
 
         let question = self
@@ -517,7 +560,7 @@ impl GitCometView {
             .map(|panel| panel.ask_input.read(cx).text().trim().to_string())
             .unwrap_or_default();
         if kind == ReviewerActionKind::Ask && question.is_empty() {
-            self.pending_reviewer_ask = Some(scope);
+            self.pending_reviewer_ask = Some((context.repo_id, context.number, scope));
             self.focus_codex_panel(window, cx);
             if let Some(panel) = self.codex.as_ref() {
                 let handle = panel.ask_input.read(cx).focus_handle();
@@ -526,9 +569,14 @@ impl GitCometView {
             return;
         }
 
+        // A historical range (ending before the PR head) carries range-head
+        // line numbers that would land on the wrong lines once the range
+        // changes back to All changes; route those findings to the Panel
+        // only, never into the hidden `ReviewSuggestions` queue.
         let review_generation = self
             .active_review()
             .filter(|review| review.repo_id == context.repo_id && review.number == context.number)
+            .filter(|review| !review.historical_range())
             .map(|review| review.suggestion_generation);
 
         let material_result: Result<Material, &'static str> = if kind == ReviewerActionKind::Thread {
@@ -614,15 +662,30 @@ impl GitCometView {
                 CodexDestination::Panel,
                 "Description vs code".to_string(),
             ),
-            ReviewerActionKind::DraftSummary => (
-                "Write a pull request review summary for the change below, in the reviewer's own \
-                 words: the overall take, then the main points. Output only the summary, without \
-                 code fences."
-                    .to_string(),
-                ResultShape::PlainText,
-                CodexDestination::ReviewDraft(context.repo_id, context.number),
-                "Draft my review summary".to_string(),
-            ),
+            ReviewerActionKind::DraftSummary => {
+                // `fill_pull_request_review_draft` only fills a summary into
+                // the review/submit dialog while it's open on this PR; `s`
+                // opens it itself, the same way `S` does, rather than
+                // silently doing nothing until the user opens it by hand.
+                self.open_pull_request_prompt(
+                    PopoverKind::PullRequestReview {
+                        repo_id: context.repo_id,
+                        number: context.number,
+                        kind: crate::github::ReviewKind::Comment,
+                    },
+                    window,
+                    cx,
+                );
+                (
+                    "Write a pull request review summary for the change below, in the \
+                     reviewer's own words: the overall take, then the main points. Output only \
+                     the summary, without code fences."
+                        .to_string(),
+                    ResultShape::PlainText,
+                    CodexDestination::ReviewDraft(context.repo_id, context.number),
+                    "Draft my review summary".to_string(),
+                )
+            }
             ReviewerActionKind::Ask => (
                 format!("Answer this question about the change below: {question}"),
                 ResultShape::PlainText,
@@ -676,6 +739,14 @@ impl GitCometView {
             None => title,
         };
 
+        // The head (or, on a commit range, its range head) a Brief/Review
+        // row's line numbers are anchored to, so `enter` on one later can
+        // refuse the jump once this pull request or head has moved on.
+        let jump_head = self
+            .active_review()
+            .filter(|review| review.repo_id == context.repo_id && review.number == context.number)
+            .map(|review| review.range_head().to_string())
+            .unwrap_or_else(|| context.head_oid.clone());
         self.dispatch_codex(
             context.repo_id,
             context.workdir,
@@ -684,6 +755,7 @@ impl GitCometView {
             material,
             destination,
             shape,
+            Some((context.number, jump_head)),
             false,
             kind == ReviewerActionKind::Ask,
             window,
@@ -775,19 +847,6 @@ impl GitCometView {
         }
     }
 
-    /// The `.reviewer` load cached for `base_oid`, once its background load
-    /// has settled — `None` while it's still loading.
-    #[cfg(test)]
-    pub(super) fn reviewer_config_for_test(&self, base_oid: &str) -> Option<ReviewerLoad> {
-        self.reviewer_cache.get(base_oid)
-    }
-
-    /// Whether `base_oid`'s `.reviewer` load has settled (cached either way,
-    /// even when it ended up `Disabled`).
-    #[cfg(test)]
-    pub(super) fn reviewer_config_loaded_for_test(&self, base_oid: &str) -> bool {
-        self.reviewer_cache.get(base_oid).is_some()
-    }
 
     /// Seeds `.reviewer/` for `base_oid` directly (as already `Ready`),
     /// bypassing the real git-backed load, for tests that only care about
@@ -845,9 +904,8 @@ impl GitCometView {
         let load = context
             .as_ref()
             .and_then(|context| self.reviewer_cache.get(&context.base_oid));
-        let scope_path = self.scope_path(state.scope);
-        let paths: Vec<String> = scope_path.iter().cloned().collect();
-        let rows = self.reviewer_menu_rows(load.as_ref(), state.scope, cx);
+        let paths = context.as_ref().map(|context| self.scope_files(context, state.scope)).unwrap_or_default();
+        let rows = self.reviewer_menu_rows(load.as_ref(), context.as_ref(), state.scope, cx);
 
         let scope_row = div()
             .flex()
@@ -1001,7 +1059,11 @@ fn format_thread_text(thread: &github::ReviewThread) -> String {
 /// Background body of [`GitCometView::reviewer_config`]: finds the commit
 /// `.reviewer/` may be trusted from, then loads it — both steps run git, so
 /// this all happens off the UI thread.
-fn reviewer_load(workdir: &Path, remote: Option<&str>, base_oid: &str) -> ReviewerLoad {
+pub(in crate::view) fn reviewer_load(
+    workdir: &Path,
+    remote: Option<&str>,
+    base_oid: &str,
+) -> ReviewerLoad {
     let Some(remote) = remote else {
         return ReviewerLoad::Disabled("Rules off: no GitHub remote.".to_string());
     };

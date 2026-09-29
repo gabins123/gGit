@@ -115,7 +115,7 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Action | Key | Notes |
 | --- | --- | --- |
 | Next / previous pull request | `j` / `k` | Sidebar. Selecting one shows its conversation in the middle panel and its facts in Details. |
-| Down / up its stack | `<` / `>` | Sidebar, middle panel or Details: selects the pull request below / above the current one in its stack. No-op outside a stack, or at either end of it. |
+| Down / up its stack | `<` / `>` | Sidebar, middle panel or Details: selects the pull request below / above the current one in its stack. No-op outside a stack, at either end of it, or in review mode (reviewing one pull request never swaps in another). |
 | Read the pull request | `Enter` | Sidebar or Details: focuses the selected pull request in the middle panel. Reading code starts with `r` (review mode). |
 | Select commits to review | `j` / `k`, `Shift+J` / `Shift+K` | Details: move among newest-first commits and grow a contiguous range; `Escape` returns to All commits. `r` reviews the selection. |
 | Next / previous entry or thread | `j` / `k` | Middle panel: moves through conversation entries or visible review threads. |
@@ -177,7 +177,7 @@ Read-only suggestions from Codex through the `codex` CLI on your ChatGPT subscri
 
 ### Reviewer menu
 
-On a pull request (the Pull requests tab or review mode), `i` opens the reviewer menu instead of the plain Codex menu above. It reads a repository-authored `.reviewer/` folder from the pull request's **base commit** (never its head or the worktree): `README.md` is always sent, `checklist.md` is one rule per `- ` line, `areas/*.md` (front matter `paths: [globs]`) are sent only when the scope touches a matching path, and `agents/*.md` (front matter `title`, `key` 1-9, `scope`, optional `paths`) each add a numbered action whose body is the agent's own instructions. A missing or empty folder falls back to a built-in reviewer, and the menu says so; if the pull request itself changes `.reviewer/`, the result says so too. `.reviewer` text is trusted and goes into Codex's instructions; the pull request's own diffs, description and threads stay in the untrusted material, same as everywhere else Codex runs.
+On a pull request (the Pull requests tab or review mode), `i` opens the reviewer menu instead of the plain Codex menu above. It reads a repository-authored `.reviewer/` folder from where the pull request leaves the default branch (the merge base of its base commit and the default branch's tip, never its head or the worktree): `README.md` is always sent, `checklist.md` is one rule per `- ` line, `areas/*.md` (front matter `paths: [globs]`) are sent only when the scope touches a matching path, and `agents/*.md` (front matter `title`, `key` 1-9, `scope`, optional `paths`) each add a numbered action whose body is the agent's own instructions. A missing or empty folder falls back to a built-in reviewer, and the menu says so; if the pull request itself changes `.reviewer/`, the result says so too. `.reviewer` text is trusted and goes into Codex's instructions; the pull request's own diffs, description and threads stay in the untrusted material, same as everywhere else Codex runs.
 
 | Action | Key | Notes |
 | --- | --- | --- |
@@ -185,7 +185,7 @@ On a pull request (the Pull requests tab or review mode), `i` opens the reviewer
 | Move / run | `j` / `k`, `Enter` | Over the action rows; a row's own letter also runs it directly. `Escape` or `i` closes the menu. A disabled row (for example `h` with no thread under the cursor) says why instead of running. |
 | Brief me | `b` | A summary, a reading order, and spots to look at, as a navigable list in the Codex panel. |
 | Explain this | `e` | What the scope's material changes and why. |
-| Thread | `h` | Summarizes the thread under the cursor, checks later commits for a fix, and drafts a reply. Disabled with no thread under the cursor. |
+| Thread | `h` | Summarizes the thread under the cursor and drafts a reply. Disabled with no thread under the cursor. Checking later commits for a fix isn't available yet. |
 | Review against the rules | `r` | A verdict (pass, flag or not applicable) per `checklist.md` line, plus findings as the existing Codex line-comment suggestions (`a` adopts, `x` drops). |
 | Test gaps | `t` | What tests are missing for the change. |
 | Description vs code | `v` | Whether the pull request's description matches what its diff actually does. |

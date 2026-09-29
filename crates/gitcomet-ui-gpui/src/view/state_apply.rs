@@ -366,6 +366,7 @@ impl GitCometView {
         }
 
         self.state = next;
+        self.clear_pending_reviewer_ask_if_stale();
         if prev_sidebar_mode != gitcomet_state::model::SidebarMode::PullRequests
             && self.state.sidebar_mode == gitcomet_state::model::SidebarMode::PullRequests
             && self.pull_request_content_active()

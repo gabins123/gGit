@@ -473,6 +473,58 @@ fn less_and_greater_walk_a_pull_requests_stack(cx: &mut gpui::TestAppContext) {
     assert_eq!(selected(cx), Some(2));
 }
 
+/// Reviewing PR 1 in the stack 1<-2: `<`/`>` must not swap in a neighboring
+/// PR out from under the open review (it would silently diff/list the wrong
+/// PR — see AGENTS.md HIGH finding on `handle_pull_request_key`).
+#[gpui::test]
+fn stack_keys_are_inert_while_reviewing(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.seed_pull_requests_for_test(
+                REPO,
+                vec![
+                    stack_pull_request(1, "feat-a", "main"),
+                    stack_pull_request(2, "feat-b", "feat-a"),
+                ],
+                Some(1),
+            );
+            this.pull_requests.repo_mut(REPO).stacks = vec![crate::github::PullRequestStack {
+                members: vec![1, 2],
+                native: false,
+            }];
+            this.open_review_for_test(REPO, 1, vec!["a.rs".to_string()], "head1", cx);
+        })
+    });
+    apply_state(cx, &view, pull_request_state());
+    let selected = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_pull_requests()
+                .and_then(|prs| prs.selected)
+        })
+    };
+
+    press(cx, "1");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+    assert_eq!(selected(cx), Some(1));
+    press(cx, ">");
+    assert_eq!(selected(cx), Some(1), "sidebar: `>` must not change the review");
+    press(cx, "shift-.");
+    assert_eq!(selected(cx), Some(1), "sidebar: shift+. must not change the review");
+
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.focus_panel(Details, window, cx);
+        });
+    });
+    draw_and_drain_test_window(cx);
+    assert_eq!(focused(cx, &view), Some(Details));
+    press(cx, ">");
+    assert_eq!(selected(cx), Some(1), "details: `>` must not change the review");
+}
+
 fn selected_commit(cx: &mut gpui::VisualTestContext, view: &View) -> Option<CommitId> {
     sync_store_snapshot(cx, view);
     cx.update(|_window, app| {

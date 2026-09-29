@@ -2852,7 +2852,6 @@ impl DetailsPaneView {
     }
 
     /// Facts for the selected pull request.
-
     fn pull_request_details_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         use super::super::pull_requests::PrLoad;
 

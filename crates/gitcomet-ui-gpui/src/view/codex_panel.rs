@@ -93,6 +93,13 @@ struct CodexRun {
     /// (in review mode, `enter` also lands on them) regardless of whether
     /// they were also turned into suggestions.
     findings: Vec<reviewer::RuleFinding>,
+    /// The pull request and head (or, on a commit range, its range head)
+    /// `rows`/`findings`' line numbers are anchored to — set only for a
+    /// reviewer-menu dispatch (Brief/Review), the only ones that ever
+    /// produce a jumpable row; `None` for the plain menu. `enter` on a row
+    /// refuses the jump rather than landing on whatever review happens to be
+    /// open once this no longer matches it.
+    dispatched_for: Option<(u64, String)>,
 }
 
 /// What actually runs a request: `codex::run`, or in test builds a stub that
@@ -103,8 +110,9 @@ struct CodexRun {
 /// nondeterminism, whatever the task actually does) — which is exactly why
 /// no test in this crate ever calls `cx.run_until_parked()` after
 /// dispatching. Tests instead check the synchronous part of a dispatch:
-/// `codex_run_title_for_test`, `last_dispatch_instructions_for_test`, and
-/// (for the reviewer menu) `reviewer_scope_material_for_test`.
+/// `codex_run_title_for_test`, `last_dispatch_instructions_for_test`,
+/// `last_dispatch_destination_for_test`, and (for the reviewer menu)
+/// `reviewer_scope_material_for_test`.
 pub(super) type CodexRunner =
     Arc<dyn Fn(CodexRequest, &CancellationToken) -> Result<String, CodexError> + Send + Sync>;
 
@@ -128,6 +136,7 @@ pub(super) struct CodexPanel {
     result_scroll: ScrollHandle,
     pub(super) ask_input: Entity<components::TextInput>,
     _ask_subscription: gpui::Subscription,
+    _ask_blur_subscription: gpui::Subscription,
     _result_subscription: gpui::Subscription,
     runs: FxHashMap<RepoId, CodexRun>,
     pub(super) open: bool,
@@ -145,6 +154,11 @@ pub(super) struct CodexPanel {
     /// the test scheduler refuses to let a test drive to completion).
     #[cfg(test)]
     last_instructions_for_test: Option<String>,
+    /// The last dispatch's destination, captured the same way, so a test can
+    /// check a run was routed to the Panel rather than `ReviewSuggestions`
+    /// without driving the background run to completion.
+    #[cfg(test)]
+    last_destination_for_test: Option<CodexDestination>,
 }
 
 /// What a run needs, captured on the main thread before it leaves it.
@@ -495,8 +509,12 @@ impl GitCometView {
                     // The reviewer menu's own `q` (Ask), asked to type a
                     // question first, lands here too: it runs the reviewer
                     // Ask at the scope it was opened with, not the plain
-                    // repo-overview one.
-                    if let Some(scope) = this.pending_reviewer_ask.take() {
+                    // repo-overview one — but only while it still matches
+                    // what's on screen; `clear_pending_reviewer_ask_if_stale`
+                    // clears it as soon as it doesn't, and this is the
+                    // fallback for the moment in between.
+                    this.clear_pending_reviewer_ask_if_stale();
+                    if let Some((_, _, scope)) = this.pending_reviewer_ask.take() {
                         this.dispatch_reviewer_action(
                             super::reviewer_menu::ReviewerActionKind::Ask,
                             scope,
@@ -514,6 +532,13 @@ impl GitCometView {
                     }
                 }
             });
+            // Clicking away from the box (rather than Enter or Escape) must
+            // drop a pending reviewer Ask too, so it never lingers to fire
+            // against whatever is on screen next time the box gets Enter.
+            let ask_blur_subscription =
+                cx.on_blur(&ask_input.read(cx).focus_handle(), window, |this, _window, _cx| {
+                    this.pending_reviewer_ask = None;
+                });
             let focus_handle = cx.focus_handle().tab_index(0).tab_stop(false);
             let result_subscription = cx.observe_in(&result_input, window, {
                 let focus_handle = focus_handle.clone();
@@ -529,6 +554,7 @@ impl GitCometView {
                 result_scroll,
                 ask_input,
                 _ask_subscription: ask_subscription,
+                _ask_blur_subscription: ask_blur_subscription,
                 _result_subscription: result_subscription,
                 runs: FxHashMap::default(),
                 open: false,
@@ -538,6 +564,8 @@ impl GitCometView {
                 runner: default_runner(),
                 #[cfg(test)]
                 last_instructions_for_test: None,
+                #[cfg(test)]
+                last_destination_for_test: None,
             });
         }
         self.codex.as_mut().expect("created above")
@@ -580,6 +608,11 @@ impl GitCometView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if action == CodexAction::Ask {
+            // The plain menu's own Ask, not the reviewer's: a scope left
+            // pending from `i q` must not resurface on a later plain Ask.
+            self.pending_reviewer_ask = None;
+        }
         let Some(repo) = self.active_repo() else {
             return;
         };
@@ -712,6 +745,8 @@ impl GitCometView {
             material,
             destination,
             ResultShape::PlainText,
+            // The plain menu never produces a `b`/`r` jumpable row.
+            None,
             action == CodexAction::CommitMessage,
             action == CodexAction::Ask,
             window,
@@ -734,6 +769,10 @@ impl GitCometView {
         material: Material,
         destination: CodexDestination,
         shape: ResultShape,
+        // The pull request and head (or range head) this run's rows would
+        // jump into, for `handle_codex_panel_key`'s `enter` to check against
+        // before it jumps — see `CodexRun::dispatched_for`.
+        dispatched_for: Option<(u64, String)>,
         fills_commit_message: bool,
         clear_ask_input: bool,
         window: &mut Window,
@@ -759,6 +798,7 @@ impl GitCometView {
                 rows: Vec::new(),
                 verdicts: Vec::new(),
                 findings: Vec::new(),
+                dispatched_for,
             },
         );
         panel.open = true;
@@ -777,6 +817,7 @@ impl GitCometView {
         #[cfg(test)]
         {
             panel.last_instructions_for_test = Some(instructions.clone());
+            panel.last_destination_for_test = Some(destination);
         }
         let runner = panel.runner.clone();
         // A run takes minutes; it gets its own thread, not a pool worker.
@@ -929,7 +970,9 @@ impl GitCometView {
             "enter" if rows_len > 0 => {
                 let panel = self.codex.as_ref().expect("checked above");
                 let cursor = panel.rows_cursor;
-                let target = panel.runs.get(&repo_id).and_then(|run| {
+                let run = panel.runs.get(&repo_id);
+                let dispatched_for = run.and_then(|run| run.dispatched_for.clone());
+                let target = run.and_then(|run| {
                     if let Some(row) = run.rows.get(cursor) {
                         row.path.clone().zip(row.line)
                     } else {
@@ -938,9 +981,25 @@ impl GitCometView {
                             .map(|finding| (finding.path.clone(), finding.line))
                     }
                 });
-                if let Some((path, line)) = target {
-                    self.review_jump_to_line(&path, line, window, cx);
+                let Some((path, line)) = target else {
+                    return true;
+                };
+                // The run's rows are anchored to the PR and head they were
+                // dispatched for; jumping once that's moved on would land on
+                // whatever review happens to be open now, at the wrong lines.
+                let current = self
+                    .active_review()
+                    .filter(|review| review.repo_id == repo_id)
+                    .map(|review| (review.number, review.range_head().to_string()));
+                if dispatched_for.is_some() && dispatched_for != current {
+                    self.push_toast(
+                        components::ToastKind::Warning,
+                        "This result is for a different pull request or head now.".to_string(),
+                        cx,
+                    );
+                    return true;
                 }
+                self.review_jump_to_line(&path, line, window, cx);
             }
             "y" => {
                 if !text.trim().is_empty() {
@@ -1387,6 +1446,46 @@ impl GitCometView {
     #[cfg(test)]
     pub(super) fn last_dispatch_instructions_for_test(&self) -> Option<String> {
         self.codex.as_ref()?.last_instructions_for_test.clone()
+    }
+
+    /// The most recent dispatch's destination, captured the same way.
+    #[cfg(test)]
+    pub(super) fn last_dispatch_destination_for_test(&self) -> Option<CodexDestination> {
+        self.codex.as_ref()?.last_destination_for_test
+    }
+
+    /// Seeds a finished `RuleReview` run directly, with `dispatched_for` set
+    /// as a real dispatch would: no test can drive `dispatch_codex`'s runner
+    /// to completion (see the module doc), so this is the only way to
+    /// exercise `handle_codex_panel_key`'s `enter`/`j`/`k` over `findings`.
+    #[cfg(test)]
+    pub(super) fn seed_codex_run_findings_for_test(
+        &mut self,
+        repo_id: RepoId,
+        findings: Vec<reviewer::RuleFinding>,
+        dispatched_for: Option<(u64, String)>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let panel = self.codex_panel(window, cx);
+        panel.next_seq += 1;
+        let seq = panel.next_seq;
+        panel.runs.insert(
+            repo_id,
+            CodexRun {
+                title: "Review against the rules".to_string(),
+                state: RunState::Done,
+                answer: String::new(),
+                cancel: CancellationToken::new(),
+                seq,
+                shape: ResultShape::RuleReview,
+                rows: Vec::new(),
+                verdicts: Vec::new(),
+                findings,
+                dispatched_for,
+            },
+        );
+        panel.open = true;
     }
 
 }

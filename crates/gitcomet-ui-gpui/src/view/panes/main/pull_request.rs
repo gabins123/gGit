@@ -733,6 +733,28 @@ fn pr_markdown_document(source: &str) -> Option<MarkdownPreviewDocument> {
     Some(document)
 }
 
+fn pr_thread_scroll_index(
+    threads: &PrLoad<Arc<Vec<ReviewThread>>>,
+    show_hidden: bool,
+    selected: usize,
+) -> Option<usize> {
+    let mut index = 0;
+    let mut last_path: Option<&str> = None;
+    let threads = threads.ready()?;
+    for ix in visible_pr_thread_indexes(threads, show_hidden) {
+        let thread = &threads[ix];
+        if last_path != Some(thread.path.as_str()) {
+            index += 1;
+            last_path = Some(&thread.path);
+        }
+        if ix == selected {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,26 +811,4 @@ mod tests {
         let other_pr = cache.document(8, key, "# Edited").unwrap();
         assert!(!Arc::ptr_eq(&edited, &other_pr));
     }
-}
-
-fn pr_thread_scroll_index(
-    threads: &PrLoad<Arc<Vec<ReviewThread>>>,
-    show_hidden: bool,
-    selected: usize,
-) -> Option<usize> {
-    let mut index = 0;
-    let mut last_path: Option<&str> = None;
-    let threads = threads.ready()?;
-    for ix in visible_pr_thread_indexes(threads, show_hidden) {
-        let thread = &threads[ix];
-        if last_path != Some(thread.path.as_str()) {
-            index += 1;
-            last_path = Some(&thread.path);
-        }
-        if ix == selected {
-            return Some(index);
-        }
-        index += 1;
-    }
-    None
 }

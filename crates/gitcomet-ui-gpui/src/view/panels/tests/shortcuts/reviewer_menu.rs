@@ -250,13 +250,14 @@ fn an_action_dispatches_with_the_expected_scope_and_material(cx: &mut gpui::Test
         })
     );
 
-    // No `.reviewer/` involved yet: `i` kicks off its load, and with no
-    // GitHub remote configured it settles (fast, no subprocess) to
-    // `Disabled` rather than staying `Loading` forever.
-    cx.simulate_keystrokes("i");
-    wait_until(cx, "the .reviewer load to settle", |cx| {
-        cx.update(|_window, app| view.read(app).reviewer_config_loaded_for_test("base1"))
+    // Test builds never run the real `.reviewer` load, so seed an empty
+    // config (the built-in reviewer) before dispatching.
+    cx.update(|_window, app| {
+        view.update(app, |this, _cx| {
+            this.seed_reviewer_config_for_test("base1", ReviewerConfig::default());
+        })
     });
+    cx.simulate_keystrokes("i");
     cx.simulate_keystrokes("e");
     draw_and_drain_test_window(cx);
 
@@ -392,6 +393,273 @@ fn an_agent_key_dispatches_its_own_instructions(cx: &mut gpui::TestAppContext) {
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
+/// Commits and Whole PR scopes must send their own real touched files, not
+/// an empty placeholder that `ReviewerConfig` used to read as "match every
+/// area" (AGENTS.md MED finding): an area scoped to `b.rs` must stay out of
+/// Commits' instructions when only `a.rs` is on screen, and must join Whole
+/// PR's once `b.rs` is one of the PR's own changed files.
+#[gpui::test]
+fn commits_and_pr_scopes_use_their_own_real_files_not_every_area(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    bind_app_keys_and_global_diff_fallback_for_test(cx);
+
+    let repo_id = RepoId(80173);
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_reviewer_menu_scope_files",
+        std::process::id()
+    ));
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            let repo = opening_repo_state(repo_id, &workdir);
+            let next_state = Arc::new(AppState {
+                repos: vec![repo],
+                active_repo: Some(repo_id),
+                sidebar_mode: gitcomet_state::model::SidebarMode::PullRequests,
+                ..AppState::test_default()
+            });
+            push_test_state(this, next_state, cx);
+            // The on-screen range covers only `a.rs`; the PR's own full
+            // changed-file list (`context.changed_files`) also has `b.rs`.
+            this.open_review_for_test(repo_id, 53, vec!["a.rs".to_string()], "head1", cx);
+            this.seed_pull_request_detail_for_test(
+                repo_id,
+                reviewer_pr_detail(53, "base1", "head1", &["a.rs", "b.rs"]),
+                "base1".to_string(),
+            );
+            this.seed_reviewer_config_for_test(
+                "base1",
+                ReviewerConfig {
+                    areas: vec![crate::reviewer::AreaDoc {
+                        name: "areas/b.md".to_string(),
+                        paths: vec!["b.rs".to_string()],
+                        body: "Mind b.rs's own invariant.".to_string(),
+                    }],
+                    ..Default::default()
+                },
+            );
+        });
+    });
+    draw_and_drain_test_window(cx);
+
+    // File -> Commits: still just `a.rs`, so the `b.rs`-scoped area stays out.
+    cx.simulate_keystrokes("i");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("tab");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("e");
+    draw_and_drain_test_window(cx);
+    let commits_instructions = cx.update(|_window, app| {
+        view.read(app).last_dispatch_instructions_for_test().unwrap_or_default()
+    });
+    assert!(
+        !commits_instructions.contains("Mind b.rs's own invariant"),
+        "Commits scope must not pull in an area that doesn't touch its files: {commits_instructions:?}"
+    );
+
+    // Pr (reopening the menu resets to its initial scope, File; two `tab`s
+    // widen past Commits to Pr): the PR's real changed files include `b.rs`,
+    // so the area joins.
+    cx.simulate_keystrokes("i");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("tab");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("tab");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("e");
+    draw_and_drain_test_window(cx);
+    let pr_instructions = cx.update(|_window, app| {
+        view.read(app).last_dispatch_instructions_for_test().unwrap_or_default()
+    });
+    assert!(
+        pr_instructions.contains("Mind b.rs's own invariant"),
+        "Whole PR scope must use the PR's real changed files: {pr_instructions:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// `i s` (draft my review summary) must open the review/submit dialog itself
+/// — the same one `S` opens — rather than leaving `fill_pull_request_review_draft`
+/// with nowhere to put the answer (AGENTS.md MED finding).
+#[gpui::test]
+fn draft_summary_opens_the_review_dialog(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    bind_app_keys_and_global_diff_fallback_for_test(cx);
+
+    let repo_id = RepoId(80172);
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_reviewer_menu_draft_summary",
+        std::process::id()
+    ));
+    open_review_with_detail(cx, &view, repo_id, 52, &workdir, "base1", "head1");
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_reviewer_config_for_test("base1", ReviewerConfig::default());
+        });
+    });
+
+    cx.simulate_keystrokes("i");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("s");
+    draw_and_drain_test_window(cx);
+
+    let (dialog_open, run_title) = cx.update(|_window, app| {
+        let this = view.read(app);
+        let kind = PopoverKind::PullRequestReview {
+            repo_id,
+            number: 52,
+            kind: crate::github::ReviewKind::Comment,
+        };
+        (
+            this.popover_host.read(app).is_kind_open(&kind),
+            this.codex_run_title_for_test(repo_id),
+        )
+    });
+    assert!(dialog_open, "`i s` must open the review/submit dialog");
+    assert_eq!(run_title.as_deref(), Some("Draft my review summary"));
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// A rule review (`i r`) run on a historical commit range (one ending before
+/// the PR head) must go to the Panel, never into the hidden
+/// `ReviewSuggestions` queue: its findings carry the range-head's line
+/// numbers, which don't line up with the PR head diff `Shift+C` -> All
+/// changes shows once the range is left (AGENTS.md HIGH finding on
+/// `reviewer_menu.rs`/`review.rs`).
+#[gpui::test]
+fn rule_review_on_a_historical_range_goes_to_the_panel(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    bind_app_keys_and_global_diff_fallback_for_test(cx);
+
+    let repo_id = RepoId(80171);
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_reviewer_menu_historical_range",
+        std::process::id()
+    ));
+    open_review_with_detail(cx, &view, repo_id, 51, &workdir, "base1", "head1");
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_reviewer_config_for_test("base1", ReviewerConfig::default());
+        });
+    });
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_review_commit_range(
+                Some(crate::view::pull_requests::SelectedCommitRange {
+                    oldest_oid: "old1".to_string(),
+                    newest_oid: "old1".to_string(),
+                    count: 1,
+                    total: 3,
+                }),
+                cx,
+            );
+        });
+    });
+    draw_and_drain_test_window(cx);
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .active_review()
+            .is_some_and(crate::view::review::ReviewMode::historical_range)),
+        "the range must end before the PR head"
+    );
+
+    // File -> Commits -> Pr: Pr's material never depends on the (still
+    // `Loading`) commit-range changes, so the dispatch actually runs.
+    cx.simulate_keystrokes("i");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes("tab");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("r");
+    // No `run_until_parked`: the background gather/run is scheduled but
+    // never polled, so it never reaches a `codex` process.
+    draw_and_drain_test_window(cx);
+
+    let (run_title, destination) = cx.update(|_window, app| {
+        let this = view.read(app);
+        (
+            this.codex_run_title_for_test(repo_id),
+            this.last_dispatch_destination_for_test(),
+        )
+    });
+    assert!(run_title.is_some(), "the rule review must have dispatched");
+    assert_eq!(
+        destination,
+        Some(crate::view::codex_panel::CodexDestination::Panel),
+        "a historical range must never route findings to ReviewSuggestions"
+    );
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// `i q` with an empty question leaves a reviewer Ask pending on the PR it
+/// was opened for. Leaving the Pull requests tab (and review mode) for
+/// Branches must drop it, so a later plain `q` -> Enter in the classic Codex
+/// menu never fires it against a PR that's no longer on screen (AGENTS.md
+/// MED finding on `pending_reviewer_ask`).
+#[gpui::test]
+fn pending_reviewer_ask_is_dropped_once_the_pr_tab_is_left(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    bind_app_keys_and_global_diff_fallback_for_test(cx);
+
+    let repo_id = RepoId(80176);
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_reviewer_menu_pending_ask",
+        std::process::id()
+    ));
+    open_review_with_detail(cx, &view, repo_id, 61, &workdir, "base1", "head1");
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_reviewer_config_for_test("base1", ReviewerConfig::default());
+        });
+    });
+
+    cx.simulate_keystrokes("i");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("q");
+    draw_and_drain_test_window(cx);
+    assert!(
+        cx.update(|_window, app| view.read(app).pending_reviewer_ask.is_some()),
+        "q with no question must leave a pending reviewer ask"
+    );
+
+    // Leave review mode and switch off the Pull requests tab.
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.review = None;
+            let next_state = Arc::new(AppState {
+                repos: vec![opening_repo_state(repo_id, &workdir)],
+                active_repo: Some(repo_id),
+                sidebar_mode: gitcomet_state::model::SidebarMode::Branches,
+                ..AppState::test_default()
+            });
+            push_test_state(this, next_state, cx);
+        });
+    });
+    draw_and_drain_test_window(cx);
+
+    assert!(
+        cx.update(|_window, app| view.read(app).pending_reviewer_ask.is_none()),
+        "leaving the PR tab must drop the pending reviewer ask"
+    );
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
 /// The reviewer menu is wired into the root's capture phase (like the plain
 /// Codex menu and the `?` list), so a key a focused element would otherwise
 /// bind as an action — `escape` in the diff, closing it — can't steal it
@@ -453,38 +721,99 @@ fn escape_closes_the_reviewer_menu_even_with_the_diff_focused(cx: &mut gpui::Tes
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
-/// `.reviewer/` missing (here: no git repository at all) is reported as the
-/// built-in reviewer once the background load settles.
+/// With no GitHub remote there is no trusted commit to read `.reviewer/`
+/// from, so the load settles as `Disabled` (reported in the menu) rather than
+/// `Ready` or "still loading". Called directly: test builds never run the load
+/// in the background.
+#[test]
+fn reviewer_load_without_a_github_remote_is_disabled() {
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_reviewer_menu_builtin",
+        std::process::id()
+    ));
+    let load = crate::view::reviewer_menu::reviewer_load(&workdir, None, "base1");
+    assert!(
+        matches!(load, crate::view::reviewer_menu::ReviewerLoad::Disabled(_)),
+        "no GitHub remote means .reviewer can't be trusted from anywhere"
+    );
+}
+
+/// `enter` on a Brief/Review row must refuse to jump once the row's own
+/// pull request or head no longer matches what's on screen, rather than
+/// landing in whatever review happens to be open (AGENTS.md LOW finding).
+/// Real dispatch never lands `findings` in tests (see the module doc), so
+/// this seeds a finished run directly.
 #[gpui::test]
-fn missing_reviewer_folder_is_reported_as_the_builtin_reviewer(cx: &mut gpui::TestAppContext) {
+fn codex_row_jump_refuses_a_stale_pull_request_or_head(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::super::GitCometView::new(store, events, None, window, cx)
     });
     bind_app_keys_and_global_diff_fallback_for_test(cx);
 
-    let repo_id = RepoId(80131);
+    let repo_id = RepoId(80177);
     let workdir = std::env::temp_dir().join(format!(
-        "gitcomet_ui_test_{}_reviewer_menu_builtin",
+        "gitcomet_ui_test_{}_codex_row_jump",
         std::process::id()
     ));
-    open_review_with_detail(cx, &view, repo_id, 45, &workdir, "base1", "head1");
+    open_review_with_detail(cx, &view, repo_id, 55, &workdir, "base1", "head1");
 
-    cx.simulate_keystrokes("i");
-    wait_until(cx, "the .reviewer load to settle", |cx| {
-        cx.update(|_window, app| view.read(app).reviewer_config_loaded_for_test("base1"))
-    });
+    let finding = crate::reviewer::RuleFinding {
+        path: "a.rs".to_string(),
+        line: 3,
+        side: "RIGHT".to_string(),
+        body: "Mind this.".to_string(),
+    };
+    let pending_jump = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_review()
+                .and_then(|review| review.pending_jump)
+        })
+    };
 
-    // With no GitHub remote configured, this settles as `Disabled` (no
-    // trusted commit to read from) rather than `Ready` — still reported,
-    // never silently mistaken for "still loading".
-    let disabled = cx.update(|_window, app| {
-        matches!(
-            view.read(app).reviewer_config_for_test("base1"),
-            Some(crate::view::reviewer_menu::ReviewerLoad::Disabled(_))
-        )
+    // Dispatched for a different pull request: `enter` refuses, no jump.
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.seed_codex_run_findings_for_test(
+                repo_id,
+                vec![finding.clone()],
+                Some((999, "head1".to_string())),
+                window,
+                cx,
+            );
+        });
     });
-    assert!(disabled, "no GitHub remote means .reviewer can't be trusted from anywhere");
+    draw_and_drain_test_window(cx);
+    cx.update(|window, app| {
+        view.update(app, |this, cx| this.handle_codex_panel_key("enter", window, cx))
+    });
+    draw_and_drain_test_window(cx);
+    assert_eq!(pending_jump(cx), None, "a stale pull request must not jump");
+    let toasts = cx.update(|_window, app| view.read(app).toast_host.read(app).toasts_for_tests(app));
+    assert!(
+        toasts.iter().any(|(_, message)| message.contains("different pull request")),
+        "expected a refusal toast, got {toasts:?}"
+    );
+
+    // The matching pull request and head: `enter` jumps.
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.seed_codex_run_findings_for_test(
+                repo_id,
+                vec![finding],
+                Some((55, "head1".to_string())),
+                window,
+                cx,
+            );
+        });
+    });
+    draw_and_drain_test_window(cx);
+    cx.update(|window, app| {
+        view.update(app, |this, cx| this.handle_codex_panel_key("enter", window, cx))
+    });
+    draw_and_drain_test_window(cx);
+    assert_eq!(pending_jump(cx), Some((crate::github::ReviewSide::Right, 3)));
 
     let _ = std::fs::remove_dir_all(&workdir);
 }

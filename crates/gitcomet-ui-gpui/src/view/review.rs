@@ -205,8 +205,10 @@ mod commit_scope_picker_tests {
 
     #[test]
     fn extending_at_newest_commit_stays_on_the_commit() {
-        let mut picker = CommitScopePicker::default();
-        picker.cursor = 2;
+        let mut picker = CommitScopePicker {
+            cursor: 2,
+            ..Default::default()
+        };
         picker.selection.select(Some(0));
         picker.step(-1, true, 3);
         assert_eq!(picker.cursor, 2);
@@ -614,23 +616,22 @@ impl GitCometView {
         if let Some(review) = self.active_review() {
             if review.only_changed {
                 picker.cursor = 1;
-            } else if let Some(range) = &review.commit_range {
-                if let Some(commits) = self
+            } else if let Some(range) = &review.commit_range
+                && let Some(commits) = self
                     .active_repo_id()
                     .and_then(|repo_id| self.pull_requests.repo(repo_id))
                     .and_then(|prs| prs.detail.ready())
                     .map(|detail| detail.commits.as_slice())
-                {
-                    let newest = commits
-                        .iter()
-                        .position(|commit| commit.oid == range.selection.newest_oid);
-                    let oldest = commits
-                        .iter()
-                        .position(|commit| commit.oid == range.selection.oldest_oid);
-                    if let (Some(newest), Some(oldest)) = (newest, oldest) {
-                        picker.selection.select_range(newest, oldest, commits.len());
-                        picker.cursor = oldest + 2;
-                    }
+            {
+                let newest = commits
+                    .iter()
+                    .position(|commit| commit.oid == range.selection.newest_oid);
+                let oldest = commits
+                    .iter()
+                    .position(|commit| commit.oid == range.selection.oldest_oid);
+                if let (Some(newest), Some(oldest)) = (newest, oldest) {
+                    picker.selection.select_range(newest, oldest, commits.len());
+                    picker.cursor = oldest + 2;
                 }
             }
         }
@@ -1312,6 +1313,11 @@ impl GitCometView {
             review.file_ix = review.file_ix.min(review.files.len().saturating_sub(1));
         }
         review.reopened_for = None;
+        // The range just changed: a run still in flight for the old one must
+        // not land its findings (wrong lines, or `ReviewSuggestions`-routed
+        // findings meant for a different range) once it finishes.
+        review.suggestions.clear();
+        review.suggestion_generation += 1;
         self.store.dispatch(Msg::ClearDiffSelection {
             repo_id: review.repo_id,
         });

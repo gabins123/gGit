@@ -118,9 +118,11 @@ https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/m
 - **Merge** (`Shift+M`, `PopoverKind::MergePullRequest`), following GitHub's rules:
   - Native stack: merging a PR merges it and every unmerged PR below it, bottom-up, in one
     operation, through GitHub's asynchronous stack merge API (poll until it finishes). The dialog
-    lists which PRs merge and which stay open. It refuses, naming the PR, when any PR below isn't
-    approved, has failing checks, or the stack isn't linear. Merge commit, squash and rebase all
-    stay available. Afterwards refresh: GitHub rebases the next PR onto the stack's base.
+    lists which PRs merge and which stay open. It refuses locally, naming the PR, when any PR
+    below isn't approved or has failing checks; a non-linear stack is left to GitHub's own
+    refusal at merge time (`merge_stack`'s `failed` outcome), shown the same way, never
+    re-derived here. Merge commit, squash and rebase all stay available. Afterwards refresh:
+    GitHub rebases the next PR onto the stack's base.
   - Base-branch chain only (no native stack): merge works as today, into the PR's own base. The
     dialog says where that is ("into feat/a, not dev"); for the bottom PR it notes that deleting
     the branch (`Alt+D`) makes GitHub retarget the next PR to the base.
@@ -169,8 +171,9 @@ https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/m
 
 ## Phase 6: reviewer agents
 
-- **.reviewer loader**: read `.reviewer/` from the PR's base commit (`git show <base_oid>:<path>`),
-  never from the PR head. `README.md` is always sent; `checklist.md` is one rule per line;
+- **.reviewer loader**: read `.reviewer/` from where the PR leaves the default branch (the merge
+  base of its base commit and the default branch's tip, `git show <merge_base>:<path>`), never
+  from the PR head. `README.md` is always sent; `checklist.md` is one rule per line;
   `areas/*.md` carry front matter `paths: [globs]` and are sent only when the scope touches a
   matching path; `agents/*.md` carry front matter `title`, `key` (1-9), `scope`
   (`lines|file|commits|pr`), optional `paths`, and their body is the agent's instructions.
@@ -183,7 +186,8 @@ https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/m
   (Lines / File / Commits / Whole PR) starting at what the user is on (selection, else file,
   else thread, else whole PR); `tab` widens it. Chips list the `.reviewer` files that will be sent.
   Actions: `b` brief me (summary, reading order, spots to look at), `e` explain this, `h` thread
-  (summarize, check later commits for a fix, draft a reply), `r` review against the rules
+  (summarize and draft a reply — checking later commits for a fix isn't available yet),
+  `r` review against the rules
   (a verdict per checklist line; findings become the existing Codex suggestions, `a` adopt /
   `x` drop, `view/review.rs:2546`), `t` test gaps, `v` description vs code, `s` draft my review
   summary (fills the Submit dialog like `Alt+G`), `q` ask, `1`-`9` agents from `.reviewer/agents`.

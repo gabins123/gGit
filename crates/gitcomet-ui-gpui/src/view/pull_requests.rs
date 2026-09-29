@@ -758,6 +758,9 @@ impl GitCometView {
         entry.files_seq += 1;
         entry.file_page_count = 0;
         entry.files_error = None;
+        // A leftover reviewer Ask must not fire against the newly selected
+        // pull request.
+        self.clear_pending_reviewer_ask_if_stale();
         // A diff asked for on the previous pull request must not steal focus.
         self.focus_diff_when_open = false;
         let entry = self.pull_requests.repo_mut(repo_id);
