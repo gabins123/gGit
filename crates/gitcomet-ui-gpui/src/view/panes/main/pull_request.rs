@@ -1,5 +1,7 @@
 use super::*;
-use crate::github::{ConversationEntry, PrReviewerStatus, PullRequestDetail, ReviewThread};
+use crate::github::{
+    ConversationEntry, PrReviewerStatus, PullRequestCommit, PullRequestDetail, ReviewThread,
+};
 use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use crate::view::RemoteMarkdownImagePolicy;
 use crate::view::markdown_preview::{
@@ -54,6 +56,26 @@ impl PrMarkdownCache {
     }
 }
 
+/// One synthetic push row for each conversation gap containing commits.
+fn pr_push_counts(commits: &[PullRequestCommit], entries: &[ConversationEntry]) -> Vec<usize> {
+    let mut dates: Vec<&str> = commits
+        .iter()
+        .map(|commit| commit.committed_at.as_str())
+        .collect();
+    dates.sort_unstable();
+    let mut next = 0;
+    let mut counts = Vec::with_capacity(entries.len() + 1);
+    for entry in entries {
+        let start = next;
+        while next < dates.len() && dates[next] <= entry.at.as_str() {
+            next += 1;
+        }
+        counts.push(next - start);
+    }
+    counts.push(dates.len() - next);
+    counts
+}
+
 impl MainPaneView {
     pub(super) fn pull_request_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         let theme = self.theme;
@@ -98,7 +120,14 @@ impl MainPaneView {
         let scroll_key = (detail.number, tab, selection);
         if self.pull_request_scroll_key != Some(scroll_key) {
             let target = match tab {
-                PrContentTab::Conversation => selected_entry.map_or(0, |ix| ix + 2),
+                PrContentTab::Conversation => selected_entry.map_or(0, |ix| {
+                    ix + 2
+                        + pr_push_counts(&detail.commits, &detail.conversation)
+                            .iter()
+                            .take(ix + 1)
+                            .filter(|count| **count > 0)
+                            .count()
+                }),
                 PrContentTab::Comments => selected_thread
                     .and_then(|ix| pr_thread_scroll_index(&threads, show_hidden, ix))
                     .unwrap_or(0),
@@ -306,7 +335,25 @@ impl MainPaneView {
         } else {
             self.pr_markdown(detail.number, PrMarkdownKey::Body, &detail.body, cx)
         });
+        // GitHub gives commit times rather than push times. Group commits by
+        // the conversation gap their commit time falls in.
+        let push_counts = pr_push_counts(&detail.commits, &detail.conversation);
+        let pushed_event = |count: usize| {
+            div()
+                .px_2()
+                .py_2()
+                .text_size(theme.ui_text(12.0))
+                .text_color(theme.colors.foreground.secondary)
+                .child(format!(
+                    "Pushed {} commit{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ))
+        };
         for (ix, entry) in detail.conversation.iter().enumerate() {
+            if push_counts[ix] > 0 {
+                body = body.child(pushed_event(push_counts[ix]));
+            }
             body = body.child(self.pr_conversation_entry(
                 detail.number,
                 ix,
@@ -314,6 +361,9 @@ impl MainPaneView {
                 selected_entry,
                 cx,
             ));
+        }
+        if push_counts[detail.conversation.len()] > 0 {
+            body = body.child(pushed_event(push_counts[detail.conversation.len()]));
         }
         let checks = detail.checks;
         body.child(
@@ -659,6 +709,23 @@ fn pr_markdown_document(source: &str) -> Option<MarkdownPreviewDocument> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pushes_are_grouped_in_conversation_gaps() {
+        let commits = ["1", "2", "3", "5"].map(|at| PullRequestCommit {
+            oid: at.into(),
+            headline: String::new(),
+            committed_at: at.into(),
+        });
+        let entries = ["2", "4"].map(|at| ConversationEntry {
+            id: at.into(),
+            author: String::new(),
+            verb: "commented",
+            at: at.into(),
+            body: String::new(),
+        });
+        assert_eq!(pr_push_counts(&commits, &entries), [2, 1, 1]);
+    }
 
     #[test]
     fn remote_markdown_images_become_url_links() {

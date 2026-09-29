@@ -106,6 +106,8 @@ pub(in super::super) struct DetailsPaneView {
     pub(in super::super) worktree_files_scroll: UniformListScrollHandle,
     pub(in super::super) commit_message_scroll: ScrollHandle,
     pub(in super::super) commit_scroll: ScrollHandle,
+    pr_details_scroll: ScrollHandle,
+    pr_details_scroll_key: Option<(u64, Option<usize>)>,
 
     pub(in super::super) commit_message_input: Entity<components::TextInput>,
     pub(in super::super) commit_details_message_input: Entity<components::TextInput>,
@@ -554,6 +556,8 @@ impl DetailsPaneView {
             worktree_files_scroll: UniformListScrollHandle::default(),
             commit_message_scroll,
             commit_scroll: ScrollHandle::new(),
+            pr_details_scroll: ScrollHandle::new(),
+            pr_details_scroll_key: None,
             commit_message_input,
             commit_details_message_input,
             commit_details_message_link_menu,
@@ -2480,21 +2484,26 @@ impl DetailsPaneView {
             let last_review = {
                 use super::super::pull_requests::PrLoad;
                 use super::super::review::SinceReview;
+                let Some(prs) = root.pull_requests.repo(review.repo_id) else {
+                    return div().into_any_element();
+                };
                 // GitHub text: plain, and only its first few lines.
-                let body = review
+                let body = prs
                     .last_review
                     .ready()
                     .and_then(Option::as_ref)
                     .map(|last| last.body.lines().take(3).collect::<Vec<_>>().join("\n"))
                     .filter(|body| !body.trim().is_empty());
-                let line = match &review.last_review {
+                let line = match &prs.last_review {
                     PrLoad::Idle => None,
                     PrLoad::Loading => Some("Loading your last review…".to_string()),
                     PrLoad::Failed(err) => Some(format!("Couldn't load your last review: {err}")),
                     PrLoad::Ready(None) => {
                         Some("You haven't reviewed this pull request before.".to_string())
                     }
-                    PrLoad::Ready(Some(_)) => review.last_review_line(std::time::SystemTime::now()),
+                    PrLoad::Ready(Some(last)) => {
+                        Some(review.last_review_line(last, std::time::SystemTime::now()))
+                    }
                 };
                 let gone = review.since_review == Some(SinceReview::Gone);
                 (line, body, gone)
@@ -2852,7 +2861,7 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (detail, number, listing, files_error) = {
+        let (detail, number, listing, files_error, commit_selection, last_review) = {
             let root = root.read(cx);
             let Some(prs) = root.active_pull_requests() else {
                 return div().into_any_element();
@@ -2862,6 +2871,8 @@ impl DetailsPaneView {
                 prs.selected.unwrap_or_default(),
                 prs.files_listing(),
                 prs.files_error.clone(),
+                prs.commit_selection,
+                prs.last_review.clone(),
             )
         };
         let detail = match detail {
@@ -2923,6 +2934,7 @@ impl DetailsPaneView {
             .px_3()
             .py_2()
             .overflow_y_scroll()
+            .track_scroll(&self.pr_details_scroll)
             .child(
                 div()
                     .text_size(theme.ui_text(15.0))
@@ -2964,7 +2976,7 @@ impl DetailsPaneView {
                 detail.files.len(),
                 detail.changed_files
             )));
-        } else if let Some(err) = files_error {
+        } else if let Some(ref err) = files_error {
             panel = panel.child(line(format!(
                 "Some files couldn't be listed ({err}). R retries."
             )));
@@ -3002,6 +3014,145 @@ impl DetailsPaneView {
                         .child(format!("{} · {}", reviewer.login, reviewer.status.label())),
                 );
             }
+        }
+        panel = panel.child(
+            div()
+                .pt_2()
+                .text_size(theme.ui_text(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Commits"),
+        );
+        let root_for_all = self.root_view.clone();
+        panel = panel.child(
+            div()
+                .id("pr_all_commits")
+                .px_2()
+                .py_1()
+                .rounded(px(theme.radii.control))
+                .bg(if commit_selection.cursor.is_none() {
+                    theme.colors.interaction.selected_background
+                } else {
+                    theme.colors.surface.panel
+                })
+                .child("All commits")
+                .cursor_pointer()
+                .on_activate(
+                    false,
+                    crate::kit::interaction::ControlActivation::Composite,
+                    cx.listener(move |_this, _: &ClickEvent, window, cx| {
+                        window.focus(&_this.panel_focus_handle, cx);
+                        let root = root_for_all.clone();
+                        cx.defer(move |cx| {
+                            let _ = root.update(cx, |root, cx| {
+                                root.select_pull_request_commit(None, cx);
+                            });
+                        });
+                    }),
+                ),
+        );
+        let reviewed_ix = last_review
+            .ready()
+            .and_then(Option::as_ref)
+            .and_then(|last| {
+                detail
+                    .commits
+                    .iter()
+                    .position(|commit| commit.oid == last.commit_id)
+            });
+        let commits_truncated = detail
+            .commits
+            .first()
+            .is_some_and(|commit| commit.oid != detail.head_oid);
+        if commits_truncated {
+            panel = panel.child(line(
+                "Only the first 250 commits are listed; newer commits are on GitHub.".to_string(),
+            ));
+        }
+        if let Some(last) = last_review.ready().and_then(Option::as_ref)
+            && reviewed_ix.is_none()
+            && !last.commit_id.is_empty()
+        {
+            panel = panel.child(line(
+                if commits_truncated {
+                    "Your last review's commit is outside the first 250 listed commits."
+                } else {
+                    "Your last review's commit is gone."
+                }
+                .to_string(),
+            ));
+        }
+        let selected_range = commit_selection.range(detail.commits.len());
+        let now = std::time::SystemTime::now();
+        for (ix, commit) in detail.commits.iter().enumerate() {
+            let age = commit
+                .committed_at
+                .parse::<jiff::Timestamp>()
+                .ok()
+                .map(|at| super::super::date_time::format_relative_time(at.as_second(), now))
+                .unwrap_or_else(|| "date unknown".to_string());
+            let dot = if reviewed_ix.is_some_and(|reviewed| ix < reviewed) {
+                "● "
+            } else {
+                ""
+            };
+            let short = commit.oid.get(..7).unwrap_or(&commit.oid);
+            let selected = selected_range.is_some_and(|(first, last)| (first..=last).contains(&ix));
+            let root_for_commit = self.root_view.clone();
+            panel = panel.child(
+                div()
+                    .id(SharedString::from(format!("pr_commit_{ix}")))
+                    .px_2()
+                    .py_1()
+                    .rounded(px(theme.radii.control))
+                    .bg(if selected {
+                        theme.colors.interaction.selected_background
+                    } else {
+                        theme.colors.surface.panel
+                    })
+                    .text_size(theme.ui_text(12.0))
+                    .child(format!("{dot}{short}  {} · {age}", commit.headline))
+                    .cursor_pointer()
+                    .on_activate(
+                        false,
+                        crate::kit::interaction::ControlActivation::Composite,
+                        cx.listener(move |_this, _: &ClickEvent, window, cx| {
+                            window.focus(&_this.panel_focus_handle, cx);
+                            let root = root_for_commit.clone();
+                            cx.defer(move |cx| {
+                                let _ = root.update(cx, |root, cx| {
+                                    root.select_pull_request_commit(Some(ix), cx);
+                                });
+                            });
+                        }),
+                    ),
+            );
+            if reviewed_ix == Some(ix) {
+                panel = panel.child(line("Your last review".to_string()));
+            }
+        }
+        let scroll_key = (detail.number, commit_selection.cursor);
+        if self.pr_details_scroll_key != Some(scroll_key) {
+            let target = commit_selection.cursor.map_or(0, |ix| {
+                let checks = detail
+                    .check_runs
+                    .iter()
+                    .filter(|run| run.state != crate::github::CheckState::Passing)
+                    .count();
+                let notices =
+                    usize::from(detail.too_large_for_app())
+                        + usize::from(listing || files_error.is_some())
+                        + usize::from(commits_truncated)
+                        + usize::from(last_review.ready().and_then(Option::as_ref).is_some_and(
+                            |last| reviewed_ix.is_none() && !last.commit_id.is_empty(),
+                        ));
+                8 + checks
+                    + notices
+                    + detail.reviewers.len().max(1)
+                    + ix
+                    + usize::from(reviewed_ix.is_some_and(|reviewed| reviewed < ix))
+            });
+            self.pr_details_scroll.scroll_to_item(target);
+            self.pr_details_scroll_key = Some(scroll_key);
         }
         panel
             .child(line(

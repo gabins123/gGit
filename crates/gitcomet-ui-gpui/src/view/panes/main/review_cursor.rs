@@ -16,10 +16,13 @@ const REVIEW_OUTSIDE_HUNK: &str =
     "GitHub only takes comments on changed lines and the 3 lines around them.";
 const REVIEW_ACROSS_GAP: &str = "A comment's lines have to be one unbroken run of the diff.";
 const REVIEW_SINCE_OLD_SIDE: &str = "Since your last review, the old side is that review's version, not the pull request's base: comment on new lines, or press L for the whole pull request.";
+const REVIEW_RANGE_OLD_SIDE: &str = "The range's old side is not the pull request's base: comment on new lines, or press Shift+C for All changes.";
 const REVIEW_SINCE_OUTSIDE: &str = "GitHub only takes comments inside the pull request's own changes and the 3 lines around them; press L to see them.";
+const REVIEW_RANGE_OUTSIDE: &str = "GitHub only takes comments inside the pull request's own changes and the 3 lines around them; press Shift+C for All changes.";
 const REVIEW_SINCE_LOADING: &str =
     "Still working out which lines of this file the pull request changed.";
 const REVIEW_SINCE_FAILED: &str = "Couldn't work out which lines of this file the pull request changed; press L for the whole pull request.";
+const REVIEW_RANGE_FAILED: &str = "Couldn't work out which lines of this file the pull request changed; press Shift+C for All changes.";
 
 /// The head-side lines of a file that the pull request's own diff covers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +42,11 @@ pub(in crate::view) enum ReviewCommentScope {
     /// The changes since your last review: only head-side lines inside the
     /// pull request's own hunks.
     Since(SinceLines),
+    /// A selected range ending at the current head, limited to the PR's hunks.
+    Range(SinceLines),
+    /// The selected range ends before the PR head, so its lines cannot be
+    /// attached to the pending review's current-head commit.
+    Historical,
 }
 
 /// A comment from `start` to `end` while the diff shows the changes since
@@ -49,21 +57,36 @@ fn since_anchor(
     start: ReviewRow,
     end: ReviewRow,
     lines: &SinceLines,
+    range: bool,
 ) -> Result<ReviewAnchor, &'static str> {
     let ranges = match lines {
         SinceLines::Loading => return Err(REVIEW_SINCE_LOADING),
-        SinceLines::Failed => return Err(REVIEW_SINCE_FAILED),
+        SinceLines::Failed => {
+            return Err(if range {
+                REVIEW_RANGE_FAILED
+            } else {
+                REVIEW_SINCE_FAILED
+            });
+        }
         SinceLines::Ranges(ranges) => ranges,
     };
     let head_line = |row: ReviewRow| match row.side_line() {
         (ReviewSide::Right, line) => Ok(line),
-        (ReviewSide::Left, _) => Err(REVIEW_SINCE_OLD_SIDE),
+        (ReviewSide::Left, _) => Err(if range {
+            REVIEW_RANGE_OLD_SIDE
+        } else {
+            REVIEW_SINCE_OLD_SIDE
+        }),
     };
     let (first, last) = (head_line(start)?, head_line(end)?);
     ranges
         .iter()
         .find(|(lo, hi)| (*lo..=*hi).contains(&first) && (*lo..=*hi).contains(&last))
-        .ok_or(REVIEW_SINCE_OUTSIDE)?;
+        .ok_or(if range {
+            REVIEW_RANGE_OUTSIDE
+        } else {
+            REVIEW_SINCE_OUTSIDE
+        })?;
     Ok(ReviewAnchor {
         path: path.to_owned(),
         side: ReviewSide::Right,
@@ -273,11 +296,23 @@ impl MainPaneView {
     /// within the hunk context of a changed row. A row that is not a line
     /// (hunk or file header) ends the hunk, like the hidden gap it stands for.
     fn review_row_commentable(&self, visible_ix: usize) -> bool {
+        if self.review_comment_scope == ReviewCommentScope::Historical {
+            return false;
+        }
         let Some(row) = self.review_row(visible_ix) else {
             return false;
         };
-        if let ReviewCommentScope::Since(lines) = &self.review_comment_scope {
-            return since_anchor("", row, row, lines).is_ok();
+        if let ReviewCommentScope::Since(lines) | ReviewCommentScope::Range(lines) =
+            &self.review_comment_scope
+        {
+            return since_anchor(
+                "",
+                row,
+                row,
+                lines,
+                matches!(&self.review_comment_scope, ReviewCommentScope::Range(_)),
+            )
+            .is_ok();
         }
         if row.changed {
             return true;
@@ -308,6 +343,11 @@ impl MainPaneView {
         &self,
         path: &str,
     ) -> Result<ReviewAnchor, &'static str> {
+        if self.review_comment_scope == ReviewCommentScope::Historical {
+            return Err(
+                "This range ends before the PR head. Choose a range ending at the current head to add line comments.",
+            );
+        }
         // After a change jump the range is gone, but the anchor is the row it
         // landed on.
         let (lo, hi) = self
@@ -329,8 +369,16 @@ impl MainPaneView {
         if rows().any(|visible_ix| self.review_row(visible_ix).is_none()) {
             return Err(REVIEW_ACROSS_GAP);
         }
-        if let ReviewCommentScope::Since(lines) = &self.review_comment_scope {
-            return since_anchor(path, start_row, end_row, lines);
+        if let ReviewCommentScope::Since(lines) | ReviewCommentScope::Range(lines) =
+            &self.review_comment_scope
+        {
+            return since_anchor(
+                path,
+                start_row,
+                end_row,
+                lines,
+                matches!(&self.review_comment_scope, ReviewCommentScope::Range(_)),
+            );
         }
         // GitHub refuses a range whole if any row of it is outside a hunk.
         if rows().any(|visible_ix| !self.review_row_commentable(visible_ix)) {
@@ -522,17 +570,30 @@ mod tests {
             changed: true,
         };
         let ranges = SinceLines::Ranges(vec![(10, 20), (40, 44)]);
-        let anchor = since_anchor("a.rs", row(None, Some(12)), row(Some(3), Some(15)), &ranges)
-            .expect("inside a hunk");
+        let anchor = since_anchor(
+            "a.rs",
+            row(None, Some(12)),
+            row(Some(3), Some(15)),
+            &ranges,
+            false,
+        )
+        .expect("inside a hunk");
         assert_eq!(
             (anchor.side, anchor.line, anchor.start),
             (ReviewSide::Right, 15, Some((ReviewSide::Right, 12)))
         );
-        let one = since_anchor("a.rs", row(None, Some(44)), row(None, Some(44)), &ranges)
-            .expect("a single line");
+        let one = since_anchor(
+            "a.rs",
+            row(None, Some(44)),
+            row(None, Some(44)),
+            &ranges,
+            false,
+        )
+        .expect("a single line");
         assert_eq!(one.start, None);
-        let err =
-            |start, end, ranges: &SinceLines| since_anchor("a.rs", start, end, ranges).unwrap_err();
+        let err = |start, end, ranges: &SinceLines| {
+            since_anchor("a.rs", start, end, ranges, false).unwrap_err()
+        };
         assert_eq!(
             err(row(None, Some(30)), row(None, Some(30)), &ranges),
             REVIEW_SINCE_OUTSIDE

@@ -829,7 +829,9 @@ impl GitCometView {
     pub(in crate::view) fn is_overlay_open(&self, cx: &App) -> bool {
         // The collapsed-sidebar section popover covers the history view too, so it
         // must suppress ref hovers the same way the popover host does.
-        self.popover_host.read(cx).is_open() || self.sidebar_collapsed_popover.is_some()
+        self.popover_host.read(cx).is_open()
+            || self.sidebar_collapsed_popover.is_some()
+            || self.commit_scope_picker.is_some()
     }
 
     pub(in crate::view) fn show_history_refs_hover(
@@ -1626,6 +1628,7 @@ impl GitCometView {
             focus_prev_render: None,
             armed_branch_key: None,
             review: None,
+            commit_scope_picker: None,
             _focus_lost_subscription: focus_lost_subscription,
             sidebar_width_design: initial_sidebar_width_design,
             details_width_design: initial_details_width_design,

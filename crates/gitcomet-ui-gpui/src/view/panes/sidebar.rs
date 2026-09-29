@@ -3248,7 +3248,7 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (number, title, current, since, counts) = {
+        let (number, title, current, since, range_hidden, counts) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
@@ -3278,7 +3278,37 @@ impl SidebarPaneView {
             self.review_file_counts = file_counts;
             let changed = review.files_changed_since_review();
             let short = |oid: &str| oid.chars().take(7).collect::<String>();
-            let since = if let Some(base) = review.since_base() {
+            let range_hidden = review
+                .commit_range
+                .as_ref()
+                .and_then(|range| range.changes.ready())
+                .map(|changes| {
+                    review
+                        .all_files
+                        .iter()
+                        .filter(|path| !changes.files.contains(*path))
+                        .count()
+                });
+            let since = if let Some(range) = &review.commit_range {
+                Some(match &range.changes {
+                    super::super::pull_requests::PrLoad::Ready(_) => format!(
+                        "{} of {} commits · {}..{}{} · C picks range",
+                        range.selection.count,
+                        range.selection.total,
+                        short(&range.selection.oldest_oid),
+                        short(&range.selection.newest_oid),
+                        if review.historical_range() {
+                            " · line comments read-only"
+                        } else {
+                            ""
+                        }
+                    ),
+                    super::super::pull_requests::PrLoad::Failed(err) => {
+                        format!("Couldn't load selected range: {err} · C picks another")
+                    }
+                    _ => "Loading selected commit range…".to_string(),
+                })
+            } else if let Some(base) = review.since_base() {
                 Some(format!(
                     "Since your last review · {}..{} · L shows all",
                     short(base),
@@ -3305,7 +3335,7 @@ impl SidebarPaneView {
             // Files past the first 100 still coming, and of how many; or the
             // pages that never came.
             let listing = root
-                .pull_request_files_listing(review.repo_id, review.number)
+                .review_files_listing()
                 .then(|| {
                     root.pull_requests
                         .repo(review.repo_id)
@@ -3314,9 +3344,7 @@ impl SidebarPaneView {
                         .map(|detail| detail.changed_files.min(crate::github::MAX_LISTED_FILES))
                 })
                 .flatten();
-            let files_missing = root
-                .pull_request_files_error(review.repo_id, review.number)
-                .is_some();
+            let files_missing = root.review_files_missing();
             let counts = (
                 viewed_all,
                 review.files.len(),
@@ -3331,6 +3359,7 @@ impl SidebarPaneView {
                 review.title.clone(),
                 review.file_ix,
                 since,
+                range_hidden,
                 counts,
             )
         };
@@ -3350,6 +3379,9 @@ impl SidebarPaneView {
             "{listed} file{}",
             if listed == 1 { "" } else { "s" }
         )];
+        if let Some(hidden) = range_hidden {
+            state.push(format!("{hidden} outside range hidden"));
+        }
         if hidden > 0 {
             state.push(format!("{hidden} viewed hidden (V shows)"));
         } else if show_viewed {
@@ -3364,15 +3396,29 @@ impl SidebarPaneView {
             state.push("some files missing · R retries".to_string());
         }
         let state = state.join(" · ");
-        let empty = (listed == 0).then_some(if listing.is_some() && !filtering {
-            "Still listing the pull request's files."
-        } else if hidden > 0 && !filtering {
-            "All files viewed. V shows them."
-        } else if filtering {
-            "No file matches the filter. Esc clears it."
-        } else {
-            "No files to show. L shows all of them."
-        });
+        let empty = (listed == 0).then_some(
+            if since
+                .as_deref()
+                .is_some_and(|line| line.starts_with("Loading selected"))
+            {
+                "Loading the selected commit range…"
+            } else if since
+                .as_deref()
+                .is_some_and(|line| line.starts_with("Couldn't load selected"))
+            {
+                "Couldn't load this range. C picks another scope."
+            } else if range_hidden.is_some() && total == 0 {
+                "No files in this commit range. C picks another scope."
+            } else if listing.is_some() && !filtering {
+                "Still listing the pull request's files."
+            } else if hidden > 0 && !filtering {
+                "All files viewed. V shows them."
+            } else if filtering {
+                "No file matches the filter. Esc clears it."
+            } else {
+                "No files to show. L shows all of them."
+            },
+        );
         let query_bar = (self.review_query_open || filtering).then(|| {
             div()
                 .mx_2()

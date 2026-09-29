@@ -615,6 +615,7 @@ fn review_mode_walks_files_keeps_comments_and_leaves_with_q(cx: &mut gpui::TestA
                     check_runs: vec![],
                     conversation: vec![],
                     reviewers: vec![],
+                    commits: vec![],
                 },
                 "c".repeat(40),
             );
@@ -775,6 +776,23 @@ fn seed_three_file_pull_request(cx: &mut gpui::VisualTestContext, view: &View) {
                     check_runs: vec![],
                     conversation: vec![],
                     reviewers: vec![],
+                    commits: vec![
+                        crate::github::PullRequestCommit {
+                            oid: "a".repeat(40),
+                            headline: "Third".into(),
+                            committed_at: "2026-01-03T00:00:00Z".into(),
+                        },
+                        crate::github::PullRequestCommit {
+                            oid: "d".repeat(40),
+                            headline: "Second".into(),
+                            committed_at: "2026-01-02T00:00:00Z".into(),
+                        },
+                        crate::github::PullRequestCommit {
+                            oid: "e".repeat(40),
+                            headline: "First".into(),
+                            committed_at: "2026-01-01T00:00:00Z".into(),
+                        },
+                    ],
                 },
                 "c".repeat(40),
             );
@@ -849,6 +867,62 @@ fn leaving_review_clears_its_diff_before_history_returns(cx: &mut gpui::TestAppC
 }
 
 #[gpui::test]
+fn review_reopens_its_file_when_the_merge_base_arrives_on_another_tab(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+
+    press(cx, "1 r");
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.pull_requests.repo_mut(REPO).diff_base =
+                crate::view::pull_requests::PrLoad::Loading;
+            this.store
+                .dispatch(Msg::ClearDiffSelection { repo_id: REPO });
+        })
+    });
+    cx.update(|_window, app| {
+        view.read(app).store.dispatch(Msg::SetSidebarMode {
+            mode: gitcomet_state::model::SidebarMode::Files,
+        });
+    });
+    sync_store_snapshot(cx, &view);
+    draw_and_drain_test_window(cx);
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.pull_requests.repo_mut(REPO).diff_base =
+                crate::view::pull_requests::PrLoad::Ready("c".repeat(40));
+        })
+    });
+    sync_store_snapshot(cx, &view);
+    assert!(cx.update(|_window, app| {
+        view.read(app).store.snapshot().repos[0]
+            .diff_state
+            .diff_target
+            .is_none()
+    }));
+
+    press(cx, "1 ]");
+    wait_until(cx, "review diff to reopen", |cx| {
+        sync_store_snapshot(cx, &view);
+        cx.update(|_window, app| {
+            matches!(
+                view.read(app).store.snapshot().repos[0].diff_state.diff_target.as_ref(),
+                Some(DiffTarget::CommitRange {
+                    from_commit_id,
+                    to_commit_id: Some(head),
+                    path: Some(path),
+                }) if from_commit_id.as_ref() == "c".repeat(40)
+                    && head.as_ref() == "a".repeat(40)
+                    && path == Path::new("a.rs")
+            )
+        })
+    });
+}
+
+#[gpui::test]
 fn pull_request_details_keys_keep_the_hidden_diff_closed(cx: &mut gpui::TestAppContext) {
     let _guard = lock_visual_test();
     let (view, cx) = fixture(cx);
@@ -877,6 +951,143 @@ fn pull_request_details_keys_keep_the_hidden_diff_closed(cx: &mut gpui::TestAppC
     }));
     press(cx, "enter");
     assert_eq!(focused(cx, &view), Some(History));
+}
+
+#[gpui::test]
+fn pr_commit_keys_and_picker_apply_scoped_review_diffs(cx: &mut gpui::TestAppContext) {
+    use crate::view::panes::main::ReviewCommentScope;
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    let selection = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, app| {
+            view.read(app)
+                .active_pull_requests()
+                .unwrap()
+                .commit_selection
+                .range(3)
+        })
+    };
+    press(cx, "3 j shift-j");
+    assert_eq!(selection(cx), Some((0, 1)));
+    press(cx, "escape");
+    assert_eq!(selection(cx), None);
+    press(cx, "j j shift-j r");
+    assert!(cx.update(|_, app| {
+        view.read(app)
+            .active_review()
+            .unwrap()
+            .commit_range
+            .is_some()
+    }));
+    cx.update(|_, app| {
+        view.update(app, |this, cx| {
+            this.seed_commit_range_for_test(
+                "f".repeat(40),
+                ["b.rs".to_string(), "old.rs".to_string()].into(),
+                cx,
+            )
+        })
+    });
+    sync_store_snapshot(cx, &view);
+    assert!(cx.update(|_, app| {
+        let root = view.read(app);
+        let review = root.active_review().unwrap();
+        assert_eq!(review.file_ix, 0);
+        assert_eq!(review.files, vec!["b.rs", "old.rs"]);
+        assert_eq!(
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            root.main_pane.read(app).review_comment_scope,
+            ReviewCommentScope::Historical
+        );
+        matches!(root.store.snapshot().repos[0].diff_state.diff_target.as_ref(),
+            Some(DiffTarget::CommitRange { from_commit_id, to_commit_id: Some(head), .. })
+                if from_commit_id.as_ref() == "f".repeat(40) && head.as_ref() == "d".repeat(40))
+    }));
+    press(cx, "1 j");
+    sync_store_snapshot(cx, &view);
+    assert!(cx.update(|_, app| matches!(
+        view.read(app).store.snapshot().repos[0].diff_state.diff_target.as_ref(),
+        Some(DiffTarget::CommitRange { path: Some(path), .. }) if path == Path::new("old.rs")
+    )));
+    cx.update(|window, app| {
+        view.update(app, |root, app| root.focus_panel(Diff, window, app));
+    });
+    assert_eq!(focused(cx, &view), Some(Diff));
+    press(cx, "shift-c");
+    assert!(cx.update(|_, app| {
+        let picker = view.read(app).commit_scope_picker.unwrap();
+        picker.cursor == 4 && picker.selection.range(3) == Some((1, 2))
+    }));
+    press(cx, "enter");
+    assert!(cx.update(|_, app| {
+        let root = view.read(app);
+        let review = root.active_review().unwrap();
+        root.commit_scope_picker.is_none()
+            && review.file_ix == 1
+            && review
+                .commit_range
+                .as_ref()
+                .is_some_and(|range| range.changes.ready().is_some())
+    }));
+    press(cx, "shift-c");
+    press(cx, "shift-k");
+    assert_eq!(
+        cx.update(|_, app| view
+            .read(app)
+            .commit_scope_picker
+            .unwrap()
+            .selection
+            .range(3)),
+        Some((1, 1))
+    );
+    press(cx, "shift-j");
+    assert_eq!(
+        cx.update(|_, app| view
+            .read(app)
+            .commit_scope_picker
+            .unwrap()
+            .selection
+            .range(3)),
+        Some((1, 2))
+    );
+    press(cx, "escape shift-c k k enter");
+    assert!(cx.update(|_, app| {
+        view.read(app)
+            .active_review()
+            .unwrap()
+            .commit_range
+            .is_some()
+    }));
+    cx.update(|_, app| {
+        view.update(app, |this, cx| {
+            this.seed_commit_range_for_test("g".repeat(40), ["a.rs".to_string()].into(), cx)
+        })
+    });
+    assert_eq!(
+        cx.update(|_, app| view
+            .read(app)
+            .main_pane
+            .read(app)
+            .review_comment_scope
+            .clone()),
+        ReviewCommentScope::Range(crate::view::panes::main::SinceLines::Loading)
+    );
+    press(cx, "shift-c escape");
+    assert!(cx.update(|_, app| view.read(app).commit_scope_picker.is_none()));
+    press(cx, "shift-c k k k enter");
+    assert!(cx.update(|_, app| {
+        view.read(app)
+            .active_review()
+            .unwrap()
+            .commit_range
+            .is_none()
+    }));
 }
 
 #[gpui::test]
@@ -960,9 +1171,10 @@ fn shift_l_keeps_the_review_to_files_changed_since_your_last_review(cx: &mut gpu
         })),
     );
     let line = cx.update(|_window, app| {
-        view.read(app)
-            .active_review()
-            .and_then(|review| review.last_review_line(std::time::SystemTime::now()))
+        let root = view.read(app);
+        let review = root.active_review()?;
+        let last = root.active_pull_requests()?.last_review.ready()?.as_ref()?;
+        Some(review.last_review_line(last, std::time::SystemTime::now()))
     });
     assert!(
         line.as_deref().is_some_and(

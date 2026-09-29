@@ -446,6 +446,24 @@ impl GitCometView {
 
     /// The hint bar's keys for `panel`, which differ on the Pull requests tab.
     pub(super) fn key_hints(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if matches!(panel, FocusPanel::Diff | FocusPanel::History)
+            && self
+                .active_review()
+                .is_some_and(super::review::ReviewMode::historical_range)
+        {
+            return &[
+                ("j/k", "line"),
+                ("shift+j/k", "select"),
+                ("c", "comment"),
+                ("a/x", "suggestion"),
+                ("}/{", "change"),
+                ("]/[", "file"),
+                ("space", "viewed"),
+                ("L", "changed since"),
+                ("C", "commits"),
+                ("S", "submit"),
+            ];
+        }
         if self.active_review().is_some() {
             return match panel {
                 FocusPanel::Sidebar => &[
@@ -454,6 +472,7 @@ impl GitCometView {
                     ("/", "filter"),
                     ("V", "show viewed"),
                     ("L", "changed since"),
+                    ("C", "commits"),
                     ("enter", "diff"),
                     ("S", "submit"),
                     ("q", "leave"),
@@ -469,6 +488,7 @@ impl GitCometView {
                     ("]/[", "file"),
                     ("space", "viewed"),
                     ("L", "changed since"),
+                    ("C", "commits"),
                     ("S", "submit"),
                 ],
                 FocusPanel::Details => &[
@@ -477,6 +497,7 @@ impl GitCometView {
                     ("e", "edit"),
                     ("d d", "delete"),
                     ("r", "reply outdated"),
+                    ("C", "commits"),
                     ("S", "submit"),
                 ],
             };
@@ -508,6 +529,9 @@ impl GitCometView {
                 }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
+                        ("j/k", "commit"),
+                        ("J/K", "range"),
+                        ("esc", "all"),
                         ("enter", "read"),
                         ("space", "checkout"),
                         ("r", "review"),
@@ -543,6 +567,28 @@ impl GitCometView {
     }
 
     pub(super) fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if matches!(panel, FocusPanel::Diff | FocusPanel::History)
+            && self
+                .active_review()
+                .is_some_and(super::review::ReviewMode::historical_range)
+        {
+            return &[
+                ("j / k", "Line cursor down / up"),
+                ("shift+j / k", "Select lines from the cursor"),
+                (
+                    "c",
+                    "Line comments require a range ending at the current head",
+                ),
+                ("a / x", "Adopt / drop a Codex suggestion"),
+                ("} / {", "Next / previous change"),
+                ("] / [", "Next / previous file"),
+                ("space", "Mark viewed"),
+                ("L", "Changes since your last review"),
+                ("C", "Pick a commit range"),
+                ("S", "Submit the review"),
+                ("q", "Leave review mode"),
+            ];
+        }
         if self.active_review().is_some() {
             return match panel {
                 FocusPanel::Sidebar => &[
@@ -560,6 +606,10 @@ impl GitCometView {
                         "Filter the file list: fuzzy words, .rs for a type; esc clears",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "C",
+                        "Pick all changes, since last review, or a commit range",
+                    ),
                     ("R", "Retry the files that failed to list"),
                     ("enter", "Go to the diff"),
                     ("S", "Submit the review"),
@@ -590,6 +640,10 @@ impl GitCometView {
                         "Filter the file list: fuzzy words, .rs for a type; esc clears",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "C",
+                        "Pick all changes, since last review, or a commit range",
+                    ),
                     ("esc", "Drop the selection"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
@@ -608,6 +662,10 @@ impl GitCometView {
                         "Changes since your last review (files and diff) / the whole PR",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "C",
+                        "Pick all changes, since last review, or a commit range",
+                    ),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
                 ],
@@ -644,6 +702,9 @@ impl GitCometView {
                 }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
+                        ("j / k", "Next / previous PR commit"),
+                        ("J / K", "Extend the contiguous commit range"),
+                        ("esc", "Select all commits"),
                         ("enter", "Read the pull request in the middle panel"),
                         ("space", "Check it out locally"),
                         ("r", "Review"),
@@ -1270,7 +1331,14 @@ impl GitCometView {
         let in_content = current == Some(FocusPanel::History) && self.pull_request_content_active();
         if shift {
             return match key.to_ascii_lowercase().as_str() {
-                "j" | "k" if in_details => Some(true),
+                "j" | "k" if in_details => {
+                    self.step_pull_request_commit(
+                        if key.eq_ignore_ascii_case("j") { 1 } else { -1 },
+                        true,
+                        cx,
+                    );
+                    Some(true)
+                }
                 "c" | "t" if in_content => Some(true),
                 "v" if in_content => {
                     self.toggle_pull_request_hidden_threads(cx);
@@ -1312,7 +1380,14 @@ impl GitCometView {
             _ => 0,
         };
         match (current, key) {
-            (Some(FocusPanel::Details), _) if direction != 0 && in_details => Some(true),
+            (Some(FocusPanel::Details), _) if direction != 0 && in_details => {
+                self.step_pull_request_commit(direction, false, cx);
+                Some(true)
+            }
+            (Some(FocusPanel::Details), "escape") if in_details => {
+                self.clear_pull_request_commit_selection(cx);
+                Some(true)
+            }
             (Some(FocusPanel::History), "t" | "g" | "m" | "escape") if in_content => Some(true),
             (Some(FocusPanel::History), _) if direction != 0 && in_content => {
                 self.step_pull_request_content(direction, cx);
@@ -1409,6 +1484,9 @@ impl GitCometView {
         }
         if self.keys_help_panel.is_some() {
             return self.handle_keys_help_key(keystroke, window, cx);
+        }
+        if self.commit_scope_picker.is_some() {
+            return self.handle_commit_scope_picker_key(keystroke, cx);
         }
         let mods = keystroke.modifiers;
         if mods.control || mods.alt || mods.platform || mods.function {

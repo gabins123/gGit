@@ -303,6 +303,24 @@ struct RawReview {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RawPullRequestCommit {
+    #[serde(default)]
+    oid: String,
+    #[serde(default)]
+    message_headline: String,
+    #[serde(default)]
+    committed_date: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestCommit {
+    pub(crate) oid: String,
+    pub(crate) headline: String,
+    pub(crate) committed_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawReviewerIdentity {
     #[serde(default)]
     login: Option<String>,
@@ -516,6 +534,8 @@ struct RawDetail {
     review_requests: Vec<RawReviewRequest>,
     #[serde(default)]
     latest_reviews: Vec<RawLatestReview>,
+    #[serde(default)]
+    commits: Vec<RawPullRequestCommit>,
 }
 
 /// Everything the Details panel shows for one pull request.
@@ -548,6 +568,8 @@ pub(crate) struct PullRequestDetail {
     pub(crate) check_runs: Vec<CheckRun>,
     pub(crate) conversation: Vec<ConversationEntry>,
     pub(crate) reviewers: Vec<PrReviewer>,
+    /// GitHub's PR commits, newest first.
+    pub(crate) commits: Vec<PullRequestCommit>,
 }
 
 impl PullRequestDetail {
@@ -612,6 +634,17 @@ impl From<RawDetail> for PullRequestDetail {
             },
             conversation: conversation(raw.comments, raw.reviews),
             reviewers: reviewers(raw.review_requests, raw.latest_reviews),
+            commits: raw
+                .commits
+                .into_iter()
+                .rev()
+                .filter(|commit| is_object_id(&commit.oid))
+                .map(|commit| PullRequestCommit {
+                    oid: commit.oid,
+                    headline: commit.message_headline.chars().take(200).collect(),
+                    committed_at: commit.committed_date,
+                })
+                .collect(),
         }
     }
 }
@@ -1019,7 +1052,7 @@ pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullReques
         "--json=number,title,body,url,author,headRefName,headRefOid,baseRefName,baseRefOid,\
          isDraft,isCrossRepository,state,reviewDecision,mergeable,additions,deletions,\
          changedFiles,files,\
-         statusCheckRollup,comments,reviews,reviewRequests,latestReviews",
+          statusCheckRollup,comments,reviews,reviewRequests,latestReviews,commits",
     ]);
     let raw: RawDetail = parse_json(&run(command, None)?)?;
     Ok(raw.into())
@@ -1952,6 +1985,75 @@ pub(crate) fn changes_since(
     Ok(ChangesSince { files, commits })
 }
 
+/// A contiguous selection of PR commits, from the parent of its oldest
+/// commit through its newest commit. Net changes are limited to GitHub's PR
+/// file list; first-parent non-merge commits also retain reverted paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommitRangeChanges {
+    pub(crate) base_oid: String,
+    pub(crate) files: std::collections::BTreeSet<String>,
+}
+
+pub(crate) fn commit_range_changes(
+    workdir: &Path,
+    remote: &str,
+    oldest_oid: &str,
+    newest_oid: &str,
+    pr_files: &[String],
+) -> Result<CommitRangeChanges, PrError> {
+    if !is_object_id(oldest_oid) || !is_object_id(newest_oid) {
+        return Err(PrError::Failed(
+            "GitHub returned an unexpected commit id".to_string(),
+        ));
+    }
+    fetch_missing(workdir, remote, &[oldest_oid, newest_oid])?;
+    let mut parent = git(workdir);
+    parent.args(["rev-parse", "--verify", &format!("{oldest_oid}^")]);
+    let base_oid = String::from_utf8_lossy(&run_git(parent)?)
+        .trim()
+        .to_string();
+    if !is_object_id(&base_oid) {
+        return Err(PrError::Failed(
+            "Couldn't find the selected commit's parent".to_string(),
+        ));
+    }
+    let mut diff = git(workdir);
+    diff.args([
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "-z",
+        &base_oid,
+        newest_oid,
+        "--",
+    ]);
+    let allowed: std::collections::BTreeSet<&str> = pr_files.iter().map(String::as_str).collect();
+    let mut files: std::collections::BTreeSet<String> = parse_name_list(&run_git(diff)?)
+        .into_iter()
+        .filter(|path| allowed.contains(path.as_str()))
+        .collect();
+    let mut log = git(workdir);
+    log.args([
+        "log",
+        "--first-parent",
+        "--no-merges",
+        "--format=",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        &format!("{base_oid}..{newest_oid}"),
+        "--",
+    ]);
+    files.extend(parse_name_list(&run_git(log)?));
+    if files.len() > MAX_LISTED_FILES as usize {
+        return Err(PrError::Failed(format!(
+            "This commit range changes more than {MAX_LISTED_FILES} files; review it on GitHub."
+        )));
+    }
+    Ok(CommitRangeChanges { base_oid, files })
+}
+
 /// The head-side line ranges (first, last) of `path`'s hunks in the pull
 /// request's own diff, with GitHub's 3 lines of context: the lines GitHub
 /// takes a head-side comment on.
@@ -2318,6 +2420,127 @@ mod tests {
         assert_eq!(
             PrReviewerStatus::ChangesRequested.label(),
             "Changes requested"
+        );
+    }
+
+    #[test]
+    fn detail_json_lists_commits_newest_first() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let json = serde_json::json!({
+            "number": 9, "title": "t", "url": "u", "headRefName": "h", "headRefOid": new,
+            "baseRefName": "b", "baseRefOid": "c",
+            "commits": [
+                {"oid": old, "messageHeadline": "first", "committedDate": "2026-09-01T00:00:00Z"},
+                {"oid": new, "messageHeadline": "second", "committedDate": "2026-09-02T00:00:00Z"},
+                {"oid": "bad", "messageHeadline": "invalid", "committedDate": ""}
+            ]
+        });
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.to_string().as_bytes())
+            .expect("valid detail")
+            .into();
+        assert_eq!(detail.commits.len(), 2);
+        assert_eq!(detail.commits[0].headline, "second");
+        assert_eq!(detail.commits[1].headline, "first");
+    }
+
+    #[test]
+    fn commit_range_starts_at_oldest_parent_and_lists_touched_paths() {
+        let dir = tempfile::tempdir().expect("temporary repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        let commit = |message: &str| {
+            git(&["add", "--all"]);
+            git(&[
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ]);
+            git(&["rev-parse", "HEAD"])
+        };
+        std::fs::write(dir.path().join("a.rs"), "base\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "base\n").unwrap();
+        std::fs::write(dir.path().join("reverted.rs"), "base\n").unwrap();
+        let base = commit("base");
+        std::fs::write(dir.path().join("a.rs"), "oldest\n").unwrap();
+        let oldest = commit("oldest");
+        std::fs::write(dir.path().join("b.rs"), "newest\n").unwrap();
+        commit("middle");
+        std::fs::write(dir.path().join("reverted.rs"), "changed\n").unwrap();
+        commit("change reverted file");
+        std::fs::write(dir.path().join("reverted.rs"), "base\n").unwrap();
+        commit("revert file");
+        git(&["checkout", "-q", "-b", "feature"]);
+        git(&["checkout", "-q", "-b", "upstream", &base]);
+        std::fs::write(dir.path().join("main-only.rs"), "imported\n").unwrap();
+        commit("upstream change");
+        git(&["checkout", "-q", "feature"]);
+        git(&[
+            "-c",
+            "user.name=Tester",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            "merge upstream",
+            "upstream",
+        ]);
+        let newest = git(&["rev-parse", "HEAD"]);
+
+        let files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let range = super::commit_range_changes(dir.path(), "unused", &oldest, &newest, &files)
+            .expect("local range");
+        assert_eq!(range.base_oid, base);
+        assert_eq!(
+            range.files.into_iter().collect::<Vec<_>>(),
+            ["a.rs", "b.rs", "reverted.rs"]
+        );
+        assert!(
+            super::commit_range_changes(dir.path(), "unused", "invalid", &newest, &files).is_err()
+        );
+
+        let remote = tempfile::tempdir().expect("remote");
+        let remote_path = remote.path().to_str().expect("UTF-8 path");
+        git(&["init", "--bare", "-q", remote_path]);
+        git(&["push", "-q", remote_path, "HEAD:refs/heads/main"]);
+        let client = tempfile::tempdir().expect("client");
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(client.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let fetched =
+            super::commit_range_changes(client.path(), remote_path, &oldest, &newest, &files)
+                .expect("fetch missing commits from the remote");
+        assert_eq!(fetched.base_oid, base);
+        assert_eq!(
+            fetched.files.into_iter().collect::<Vec<_>>(),
+            ["a.rs", "b.rs", "reverted.rs"]
         );
     }
 

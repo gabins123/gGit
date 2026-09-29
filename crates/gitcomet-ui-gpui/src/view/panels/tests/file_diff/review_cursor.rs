@@ -134,6 +134,12 @@ index 1111111..2222222 100644
                 (anchor.side, anchor.line, anchor.start),
                 (ReviewSide::Right, 6, None)
             );
+            pane.review_comment_scope = crate::view::panes::main::ReviewCommentScope::Historical;
+            assert!(
+                pane.review_selection_anchor(path)
+                    .unwrap_err()
+                    .contains("current head")
+            );
 
             // t/T: step between thread lines, either side.
             let threads = [(ReviewSide::Right, 9), (ReviewSide::Left, 6)];

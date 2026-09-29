@@ -38,6 +38,70 @@ pub(super) enum PrContentTab {
     Comments,
 }
 
+/// The All commits row is `None`; commit indexes are newest first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PrCommitSelection {
+    pub(super) cursor: Option<usize>,
+    anchor: Option<usize>,
+}
+
+impl PrCommitSelection {
+    pub(super) fn range(self, len: usize) -> Option<(usize, usize)> {
+        let cursor = self.cursor.filter(|ix| *ix < len)?;
+        let anchor = self.anchor.filter(|ix| *ix < len).unwrap_or(cursor);
+        Some((cursor.min(anchor), cursor.max(anchor)))
+    }
+
+    pub(super) fn step(&mut self, direction: i8, extend: bool, len: usize) {
+        let next = match (self.cursor, direction) {
+            (None, 1) if len > 0 => Some(0),
+            (Some(ix), 1) if ix + 1 < len => Some(ix + 1),
+            (Some(0), -1) => extend.then_some(0),
+            (Some(ix), -1) => Some(ix - 1),
+            _ => self.cursor,
+        };
+        if extend && let (Some(cursor), Some(_)) = (self.cursor, next) {
+            self.anchor.get_or_insert(cursor);
+        } else if !extend || next.is_none() {
+            self.anchor = None;
+        }
+        self.cursor = next;
+    }
+
+    pub(super) fn select(&mut self, ix: Option<usize>) {
+        self.cursor = ix;
+        self.anchor = None;
+    }
+
+    pub(super) fn select_range(&mut self, newest: usize, oldest: usize, len: usize) {
+        if newest <= oldest && oldest < len {
+            self.cursor = Some(oldest);
+            self.anchor = Some(newest);
+        }
+    }
+
+    pub(super) fn selected_range(
+        self,
+        commits: &[github::PullRequestCommit],
+    ) -> Option<SelectedCommitRange> {
+        let (newest, oldest) = self.range(commits.len())?;
+        Some(SelectedCommitRange {
+            oldest_oid: commits[oldest].oid.clone(),
+            newest_oid: commits[newest].oid.clone(),
+            count: oldest - newest + 1,
+            total: commits.len(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SelectedCommitRange {
+    pub(super) oldest_oid: String,
+    pub(super) newest_oid: String,
+    pub(super) count: usize,
+    pub(super) total: usize,
+}
+
 #[derive(Default)]
 pub(super) struct RepoPullRequests {
     pub(super) list: PrLoad<Arc<Vec<PullRequestSummary>>>,
@@ -47,15 +111,11 @@ pub(super) struct RepoPullRequests {
     pub(super) content_tab: PrContentTab,
     pub(super) selected_entry: Option<usize>,
     pub(super) selected_thread: Option<usize>,
+    pub(super) commit_selection: PrCommitSelection,
+    pub(super) last_review: PrLoad<Option<github::LastReview>>,
     pub(super) show_hidden_threads: bool,
     /// The selected PR's merge base, once its commits are local.
     pub(super) diff_base: PrLoad<String>,
-    /// Index into the selected PR's files.
-    pub(super) selected_file: Option<usize>,
-    /// Its diff was asked for (enter, a click, review mode), so the commit
-    /// fetch opens it when it lands, or reports why it can't. The fetch
-    /// starts as soon as the details land; asked for or not.
-    pub(super) diff_asked: bool,
     /// Set while a review or create is with gh.
     pub(super) submitting: bool,
     /// gh's refusal of the last review, create or merge, shown in its dialog.
@@ -80,6 +140,7 @@ pub(super) struct RepoPullRequests {
     pub(super) files_error: Option<String>,
     list_seq: u64,
     detail_seq: u64,
+    last_review_seq: u64,
     threads_seq: u64,
     diff_seq: u64,
     files_seq: u64,
@@ -304,7 +365,7 @@ impl PullRequestsState {
         self.repos.get(&repo_id)
     }
 
-    fn repo_mut(&mut self, repo_id: RepoId) -> &mut RepoPullRequests {
+    pub(super) fn repo_mut(&mut self, repo_id: RepoId) -> &mut RepoPullRequests {
         self.repos.entry(repo_id).or_default()
     }
 }
@@ -382,6 +443,14 @@ impl GitCometView {
             return;
         };
         let repo_id = target.repo_id;
+        if self
+            .pull_requests
+            .repo(repo_id)
+            .is_some_and(|prs| matches!(prs.diff_base, PrLoad::Failed(_)))
+        {
+            self.reset_pull_request_diff_base(repo_id);
+            self.fetch_pull_request_commits(repo_id, cx);
+        }
         let entry = self.pull_requests.repo_mut(repo_id);
         // `R` also lists again the files a failed page left out.
         if entry.files_error.is_some() && !entry.files_listing() {
@@ -464,10 +533,12 @@ impl GitCometView {
         entry.content_tab = PrContentTab::Conversation;
         entry.selected_entry = None;
         entry.selected_thread = None;
+        entry.commit_selection = PrCommitSelection::default();
+        entry.last_review = PrLoad::Idle;
+        entry.last_review_seq += 1;
         entry.show_hidden_threads = false;
         entry.diff_base = PrLoad::Idle;
         entry.diff_seq += 1;
-        entry.diff_asked = false;
         // The previous pull request's listing stops where it is.
         entry.files_seq += 1;
         entry.file_page_count = 0;
@@ -475,7 +546,6 @@ impl GitCometView {
         // A diff asked for on the previous pull request must not steal focus.
         self.focus_diff_when_open = false;
         let entry = self.pull_requests.repo_mut(repo_id);
-        entry.selected_file = None;
         entry.submit_error = None;
         // `j`/`k` can pass many pull requests a second, and each load is
         // several GitHub requests: gh runs for the one the selection settles on.
@@ -539,8 +609,15 @@ impl GitCometView {
                             }
                             _ => false,
                         };
+                        let same_commits = entry.detail.ready().is_some_and(|previous| {
+                            previous.number == number && previous.commits == detail.commits
+                        });
                         entry.detail = PrLoad::Ready(Arc::new(detail));
                         entry.selected_entry = None;
+                        if !same_commits {
+                            entry.commit_selection = PrCommitSelection::default();
+                        }
+                        this.load_pull_request_last_review(repo_id, number, cx);
                         this.load_pull_request_threads(repo_id, number, cx);
                         if !carried {
                             this.list_more_pull_request_files(repo_id, cx);
@@ -570,6 +647,52 @@ impl GitCometView {
         })
         .detach();
         self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn load_pull_request_last_review(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.last_review_seq += 1;
+        let seq = entry.last_review_seq;
+        if entry.last_review.ready().is_none() {
+            entry.last_review = PrLoad::Loading;
+        }
+        let task = cx.background_spawn(async move {
+            github::last_review(&target.workdir, &target.slug, number)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let entry = this.pull_requests.repo_mut(repo_id);
+                if entry.last_review_seq != seq || entry.selected != Some(number) {
+                    return;
+                }
+                match result {
+                    Ok(last) => entry.last_review = PrLoad::Ready(last),
+                    Err(_) if entry.last_review.ready().is_some() => {}
+                    Err(err) => entry.last_review = PrLoad::Failed(err),
+                }
+                if this
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.repo_id == repo_id && review.number == number)
+                {
+                    this.review_load_changes_since(cx);
+                }
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
     }
 
     fn load_pull_request_threads(
@@ -751,23 +874,30 @@ impl GitCometView {
             {
                 let fresh: Vec<String> = {
                     let listed: rustc_hash::FxHashSet<&str> =
-                        review.files.iter().map(String::as_str).collect();
+                        review.all_files.iter().map(String::as_str).collect();
                     new.into_iter()
                         .map(|file| file.path)
                         .filter(|path| !listed.contains(path.as_str()))
                         .collect()
                 };
-                review.files.extend(fresh);
+                review.all_files.extend(fresh.iter().cloned());
+                if review.commit_range.is_none() {
+                    review.files.extend(fresh);
+                }
             }
         }
         self.notify_pull_request_panes(cx);
         true
     }
 
-    /// Fetches the PR's commits as soon as its details land, so the diff is
-    /// ready by the time it's asked for. Only a diff someone asked for opens,
-    /// or reports a failure.
-    fn fetch_pull_request_commits(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) {
+    /// Fetches the PR's commits as soon as its details land, so a review diff
+    /// can open immediately. A review waiting for this fetch opens its file
+    /// when the merge base arrives, or reports a failure.
+    pub(super) fn fetch_pull_request_commits(
+        &mut self,
+        repo_id: RepoId,
+        cx: &mut gpui::Context<Self>,
+    ) {
         if cfg!(test) {
             return;
         }
@@ -803,21 +933,22 @@ impl GitCometView {
                 if entry.diff_seq != seq {
                     return;
                 }
-                let asked = entry.diff_asked;
                 match result {
                     Ok(merge_base) => {
                         entry.diff_base = PrLoad::Ready(merge_base);
-                        if asked {
-                            this.show_pull_request_file(repo_id);
+                        if let Some(ix) = this.active_review().and_then(|review| {
+                            (review.repo_id == repo_id
+                                && review.number == number
+                                && review.commit_range.is_none())
+                            .then_some(review.file_ix)
+                        }) {
+                            this.review_open_file(ix, cx);
                         }
                     }
                     Err(err) => {
                         let message = format!("Couldn't load the diff of #{number}: {err}");
                         entry.diff_base = PrLoad::Failed(err);
-                        // Told once: a later retry (a reload) doesn't open it.
-                        entry.diff_asked = false;
-                        if asked {
-                            this.focus_diff_when_open = false;
+                        if this.review_of(repo_id, number).is_some() {
                             this.push_toast(components::ToastKind::Error, message, cx);
                         }
                     }
@@ -866,6 +997,52 @@ impl GitCometView {
         };
         self.pull_requests.repo_mut(repo_id).content_tab = tab;
         self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn step_pull_request_commit(
+        &mut self,
+        direction: i8,
+        extend: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let len = entry
+            .detail
+            .ready()
+            .map_or(0, |detail| detail.commits.len());
+        entry.commit_selection.step(direction, extend, len);
+        self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn clear_pull_request_commit_selection(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        self.pull_requests.repo_mut(repo_id).commit_selection = PrCommitSelection::default();
+        self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn select_pull_request_commit(
+        &mut self,
+        ix: Option<usize>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if ix.is_none_or(|ix| {
+            entry
+                .detail
+                .ready()
+                .is_some_and(|detail| ix < detail.commits.len())
+        }) {
+            entry.commit_selection.select(ix);
+            self.notify_pull_request_panes(cx);
+        }
     }
 
     pub(super) fn select_pull_request_entry(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
@@ -963,93 +1140,6 @@ impl GitCometView {
             .contains(&ix)
             .then(|| prs.threads.ready()?.get(ix).cloned())
             .flatten()
-    }
-
-    /// Shows the selected PR's current file as a merge-base..head range diff.
-    /// Its commits must already be local (`diff_base` ready). Only for the
-    /// active repository: a fetch that lands after a tab switch just waits.
-    fn show_pull_request_file(&mut self, repo_id: RepoId) -> bool {
-        if self.active_repo_id() != Some(repo_id) {
-            return false;
-        }
-        let Some(prs) = self.pull_requests.repo(repo_id) else {
-            return false;
-        };
-        let (Some(detail), Some(merge_base), Some(file_ix)) =
-            (prs.detail.ready(), prs.diff_base.ready(), prs.selected_file)
-        else {
-            return false;
-        };
-        let Some(file) = detail.files.get(file_ix) else {
-            return false;
-        };
-        // Review mode's `L` starts the diff at your last review instead.
-        let from = self
-            .review_diff_base(repo_id, detail.number)
-            .unwrap_or_else(|| merge_base.clone());
-        self.store.dispatch(Msg::SelectDiff {
-            repo_id,
-            target: DiffTarget::CommitRange {
-                from_commit_id: CommitId(from.as_str().into()),
-                to_commit_id: Some(CommitId(detail.head_oid.as_str().into())),
-                path: Some(std::path::PathBuf::from(&file.path)),
-            },
-        });
-        true
-    }
-
-    /// Opens the selected PR's diff at `file_ix` (default: the current or first
-    /// file). The first time, its commits are fetched by id — no ref or file in
-    /// the repository changes — and the diff shows once they arrive. Returns
-    /// whether a diff is on its way.
-    pub(super) fn open_pull_request_diff(
-        &mut self,
-        file_ix: Option<usize>,
-        cx: &mut gpui::Context<Self>,
-    ) -> bool {
-        let Some(target) = self.github_target() else {
-            return false;
-        };
-        let repo_id = target.repo_id;
-        let entry = self.pull_requests.repo_mut(repo_id);
-        let Some(detail) = entry.detail.ready().cloned() else {
-            return false;
-        };
-        if detail.too_large_for_app() {
-            self.push_toast(
-                components::ToastKind::Warning,
-                format!(
-                    "#{} has {} files; GitHub lists only the first {}. Press o to review it on GitHub.",
-                    detail.number,
-                    detail.changed_files,
-                    github::MAX_LISTED_FILES
-                ),
-                cx,
-            );
-            return false;
-        }
-        if detail.files.is_empty() {
-            return false;
-        }
-        let last = detail.files.len() - 1;
-        entry.selected_file = Some(file_ix.or(entry.selected_file).unwrap_or(0).min(last));
-        entry.diff_asked = true;
-        match entry.diff_base {
-            PrLoad::Ready(_) => {
-                self.show_pull_request_file(repo_id);
-                self.notify_pull_request_panes(cx);
-                return true;
-            }
-            // The file just picked opens when the fetch lands.
-            PrLoad::Loading => {
-                self.notify_pull_request_panes(cx);
-                return true;
-            }
-            PrLoad::Idle | PrLoad::Failed(_) => {}
-        }
-        self.fetch_pull_request_commits(repo_id, cx);
-        self.notify_pull_request_panes(cx);
-        true
     }
 
     /// `o` on a branch, as in lazygit: GitHub's page for opening a pull request
@@ -1775,6 +1865,27 @@ impl GitCometView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_selection_is_contiguous_and_escape_can_return_to_all() {
+        let mut selection = PrCommitSelection::default();
+        assert_eq!(selection.range(3), None);
+        selection.step(1, false, 3);
+        assert_eq!(selection.range(3), Some((0, 0)));
+        selection.step(1, true, 3);
+        selection.step(1, true, 3);
+        assert_eq!(selection.range(3), Some((0, 2)));
+        selection.step(-1, true, 3);
+        assert_eq!(selection.range(3), Some((0, 1)));
+        selection.step(-1, false, 3);
+        assert_eq!(selection.range(3), Some((0, 0)));
+        selection.step(-1, true, 3);
+        assert_eq!(selection.range(3), Some((0, 0)));
+        selection.step(-1, false, 3);
+        assert_eq!(selection.range(3), None);
+        selection.select(None);
+        assert_eq!(selection.range(3), None);
+    }
 
     #[test]
     fn the_list_leads_with_reviews_waiting_on_you_then_yours_in_progress() {

@@ -1131,6 +1131,7 @@ pub struct GitCometView {
     pub(super) focus_prev_render: Option<FocusHandle>,
     /// The pull request being reviewed; see `review.rs`.
     pub(super) review: Option<super::review::ReviewMode>,
+    pub(super) commit_scope_picker: Option<super::review::CommitScopePicker>,
     /// A first Shift+D / Shift+M on this branch, waiting for the second.
     pub(super) armed_branch_key: Option<(String, super::branch_sidebar::BranchMenuTarget)>,
     pub(super) _focus_lost_subscription: gpui::Subscription,
