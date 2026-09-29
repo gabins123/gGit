@@ -144,17 +144,18 @@ Re-reviewing works like GitHub's: Your review opens with your last submitted rev
 
 | Action | Key | Where | Notes |
 | --- | --- | --- | --- |
-| Move the line cursor | `j` / `k`, `Down` / `Up` | Diff | The cursor starts on the file's first change. |
-| Select lines | `Shift+J` / `Shift+K`, `Shift+Down` / `Shift+Up` | Diff | Grows a selection from the cursor; a plain move drops it, as does `Escape`. No modes. |
-| Comment | `c` | Diff | On the line or the selected lines. `Ctrl+Enter` adds it to the review; `Escape` closes the box and keeps the text for those lines. GitHub only takes comments on changed lines and the 3 lines around them. |
+| Move the line cursor | `j` / `k`, `Down` / `Up` | Diff | The cursor starts on the file's first change. In the rendered Markdown preview (`Alt+P`), moves by rendered block instead of by line. |
+| Select lines | `Shift+J` / `Shift+K`, `Shift+Down` / `Shift+Up` | Diff | Grows a selection from the cursor; a plain move drops it, as does `Escape`. No modes. Not in the rendered preview. |
+| Comment | `c` | Diff | On the line or the selected lines. `Ctrl+Enter` adds it to the review; `Escape` closes the box and keeps the text for those lines. GitHub only takes comments on changed lines and the 3 lines around them. In the rendered preview, a block has no single line to comment on, so `c` switches to Text instead, with the cursor on the block's first source line. |
 | Suggest a change | `Alt+S` | Comment box | Puts the selected lines in a GitHub suggestion block, after what's typed, to edit into the fix. GitHub then offers to commit it. Not on removed lines. |
 | Next / previous thread | `t` / `Shift+T` | Diff | Threads already on GitHub, marked in blue (your pending comments are amber). Details shows the thread under the cursor. |
 | Reply | `r` | Diff | To the thread on the line under the cursor. The reply waits with the rest of the review and posts right after it. |
 | Codex suggestions | `i` then `p` | Any panel | In review mode, Codex reviews the pull request's patch as suggested line comments, marked in grey; `t` steps to them too and Details shows the one under the cursor. Nothing is posted: `a` adopts it as your pending comment (edit or delete it like any other), `x` drops it. |
-| Next / previous change | `}` / `{` | Diff | |
+| Next / previous change | `}` / `{` | Diff | In the rendered Markdown preview, jumps between changed blocks instead of changed lines. |
 | Next / previous file | `]` / `[` | Any panel | `j` / `k` in the Sidebar too. |
 | Filter the file list | `/` | Sidebar, Diff | A box above the review's file list; typing filters as you go, the same way the Changes list's `/` does: each word matches the path fuzzily, `.rs` or `*.rs` keeps that file type. `Enter` keeps the filter and goes back to the list; `Escape` clears it, from the box or the list. `j` / `k`, `]` / `[` and `Space`'s next unviewed file walk only the files listed. |
 | Show viewed files | `Shift+V` | Any panel | Viewed files are hidden from the file list by default, the open one too (its diff stays up, and `j` / `k` go on from it); the header says how many ("7 viewed hidden (V shows)"). Files changed since you viewed them count as not viewed. `Shift+V` again hides them. |
+| Show generated files | `Shift+G` | Any panel | Files GitHub treats as generated (`linguist-generated`: lockfiles, minified output, or an explicit `.gitattributes` mark) are hidden from the file list by default and don't count toward viewed progress; the header says how many ("2 generated files hidden (Shift+G shows)"). Opening one shows a "Generated file" placeholder instead of its diff; `Enter` loads the diff anyway. `Shift+G` again hides them. |
 | Retry missing files | `Shift+R` | Any panel | A pull request over 100 files lists the rest in the background (the file list's header says "listing N of M…"); when some fail to list, it says "some files missing · R retries". |
 | Mark the file viewed | `Space` | Diff, Sidebar | On GitHub too. Then goes to the next file not yet viewed. `Space` again unmarks it. |
 | Changes since your last review | `Shift+L` | Any panel | GitHub's "Changes since your last review": the file list keeps to the files changed since your last submitted review, and the diff runs from that review's commit to the head (the header says which). `j` / `k`, `]` / `[` and `Space`'s next unviewed file keep to those files. GitHub only takes comments on the pull request's own changes, so here `c` takes new-side lines inside them (and the 3 lines around) and refuses old-side lines; only new-side thread and suggestion marks show. `Shift+L` again is the whole pull request. Not offered if you never reviewed it, nothing changed, or that review's commit is gone (force-pushed away). |
@@ -272,10 +273,13 @@ These shortcuts apply in the main diff panel, including conflict resolution view
 | Previous change | `F2`, `Shift-F7`, `Option-Up` | `F2`, `Shift-F7`, `Alt-Up` | Moves one change block (a run of consecutive changed lines) at a time, landing on its first line, in Full, Collapsed, and whole-commit diffs alike. The conflict resolver moves by conflict instead. |
 | Next change | `F3`, `F7`, `Option-Down` | `F3`, `F7`, `Alt-Down` | Same unit as Previous change. With nothing selected, goes to the first change block. |
 | Switch to inline diff | `Option-I` | `Alt-I` | Raw file diff only. Conflict resolver keeps split layout. |
+| Toggle Preview / Text (or Image / Code) | `Option-P` | `Alt-P` | Wherever the switch shows: a file preview, a Full-mode file diff, and commit-range diffs (review mode and the pull request "enter" diff included). Not while a text field has focus. |
 | Enter or leave the file editor | `Option-E` | `Alt-E` | Not while a text field has focus. Escape also leaves the editor. |
 | Save the edited file | `Cmd-S` | `Ctrl-S` | Only while the editor's buffer has focus; outside it the same chord stages the file. |
 | Switch to split diff | `Option-S` | `Alt-S` | Raw file diff only. |
 | Toggle whitespace characters | `Option-W` | `Alt-W` | Text diff / conflict diff only. |
+| Cycle image diff mode (Side by side / Swipe / Onion skin) | `Option-V` | `Alt-V` | Wherever an image diff shows: working tree, commit, commit-range/PR diffs, and review mode. Not while a text field has focus. |
+| Move the Swipe divider, or step the Onion skin opacity by 10% | `,` / `.` | `,` / `.` | Only while an image diff is shown and in Swipe or Onion skin mode; not while a text field has focus. No effect in Side by side. |
 | Stage or unstage the current working-tree file and advance to the adjacent file | `Space` | `Space` | Raw working-tree file diff only, and not while the diff search input has focus. |
 | Select all diff text | `Cmd-A` | `Ctrl-A` | File preview and text-selection flows. |
 | Copy selected diff text | `Cmd-C` | `Ctrl-C` | File preview and text-selection flows. |

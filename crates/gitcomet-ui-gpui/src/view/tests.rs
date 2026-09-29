@@ -2692,6 +2692,29 @@ fn diff_target_rendered_preview_kind_reads_diff_target_paths() {
         diff_target_rendered_preview_kind(Some(&no_path_target)),
         None
     );
+
+    // A commit range is how review mode, a commit-range Details scope, and
+    // the pull request "enter" diff all show a file's diff, so it gets the
+    // same Preview / Text switch as a single commit's diff.
+    let range_target = DiffTarget::CommitRange {
+        from_commit_id: CommitId("deadbeef".into()),
+        to_commit_id: Some(CommitId("f00dcafe".into())),
+        path: Some(PathBuf::from("README.md")),
+    };
+    assert_eq!(
+        diff_target_rendered_preview_kind(Some(&range_target)),
+        Some(RenderedPreviewKind::Markdown)
+    );
+
+    let range_no_path_target = DiffTarget::CommitRange {
+        from_commit_id: CommitId("deadbeef".into()),
+        to_commit_id: None,
+        path: None,
+    };
+    assert_eq!(
+        diff_target_rendered_preview_kind(Some(&range_no_path_target)),
+        None
+    );
 }
 
 #[test]

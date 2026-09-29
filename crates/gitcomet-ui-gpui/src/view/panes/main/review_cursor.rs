@@ -282,6 +282,112 @@ impl MainPaneView {
         self.review_set_cursor(anchor, target, gpui::ScrollStrategy::Nearest, cx)
     }
 
+    /// Stops for `j`/`k` in the rendered preview: one per flowing block (a
+    /// band in Split, which unifies both sides into one aligned row space),
+    /// rather than one per diff line.
+    fn markdown_preview_block_visible_indices(&self) -> Vec<usize> {
+        if self.is_file_preview_active() {
+            let Loadable::Ready(doc) = &self.worktree_markdown.document else {
+                return Vec::new();
+            };
+            return crate::view::markdown_preview::markdown_document_blocks(doc)
+                .iter()
+                .map(|block| block.row_range().start)
+                .collect();
+        }
+        let Loadable::Ready(preview) = &self.diff_markdown.preview else {
+            return Vec::new();
+        };
+        match self.diff_view {
+            DiffViewMode::Inline => preview
+                .inline_blocks
+                .iter()
+                .map(|block| block.row_range().start)
+                .collect(),
+            DiffViewMode::Split => preview.bands.iter().map(|band| band.rows.start).collect(),
+        }
+    }
+
+    /// `j`/`k` in the rendered preview: moves the cursor to the next or
+    /// previous block's first row, rather than by diff line — a rendered row
+    /// has no line of its own to step to.
+    pub(in crate::view) fn review_move_markdown_block_cursor(
+        &mut self,
+        delta: i32,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let entries = self.markdown_preview_block_visible_indices();
+        if entries.is_empty() {
+            return false;
+        }
+        if self.review_head().is_none() {
+            let target = entries[0];
+            return self.review_set_cursor(target, target, gpui::ScrollStrategy::Nearest, cx);
+        }
+        let target = if delta < 0 {
+            self.diff_nav_prev_target_ix(&entries)
+        } else {
+            self.diff_nav_next_target_ix(&entries)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.review_set_cursor(target, target, gpui::ScrollStrategy::Nearest, cx)
+    }
+
+    /// The text diff's (side, 1-based line) that the rendered-preview cursor's
+    /// block corresponds to, for `c`'s switch back to Text. `None` when
+    /// nothing is under the cursor, or its row stands for no source line (a
+    /// diff's alignment spacer).
+    pub(in crate::view) fn markdown_preview_cursor_source_line(
+        &self,
+    ) -> Option<(ReviewSide, u32)> {
+        let row_ix = self.review_head()?;
+        if self.is_file_preview_active() {
+            let Loadable::Ready(doc) = &self.worktree_markdown.document else {
+                return None;
+            };
+            let row = doc.rows.get(row_ix)?;
+            let line = u32::try_from(row.source_line_range.start).ok()? + 1;
+            return Some((ReviewSide::Right, line));
+        }
+        let Loadable::Ready(preview) = &self.diff_markdown.preview else {
+            return None;
+        };
+        match self.diff_view {
+            DiffViewMode::Inline => {
+                let row = preview.inline.rows.get(row_ix)?;
+                if row.source_line_range.is_empty() {
+                    return None;
+                }
+                let line = u32::try_from(row.source_line_range.start).ok()? + 1;
+                let old = preview.inline_old.get(row_ix).copied().unwrap_or(false);
+                Some((
+                    if old { ReviewSide::Left } else { ReviewSide::Right },
+                    line,
+                ))
+            }
+            DiffViewMode::Split => {
+                if let Some(row) = preview
+                    .new
+                    .rows
+                    .get(row_ix)
+                    .filter(|row| !row.is_alignment_padding())
+                {
+                    let line = u32::try_from(row.source_line_range.start).ok()? + 1;
+                    return Some((ReviewSide::Right, line));
+                }
+                let row = preview
+                    .old
+                    .rows
+                    .get(row_ix)
+                    .filter(|row| !row.is_alignment_padding())?;
+                let line = u32::try_from(row.source_line_range.start).ok()? + 1;
+                Some((ReviewSide::Left, line))
+            }
+        }
+    }
+
     pub(in crate::view) fn review_collapse_selection(
         &mut self,
         cx: &mut gpui::Context<Self>,
@@ -476,13 +582,26 @@ impl MainPaneView {
     }
 
     /// Whether GitHub would take a comment on the line under the cursor.
+    ///
+    /// `false` in the rendered preview: `review_head()` there is a markdown
+    /// row index, not a text-diff row index, and the two spaces only agree by
+    /// coincidence.
     pub(in crate::view) fn review_cursor_commentable(&self) -> bool {
-        self.review_head()
-            .is_some_and(|head| self.review_row_commentable(head))
+        !self.is_markdown_preview_active()
+            && self
+                .review_head()
+                .is_some_and(|head| self.review_row_commentable(head))
     }
 
-    /// The row under the cursor.
+    /// The text-diff row under the cursor. `None` in the rendered preview,
+    /// for the same reason as [`Self::review_cursor_commentable`]: reading a
+    /// markdown row index as a text-diff row index would answer for whatever
+    /// row happens to share that number, not the block actually under the
+    /// cursor.
     pub(in crate::view) fn review_cursor_row(&self) -> Option<ReviewRow> {
+        if self.is_markdown_preview_active() {
+            return None;
+        }
         self.review_row(self.review_head()?)
     }
 
@@ -495,6 +614,12 @@ impl MainPaneView {
         direction: i8,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
+        // The rendered preview's cursor is a markdown row index, not a
+        // text-diff row index; `review.rs` keeps `t`/`T` from reaching this
+        // while it's active, but stay safe if that ever changes.
+        if self.is_markdown_preview_active() {
+            return false;
+        }
         let head = self.review_head();
         let hits: Vec<usize> = self
             .review_rows()

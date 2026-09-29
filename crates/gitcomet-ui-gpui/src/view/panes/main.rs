@@ -127,8 +127,23 @@ impl Render for MainPaneView {
         if self.annotate_enabled && show_diff && !show_pull_request {
             self.request_blame_for_current_target(false, cx);
         }
+        // A generated file (GitHub's `linguist-generated`, e.g. a lockfile)
+        // shows a placeholder instead of its diff until `enter` dismisses it
+        // for the rest of the review — usually uninteresting, and sometimes
+        // large. Not gated on `show_diff`: its diff is deliberately never
+        // requested while the placeholder is up (`review_open_file`), so
+        // `diff_target` may be unset or still pointing at a previous file.
+        let show_generated_placeholder =
+            !show_pull_request && self.review_active && self.review_generated_placeholder;
         let inner = if show_pull_request {
             self.pull_request_view(cx)
+        } else if show_generated_placeholder {
+            components::empty_state(
+                self.theme,
+                "Generated file",
+                "GitHub hides generated files like this one by default. Press enter to load its diff.",
+            )
+            .into_any_element()
         } else if show_diff {
             self.diff_view(window, cx).into_any_element()
         } else if in_rebase {

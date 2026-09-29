@@ -502,6 +502,41 @@ impl RenderedPreviewModes {
     }
 }
 
+/// How the image diff (`view/panels/main/diff.rs`) compares the old and new
+/// pictures. Sticky across files, like [`DiffViewMode`]; `Alt+V` cycles it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ImageDiffMode {
+    /// Old and new side by side, each in its own column. The default.
+    #[default]
+    SideBySide,
+    /// Old and new overlaid, split by a vertical divider: old left of it, new
+    /// right of it. `,`/`.` move the divider.
+    Swipe,
+    /// New drawn over old at an adjustable opacity. `,`/`.` step the opacity.
+    OnionSkin,
+}
+
+impl ImageDiffMode {
+    pub(super) const fn next(self) -> Self {
+        match self {
+            Self::SideBySide => Self::Swipe,
+            Self::Swipe => Self::OnionSkin,
+            Self::OnionSkin => Self::SideBySide,
+        }
+    }
+}
+
+/// One side's pixel and file size, for the "64 × 64 px · 2.1 KB" caption next
+/// to an image diff's A/B header.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ImageDiffSideInfo {
+    /// `None` when the format's intrinsic size could not be read (an SVG with
+    /// a missing/invalid size, or a raster header that failed to parse); the
+    /// caption then falls back to just the file size.
+    pub(super) pixel_size: Option<(u32, u32)>,
+    pub(super) byte_len: usize,
+}
+
 /// Preview mode for the conflict resolver merge-input pane.
 ///
 /// When the conflicted file supports a rendered preview (for example, SVG or
@@ -543,6 +578,9 @@ pub(super) fn diff_target_rendered_preview_kind(
     let path = match target? {
         DiffTarget::WorkingTree { path, .. } => path.as_path(),
         DiffTarget::Commit {
+            path: Some(path), ..
+        } => path.as_path(),
+        DiffTarget::CommitRange {
             path: Some(path), ..
         } => path.as_path(),
         _ => return None,

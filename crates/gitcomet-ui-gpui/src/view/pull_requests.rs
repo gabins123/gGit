@@ -137,6 +137,10 @@ pub(super) struct RepoPullRequests {
     pub(super) show_hidden_threads: bool,
     /// The selected PR's merge base, once its commits are local.
     pub(super) diff_base: PrLoad<String>,
+    /// Which of the selected PR's files GitHub would treat as generated
+    /// (`linguist-generated`), read from `.gitattributes` at the PR's head
+    /// commit once it's fetched locally (right after `diff_base` lands).
+    pub(super) generated_files: PrLoad<Arc<std::collections::BTreeSet<String>>>,
     /// Set while a review or create is with gh.
     pub(super) submitting: bool,
     /// gh's refusal of the last review, create or merge, shown in its dialog.
@@ -165,6 +169,7 @@ pub(super) struct RepoPullRequests {
     threads_seq: u64,
     diff_seq: u64,
     files_seq: u64,
+    generated_files_seq: u64,
 }
 
 impl RepoPullRequests {
@@ -744,6 +749,11 @@ impl GitCometView {
         entry.show_hidden_threads = false;
         entry.diff_base = PrLoad::Idle;
         entry.diff_seq += 1;
+        // A previous pull request's generated-file set is that pull
+        // request's, at that head; the new selection starts unknown, and the
+        // seq bump drops a result still landing for it.
+        entry.generated_files = PrLoad::Idle;
+        entry.generated_files_seq += 1;
         // The previous pull request's listing stops where it is.
         entry.files_seq += 1;
         entry.file_page_count = 0;
@@ -1061,6 +1071,7 @@ impl GitCometView {
         let PrLoad::Ready(detail) = &mut entry.detail else {
             return false;
         };
+        let mut classify_new_files = false;
         if !arrived.is_empty() {
             let detail = Arc::make_mut(detail);
             let mut known: rustc_hash::FxHashSet<String> =
@@ -1069,6 +1080,7 @@ impl GitCometView {
                 .into_iter()
                 .filter(|file| known.insert(file.path.clone()))
                 .collect();
+            classify_new_files = !new.is_empty();
             detail.files.extend(new.iter().cloned());
             // Review mode lists the same files in the same order; checked
             // against its own list, which a reload at a new head doesn't reset.
@@ -1090,6 +1102,16 @@ impl GitCometView {
                     review.files.extend(fresh);
                 }
             }
+        }
+        if classify_new_files {
+            // A page landing after the merge base's own detection pass ran
+            // means those files never got checked for `linguist-generated`;
+            // redo the (cheap, local, gix-only) detection over the full list.
+            let entry = self.pull_requests.repo_mut(repo_id);
+            if !matches!(entry.generated_files, PrLoad::Idle | PrLoad::Loading) {
+                entry.generated_files = PrLoad::Idle;
+            }
+            self.fetch_pull_request_generated_files(repo_id, cx);
         }
         self.notify_pull_request_panes(cx);
         true
@@ -1149,6 +1171,10 @@ impl GitCometView {
                         }) {
                             this.review_open_file(ix, cx);
                         }
+                        // The head commit is fetched locally now, so gix can
+                        // read its tree (and `.gitattributes`) without a
+                        // network call.
+                        this.fetch_pull_request_generated_files(repo_id, cx);
                     }
                     Err(err) => {
                         let message = format!("Couldn't load the diff of #{number}: {err}");
@@ -1158,6 +1184,73 @@ impl GitCometView {
                         }
                     }
                 }
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches which of the selected PR's files GitHub would treat as
+    /// generated (`linguist-generated`), read from `.gitattributes` at the
+    /// PR's head commit — a gix-only read of the commit's own tree, never the
+    /// working tree. Cosmetic-only (hiding/marking generated files in the
+    /// review file list, and the Details size line): a failure just leaves
+    /// every file shown as not generated, with no toast.
+    pub(super) fn fetch_pull_request_generated_files(
+        &mut self,
+        repo_id: RepoId,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if !matches!(entry.generated_files, PrLoad::Idle | PrLoad::Failed(_)) {
+            return;
+        }
+        let Some(detail) = entry.detail.ready().cloned() else {
+            return;
+        };
+        entry.generated_files = PrLoad::Loading;
+        entry.generated_files_seq += 1;
+        let seq = entry.generated_files_seq;
+        let number = detail.number;
+        let head_oid = detail.head_oid.clone();
+        let paths: Vec<std::path::PathBuf> = detail
+            .files
+            .iter()
+            .map(|file| std::path::PathBuf::from(&file.path))
+            .collect();
+        // The same backend the store opens every other repository with (a
+        // test run's fake backend included) — never a concrete backend
+        // hardcoded here, which would bypass whatever the app was actually
+        // configured with.
+        let backend = self.store.backend();
+        let task = cx.background_spawn(async move {
+            let repo = backend.open(&target.workdir).map_err(|err| err.to_string())?;
+            let commit_id = gitcomet_core::domain::CommitId(head_oid.into());
+            let generated = repo
+                .generated_file_paths_at_commit(&commit_id, &paths)
+                .map_err(|err| err.to_string())?;
+            Ok::<_, String>(
+                generated
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<std::collections::BTreeSet<String>>(),
+            )
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let entry = this.pull_requests.repo_mut(repo_id);
+                if entry.generated_files_seq != seq {
+                    return;
+                }
+                entry.generated_files = match result {
+                    Ok(generated) => PrLoad::Ready(Arc::new(generated)),
+                    Err(_) => PrLoad::Idle,
+                };
+                this.review_sync_generated_files(repo_id, number, cx);
                 this.notify_pull_request_panes(cx);
             });
         })
@@ -2105,6 +2198,13 @@ impl GitCometView {
         if !matches!(entry.diff_base, PrLoad::Idle) {
             entry.diff_base = PrLoad::Idle;
             entry.diff_seq += 1;
+        }
+        // The moved head's tree may set `.gitattributes` differently (or the
+        // file list itself has changed); re-read generated status at the new
+        // head rather than keep the old one's answer.
+        if !matches!(entry.generated_files, PrLoad::Idle) {
+            entry.generated_files = PrLoad::Idle;
+            entry.generated_files_seq += 1;
         }
     }
 

@@ -3331,10 +3331,11 @@ impl SidebarPaneView {
             } else {
                 None
             };
+            // Generated files don't count toward viewed progress, shown or not.
             let viewed_all = review
                 .files
                 .iter()
-                .filter(|path| review.draft.viewed.contains(*path))
+                .filter(|path| !review.is_generated(path) && review.draft.viewed.contains(*path))
                 .count();
             // Files past the first 100 still coming, and of how many; or the
             // pages that never came.
@@ -3351,9 +3352,11 @@ impl SidebarPaneView {
             let files_missing = root.review_files_missing();
             let counts = (
                 viewed_all,
-                review.files.len(),
+                review.non_generated_file_count(),
                 review.viewed_hidden(),
                 review.show_viewed,
+                review.generated_hidden(),
+                review.show_generated,
                 !review.query.is_empty(),
                 listing,
                 files_missing,
@@ -3368,7 +3371,17 @@ impl SidebarPaneView {
                 stacked_on,
             )
         };
-        let (viewed, total, hidden, show_viewed, filtering, listing, files_missing) = counts;
+        let (
+            viewed,
+            total,
+            hidden,
+            show_viewed,
+            generated_hidden,
+            show_generated,
+            filtering,
+            listing,
+            files_missing,
+        ) = counts;
         let listed = self.review_rows.len();
         // Keep the open file in view as j/k, ]/[ and space move it.
         if self.review_scrolled_to != Some(current)
@@ -3391,6 +3404,14 @@ impl SidebarPaneView {
             state.push(format!("{hidden} viewed hidden (V shows)"));
         } else if show_viewed {
             state.push("viewed shown (V hides)".to_string());
+        }
+        if generated_hidden > 0 {
+            state.push(format!(
+                "{generated_hidden} generated file{} hidden (Shift+G shows)",
+                if generated_hidden == 1 { "" } else { "s" }
+            ));
+        } else if show_generated {
+            state.push("generated files shown (Shift+G hides)".to_string());
         }
         if filtering {
             state.push(format!("/ {}", query_text.trim()));
@@ -3554,6 +3575,7 @@ impl SidebarPaneView {
                         review.draft.viewed.contains(&path),
                         review.changed_since_review(&path),
                         review.dismissed.contains(&path),
+                        review.is_generated(&path),
                         counts,
                         path,
                         ix == review.file_ix,
@@ -3563,7 +3585,7 @@ impl SidebarPaneView {
         };
         rows.into_iter()
             .map(
-                |(ix, is_viewed, updated, dismissed, counts, path, is_current)| {
+                |(ix, is_viewed, updated, dismissed, is_generated, counts, path, is_current)| {
                     let name = path
                         .rsplit_once('/')
                         .map_or(path.as_str(), |(_, name)| name)
@@ -3643,6 +3665,15 @@ impl SidebarPaneView {
                                     )
                                 }),
                         )
+                        .when(is_generated, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(secondary)
+                                    .child("generated"),
+                            )
+                        })
                         .when(updated, |row| {
                             row.child(
                                 div()

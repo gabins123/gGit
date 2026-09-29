@@ -24,6 +24,160 @@ const IMAGE_PREVIEW_CELL_PADDING_PX: f32 = 16.0;
 /// so the document does not start and end flush against the pane edges.
 pub(in crate::view) const MARKDOWN_PREVIEW_DOCUMENT_EDGE_GAP_PX: f32 = 12.0;
 
+fn format_image_diff_bytes(n: usize) -> String {
+    match n {
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.0),
+        n => format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// "64 × 64 px · 2.1 KB", or just the size when the pixel dimensions could
+/// not be read.
+fn image_diff_size_caption(info: ImageDiffSideInfo) -> String {
+    let size = format_image_diff_bytes(info.byte_len);
+    match info.pixel_size {
+        Some((width, height)) => format!("{width} × {height} px · {size}"),
+        None => size,
+    }
+}
+
+/// A column header label with its size caption appended, or the plain label
+/// when that side has no image (an added or deleted file shows only the
+/// present side's size, never a blank line for the missing one).
+fn image_diff_column_label(label: &'static str, info: Option<ImageDiffSideInfo>) -> String {
+    match info {
+        Some(info) => format!("{label} · {}", image_diff_size_caption(info)),
+        None => label.to_string(),
+    }
+}
+
+/// Paints one image, fitted (object-fit: contain) into whatever bounds the
+/// canvas element is laid out at.
+fn single_image_canvas(
+    image: Option<(Arc<gpui::RenderImage>, usize)>,
+    scale_down: bool,
+) -> gpui::Canvas<()> {
+    gpui::canvas(
+        |_bounds, _window, _cx| {},
+        move |bounds, (), window, _cx| {
+            let Some((image, frame_index)) = image.clone() else {
+                return;
+            };
+            let frame_index = frame_index.min(image.frame_count().saturating_sub(1));
+            let image_bounds = preview_render_image_bounds(
+                bounds,
+                image.size(frame_index),
+                window.scale_factor(),
+                scale_down,
+            );
+            let _ = window.paint_image(
+                bounds,
+                image_bounds,
+                gpui::Corners::default(),
+                image,
+                frame_index,
+                false,
+            );
+        },
+    )
+}
+
+/// Old and new overlaid, split by a vertical divider: old left of it, new
+/// right. Both sides are fitted independently to the full container (like
+/// Side by side's cells would be), so the crop stays aligned with what the
+/// divider promises even when the two images differ in native size.
+fn render_image_diff_swipe(
+    theme: AppTheme,
+    old: Option<(Arc<gpui::RenderImage>, usize)>,
+    new: Option<(Arc<gpui::RenderImage>, usize)>,
+    position: f32,
+    scale_down: bool,
+) -> AnyElement {
+    let position = position.clamp(0.0, 1.0);
+    let divider_color = theme.colors.stroke.default;
+    div()
+        .id("diff_image_swipe")
+        .debug_selector(|| "diff_image_swipe".to_string())
+        .relative()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .h_full()
+        .child(single_image_canvas(new, scale_down).absolute().inset_0())
+        .child(
+            gpui::canvas(
+                |_bounds, _window, _cx| {},
+                move |bounds, (), window, _cx| {
+                    let Some((image, frame_index)) = old.clone() else {
+                        return;
+                    };
+                    let frame_index = frame_index.min(image.frame_count().saturating_sub(1));
+                    let image_bounds = preview_render_image_bounds(
+                        bounds,
+                        image.size(frame_index),
+                        window.scale_factor(),
+                        scale_down,
+                    );
+                    // `paint_image`'s first argument is the clip rect (the
+                    // visible region is `bounds.intersect(&image_bounds)`),
+                    // so cropping to the divider's left side needs no content
+                    // mask: a narrower `bounds` here does it directly.
+                    let clip = gpui::Bounds {
+                        origin: bounds.origin,
+                        size: gpui::size(bounds.size.width * position, bounds.size.height),
+                    };
+                    let _ = window.paint_image(
+                        clip,
+                        image_bounds,
+                        gpui::Corners::default(),
+                        image,
+                        frame_index,
+                        false,
+                    );
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left(gpui::relative(position))
+                .w(px(1.0))
+                .h_full()
+                .bg(divider_color),
+        )
+        .into_any_element()
+}
+
+/// New drawn over old at an adjustable opacity.
+fn render_image_diff_onion(
+    old: Option<(Arc<gpui::RenderImage>, usize)>,
+    new: Option<(Arc<gpui::RenderImage>, usize)>,
+    opacity: f32,
+    scale_down: bool,
+) -> AnyElement {
+    let opacity = opacity.clamp(0.0, 1.0);
+    div()
+        .id("diff_image_onion")
+        .debug_selector(|| "diff_image_onion".to_string())
+        .relative()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .h_full()
+        .child(single_image_canvas(old, scale_down).absolute().inset_0())
+        .child(
+            single_image_canvas(new, scale_down)
+                .absolute()
+                .inset_0()
+                .opacity(opacity),
+        )
+        .into_any_element()
+}
+
 impl MainPaneView {
     pub(in crate::view) fn render_diff_horizontal_scrollbar(
         theme: AppTheme,
@@ -67,16 +221,7 @@ impl MainPaneView {
         let ui_scale_percent = crate::ui_scale::UiScale::current(cx).percent();
         let rendered_preview_kind =
             crate::view::diff_target_rendered_preview_kind(self.rendered_diff_target());
-        let has_image = self
-            .rendered_file_image_diff_loadable()
-            .is_some_and(|file| !matches!(file, Loadable::NotLoaded));
-        // An image has no collapsed form — the rendered picture is the whole
-        // file — so the image view stays available in either diff mode. Only
-        // the SVG Image/Code toggle can send an image target down the text path.
-        let wants_image = has_image
-            && (!matches!(rendered_preview_kind, Some(RenderedPreviewKind::Svg))
-                || self.rendered_preview_modes.get(RenderedPreviewKind::Svg)
-                    == RenderedPreviewMode::Rendered);
+        let wants_image = self.wants_image_diff();
         let wants_markdown_preview = self.diff_content_mode == DiffContentMode::Full
             && rendered_preview_kind == Some(RenderedPreviewKind::Markdown)
             && self
@@ -158,6 +303,12 @@ impl MainPaneView {
                             window,
                             cx,
                         );
+                        // Swipe and Onion skin paint the raw frames directly
+                        // (see `render_image_diff_swipe`/`_onion`), so a copy
+                        // of each side survives past the `old`/`new` cells
+                        // below consuming their own clones.
+                        let old_overlay_frame = old_render.clone().map(|image| (image, old_frame));
+                        let new_overlay_frame = new_render.clone().map(|image| (image, new_frame));
                         let old = self
                             .file_image_diff_cache_old_svg_path
                             .clone()
@@ -191,6 +342,7 @@ impl MainPaneView {
                             let muted = theme.colors.foreground.secondary;
                             div()
                                 .id(id)
+                                .debug_selector(move || id.to_string())
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .h_full()
@@ -263,14 +415,58 @@ impl MainPaneView {
                                 .into_any_element();
                         }
 
+                        let left_label = image_diff_column_label("A (before)", self.file_image_diff_cache_old_info);
+                        let right_label = image_diff_column_label("B (after)", self.file_image_diff_cache_new_info);
                         let columns_header = components::split_columns_header(
                             theme,
                             ui_scale_percent,
-                            "A (before)",
-                            "B (after)",
+                            left_label,
+                            right_label,
                         );
 
-                        div()
+                        let effective_mode = if self.image_diff_overlay_modes_available() {
+                            self.image_diff_mode
+                        } else {
+                            ImageDiffMode::SideBySide
+                        };
+
+                        let mode_caption = match effective_mode {
+                            ImageDiffMode::SideBySide => None,
+                            ImageDiffMode::Swipe => Some(format!(
+                                "Swipe · divider {:.0}% · , / . to move",
+                                self.image_diff_swipe_position * 100.0
+                            )),
+                            ImageDiffMode::OnionSkin => Some(format!(
+                                "Onion skin · {:.0}% new · , / . to adjust",
+                                self.image_diff_onion_opacity * 100.0
+                            )),
+                        };
+
+                        let picture_area = match effective_mode {
+                            ImageDiffMode::SideBySide => div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .flex()
+                                .child(cell("diff_image_left", old))
+                                .child(div().w(px(1.0)).h_full().bg(theme.colors.stroke.default))
+                                .child(cell("diff_image_right", new))
+                                .into_any_element(),
+                            ImageDiffMode::Swipe => render_image_diff_swipe(
+                                theme,
+                                old_overlay_frame,
+                                new_overlay_frame,
+                                self.image_diff_swipe_position,
+                                clamp_preview_size,
+                            ),
+                            ImageDiffMode::OnionSkin => render_image_diff_onion(
+                                old_overlay_frame,
+                                new_overlay_frame,
+                                self.image_diff_onion_opacity,
+                                clamp_preview_size,
+                            ),
+                        };
+
+                        let mut container = div()
                             .id("diff_image_container")
                             .relative()
                             .h_full()
@@ -278,19 +474,18 @@ impl MainPaneView {
                             .flex()
                             .flex_col()
                             .bg(theme.colors.surface.canvas)
-                            .child(columns_header)
-                            .child(
+                            .child(columns_header);
+                        if let Some(caption) = mode_caption {
+                            container = container.child(
                                 div()
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .flex()
-                                    .child(cell("diff_image_left", old))
-                                    .child(
-                                        div().w(px(1.0)).h_full().bg(theme.colors.stroke.default),
-                                    )
-                                    .child(cell("diff_image_right", new)),
-                            )
-                            .into_any_element()
+                                    .px_2()
+                                    .py_1()
+                                    .text_size(theme.ui_text(11.0))
+                                    .text_color(theme.colors.foreground.secondary)
+                                    .child(caption),
+                            );
+                        }
+                        container.child(picture_area).into_any_element()
                     }
                 }
             }
@@ -1263,5 +1458,48 @@ mod tests {
         assert!(image_diff_ready_shows_processing(true, false));
         assert!(!image_diff_ready_shows_processing(true, true));
         assert!(!image_diff_ready_shows_processing(false, false));
+    }
+
+    #[test]
+    fn image_diff_byte_sizes_pick_the_right_unit() {
+        assert_eq!(format_image_diff_bytes(0), "0 B");
+        assert_eq!(format_image_diff_bytes(999), "999 B");
+        assert_eq!(format_image_diff_bytes(2150), "2.1 KB");
+        assert_eq!(format_image_diff_bytes(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn image_diff_size_caption_falls_back_to_just_the_file_size_without_pixel_dimensions() {
+        assert_eq!(
+            image_diff_size_caption(ImageDiffSideInfo {
+                pixel_size: Some((64, 64)),
+                byte_len: 2150,
+            }),
+            "64 × 64 px · 2.1 KB"
+        );
+        assert_eq!(
+            image_diff_size_caption(ImageDiffSideInfo {
+                pixel_size: None,
+                byte_len: 512,
+            }),
+            "512 B"
+        );
+    }
+
+    #[test]
+    fn image_diff_column_label_omits_the_size_for_a_missing_side() {
+        assert_eq!(
+            image_diff_column_label(
+                "A (before)",
+                Some(ImageDiffSideInfo {
+                    pixel_size: Some((16, 16)),
+                    byte_len: 400,
+                })
+            ),
+            "A (before) · 16 × 16 px · 400 B"
+        );
+        // An added or deleted image: the missing side has no info at all, so
+        // its label stays plain rather than trailing a bare "· ".
+        assert_eq!(image_diff_column_label("B (after)", None), "B (after)");
     }
 }

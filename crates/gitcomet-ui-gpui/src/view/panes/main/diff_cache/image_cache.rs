@@ -689,7 +689,50 @@ struct ImageDiffCacheRebuild {
     new: Option<Arc<gpui::RenderImage>>,
     old_svg_path: Option<std::path::PathBuf>,
     new_svg_path: Option<std::path::PathBuf>,
+    old_info: Option<ImageDiffSideInfo>,
+    new_info: Option<ImageDiffSideInfo>,
     failed: bool,
+}
+
+/// The side's intrinsic pixel dimensions (not the downscaled preview's) and
+/// its raw byte size, for the "W × H px · size" caption. `None` dimensions
+/// (an unreadable header, or an SVG with no usable size) fall back to a
+/// file-size-only caption; the byte size itself always reads the source
+/// bytes directly, so it never depends on decoding succeeding.
+fn image_diff_side_info(format: gpui::ImageFormat, bytes: &[u8]) -> ImageDiffSideInfo {
+    ImageDiffSideInfo {
+        pixel_size: source_pixel_dimensions(format, bytes),
+        byte_len: bytes.len(),
+    }
+}
+
+fn source_pixel_dimensions(format: gpui::ImageFormat, bytes: &[u8]) -> Option<(u32, u32)> {
+    match format {
+        gpui::ImageFormat::Svg => svg_intrinsic_size(bytes),
+        _ => {
+            let image_format = image_rs_format_for_diff_preview(format)?;
+            image::ImageReader::with_format(Cursor::new(bytes), image_format)
+                .into_dimensions()
+                .ok()
+        }
+    }
+}
+
+/// Reparses the SVG tree to read its intrinsic size in user units. A second,
+/// cheap parse rather than threading the size out of
+/// `render_svg_image_diff_preview`: this keeps the rebuild's old/new sides
+/// independent (see `decode_file_image_diff_preview_pair`'s parallel decode)
+/// and the size label correct, which the *rasterized preview's* pixel
+/// dimensions would not be (that raster is upscaled for small SVGs and capped
+/// for large ones).
+fn svg_intrinsic_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &IMAGE_DIFF_SVG_USVG_OPTIONS).ok()?;
+    let size = tree.size();
+    let (width, height) = (size.width(), size.height());
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some((width.round().max(1.0) as u32, height.round().max(1.0) as u32))
 }
 
 fn decode_file_image_diff_preview_pair(
@@ -756,6 +799,8 @@ fn build_file_image_diff_cache_rebuild(
             new: None,
             old_svg_path: None,
             new_svg_path: None,
+            old_info: None,
+            new_info: None,
             failed: file.old.is_some() || file.new.is_some(),
         };
     };
@@ -773,6 +818,14 @@ fn build_file_image_diff_cache_rebuild(
         new: new_preview.render,
         old_svg_path: old_preview.cached_path,
         new_svg_path: new_preview.cached_path,
+        old_info: file
+            .old
+            .as_deref()
+            .map(|bytes| image_diff_side_info(format, bytes)),
+        new_info: file
+            .new
+            .as_deref()
+            .map(|bytes| image_diff_side_info(format, bytes)),
         failed,
     }
 }
@@ -904,8 +957,15 @@ impl MainPaneView {
         self.file_image_diff_cache_path = None;
         self.file_image_diff_cache_old_svg_path = None;
         self.file_image_diff_cache_new_svg_path = None;
+        self.file_image_diff_cache_old_info = None;
+        self.file_image_diff_cache_new_info = None;
         self.file_image_preview_animation = FileImagePreviewAnimation::default();
         self.file_image_preview_animation_task = None;
+        // The compare mode is sticky across files; the divider and opacity
+        // are not, so a new file never inherits a position that made sense
+        // only for the previous picture's proportions.
+        self.image_diff_swipe_position = 0.5;
+        self.image_diff_onion_opacity = 0.5;
     }
 
     pub(in crate::view) fn ensure_file_image_diff_cache(&mut self, cx: &mut gpui::Context<Self>) {
@@ -989,6 +1049,8 @@ impl MainPaneView {
                 self.file_image_diff_cache_new = rebuild.new;
                 self.file_image_diff_cache_old_svg_path = rebuild.old_svg_path;
                 self.file_image_diff_cache_new_svg_path = rebuild.new_svg_path;
+                self.file_image_diff_cache_old_info = rebuild.old_info;
+                self.file_image_diff_cache_new_info = rebuild.new_info;
                 cx.notify();
             }
             return;
@@ -1021,6 +1083,8 @@ impl MainPaneView {
                     this.file_image_diff_cache_new = rebuild.new;
                     this.file_image_diff_cache_old_svg_path = rebuild.old_svg_path;
                     this.file_image_diff_cache_new_svg_path = rebuild.new_svg_path;
+                    this.file_image_diff_cache_old_info = rebuild.old_info;
+                    this.file_image_diff_cache_new_info = rebuild.new_info;
                     cx.notify();
                 });
             },
@@ -1715,6 +1779,45 @@ mod tests {
             (IMAGE_DIFF_SVG_PREVIEW_MAX_EDGE_PX / 2.0) as i32
         );
         assert!(preview.cached_path.is_none());
+    }
+
+    #[test]
+    fn source_pixel_dimensions_reads_svg_intrinsic_size_not_the_rasterized_preview_size() {
+        // The rasterized preview for this SVG is upscaled to
+        // `IMAGE_DIFF_SVG_PREVIEW_TARGET_WIDTH_PX` (see the test above), so a
+        // size label built from that raster's dimensions would lie about the
+        // picture's actual size; the intrinsic viewBox size must win instead.
+        let svg = solid_rect_svg(32, 16);
+        assert_eq!(
+            source_pixel_dimensions(gpui::ImageFormat::Svg, &svg),
+            Some((32, 16))
+        );
+    }
+
+    #[test]
+    fn source_pixel_dimensions_reads_raster_header_without_downscaling() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            3,
+            5,
+            image::Rgba([1, 2, 3, 4]),
+        ));
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode png");
+
+        assert_eq!(
+            source_pixel_dimensions(gpui::ImageFormat::Png, &encoded.into_inner()),
+            Some((3, 5))
+        );
+    }
+
+    #[test]
+    fn image_diff_side_info_reports_the_source_byte_length_even_when_undecodable() {
+        let garbage = vec![0_u8; 777];
+        let info = image_diff_side_info(gpui::ImageFormat::Png, &garbage);
+        assert_eq!(info.byte_len, 777);
+        assert_eq!(info.pixel_size, None);
     }
 
     #[test]

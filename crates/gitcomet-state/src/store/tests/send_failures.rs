@@ -429,6 +429,19 @@ impl GitRepository for BlockingDiffRepo {
     }
 }
 
+/// A backend these two tests never actually call: they construct `AppStore`
+/// by hand (no worker thread), to test dispatch/shutdown bookkeeping in
+/// isolation from anything that would open a repository.
+struct UnusedBackend;
+
+impl GitBackend for UnusedBackend {
+    fn open(&self, _path: &Path) -> std::result::Result<Arc<dyn GitRepository>, Error> {
+        Err(Error::new(ErrorKind::Unsupported(
+            "this test never opens a repository",
+        )))
+    }
+}
+
 #[test]
 fn dispatch_increments_failure_counter_when_channel_is_disconnected() {
     let _guard = send_failure_counter_test_lock();
@@ -448,6 +461,7 @@ fn dispatch_increments_failure_counter_when_channel_is_disconnected() {
         state: Arc::new(RwLock::new(Arc::new(AppState::test_default()))),
         msg_tx: msg_tx.clone(),
         public_lifetime: Arc::new(StorePublicLifetime::new(msg_tx)),
+        backend: Arc::new(UnusedBackend),
     };
 
     store.dispatch(Msg::OpenRepo(PathBuf::from("/tmp/repo")));
@@ -471,6 +485,7 @@ fn concurrent_last_app_store_drops_shutdown_worker_once() {
         state: Arc::new(RwLock::new(Arc::new(AppState::test_default()))),
         msg_tx: msg_tx.clone(),
         public_lifetime: Arc::new(StorePublicLifetime::new(msg_tx)),
+        backend: Arc::new(UnusedBackend),
     };
     let store_a = store.clone();
     let store_b = store.clone();

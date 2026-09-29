@@ -6632,7 +6632,10 @@ fn dismissing_change_tracking_settings_with_escape_restores_diff_panel_focus(
     );
 }
 
+mod generated_files;
 mod hook_activity;
+mod image_diff_modes;
+mod markdown_preview_diff;
 mod panel_focus;
 mod status_selection;
 mod window_and_file_actions;

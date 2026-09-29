@@ -2861,7 +2861,16 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (detail, number, listing, files_error, commit_selection, last_review, stack_members) = {
+        let (
+            detail,
+            number,
+            listing,
+            files_error,
+            commit_selection,
+            last_review,
+            stack_members,
+            generated_count,
+        ) = {
             let root = root.read(cx);
             let Some(prs) = root.active_pull_requests() else {
                 return div().into_any_element();
@@ -2883,6 +2892,7 @@ impl DetailsPaneView {
                 prs.commit_selection,
                 prs.last_review.clone(),
                 stack_members,
+                prs.generated_files.ready().map(|generated| generated.len()),
             )
         };
         let detail = match detail {
@@ -3004,8 +3014,12 @@ impl DetailsPaneView {
             };
             panel = panel.child(line(format!("  {status}: {}", run.name)));
         }
+        let generated_suffix = generated_count
+            .filter(|count| *count > 0)
+            .map(|count| format!(" ({count} generated)"))
+            .unwrap_or_default();
         panel = panel.child(line(format!(
-            "{} files · +{} −{}",
+            "{} files{generated_suffix} · +{} −{}",
             detail.changed_files, detail.additions, detail.deletions
         )));
         if detail.too_large_for_app() {

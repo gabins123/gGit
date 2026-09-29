@@ -290,11 +290,31 @@ pub(super) struct ReviewMode {
     /// `V`: viewed files stay in the list. Off, they're hidden, the open one
     /// included; its diff stays up and `j`/`k` go on from it.
     pub(super) show_viewed: bool,
+    /// The PR's generated files (GitHub's `linguist-generated`), copied from
+    /// `pull_requests` once gix has read them, so `file_listed` and friends
+    /// (pure `&self` methods) don't have to reach back through it.
+    pub(super) generated: Arc<std::collections::BTreeSet<String>>,
+    /// `Shift+G`: generated files stay in the list, the same way `show_viewed`
+    /// works for viewed ones. Off (the default), they're hidden regardless of
+    /// viewed state — a generated file never counts toward viewed progress.
+    pub(super) show_generated: bool,
+    /// Generated files whose "Generated file" placeholder you've dismissed
+    /// with `enter`, so their diff loads normally for the rest of the review
+    /// session.
+    pub(super) generated_placeholder_dismissed: std::collections::BTreeSet<String>,
 }
 
 impl ReviewMode {
     pub(super) fn current_path(&self) -> Option<&str> {
         self.files.get(self.file_ix).map(String::as_str)
+    }
+
+    /// Whether the open file's "Generated file" placeholder is showing right
+    /// now: it's generated, and `enter` hasn't dismissed it yet this session.
+    pub(super) fn generated_placeholder_active(&self) -> bool {
+        self.current_path().is_some_and(|path| {
+            self.is_generated(path) && !self.generated_placeholder_dismissed.contains(path)
+        })
     }
 
     /// Lays GitHub's viewed marks (the answer to load `seq`) over this
@@ -389,15 +409,32 @@ impl ReviewMode {
             .count()
     }
 
+    /// Whether `path` is one of this PR's generated files (GitHub's
+    /// `linguist-generated`), as read from `.gitattributes` at the head
+    /// commit and copied here once known.
+    pub(super) fn is_generated(&self, path: &str) -> bool {
+        self.generated.contains(path)
+    }
+
     /// Whether file `ix` is in the list, the one `j`/`k`, `]`/`[` and
     /// `space` walk: it matches the `/` filter, passes `L` (only files
     /// changed since your last review), and isn't viewed, unless `V` shows
     /// viewed files. The open file follows the same rule: once everything is
     /// viewed the list is empty, even though a diff is still up. A dismissed
     /// file ("changed since you viewed") isn't viewed.
+    ///
+    /// A generated file is hidden purely by `show_generated`, regardless of
+    /// viewed state: generated files don't count toward viewed progress, so
+    /// whether one happens to be marked viewed never affects its visibility.
     pub(super) fn file_listed(&self, ix: usize) -> bool {
         self.file_passes_filters(ix)
-            && (self.show_viewed || !self.draft.viewed.contains(&self.files[ix]))
+            && self.files.get(ix).is_some_and(|path| {
+                if self.is_generated(path) {
+                    self.show_generated
+                } else {
+                    self.show_viewed || !self.draft.viewed.contains(path)
+                }
+            })
     }
 
     /// The `/` filter and `L`, viewed or not.
@@ -424,10 +461,38 @@ impl ReviewMode {
             .is_some_and(|range| range.selection.newest_oid != self.draft.head_oid)
     }
 
-    /// Viewed files the list hides for now: `V` shows them.
+    /// Viewed files the list hides for now: `V` shows them. A generated file
+    /// is never counted here, even when it's viewed and hidden — it's
+    /// counted once, under `generated_hidden`, so the two lines never
+    /// double-count the same file.
     pub(super) fn viewed_hidden(&self) -> usize {
         (0..self.files.len())
-            .filter(|ix| self.file_passes_filters(*ix) && !self.file_listed(*ix))
+            .filter(|ix| {
+                self.file_passes_filters(*ix)
+                    && !self.file_listed(*ix)
+                    && !self.files.get(*ix).is_some_and(|path| self.is_generated(path))
+            })
+            .count()
+    }
+
+    /// Generated files the list hides for now: `Shift+G` shows them.
+    pub(super) fn generated_hidden(&self) -> usize {
+        (0..self.files.len())
+            .filter(|ix| {
+                self.file_passes_filters(*ix)
+                    && !self.show_generated
+                    && self.files.get(*ix).is_some_and(|path| self.is_generated(path))
+            })
+            .count()
+    }
+
+    /// Files that count toward viewed progress ("X of Y viewed"): every file
+    /// but the generated ones, whether or not `Shift+G` is currently showing
+    /// them.
+    pub(super) fn non_generated_file_count(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|path| !self.is_generated(path))
             .count()
     }
 
@@ -737,6 +802,34 @@ impl GitCometView {
         }
     }
 
+    /// Copies the PR's generated-files set (once gix has read it) into the
+    /// active review of it, so `ReviewMode`'s pure `&self` methods
+    /// (`file_listed`, `generated_hidden`, `is_generated`) can consult it
+    /// without reaching back through `self.pull_requests`.
+    pub(super) fn review_sync_generated_files(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(generated) = self
+            .pull_requests
+            .repo(repo_id)
+            .and_then(|prs| prs.generated_files.ready())
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(review) = self
+            .review
+            .as_mut()
+            .filter(|review| review.repo_id == repo_id && review.number == number)
+        {
+            review.generated = generated;
+            self.sync_review_marks(cx);
+        }
+    }
+
     /// `r` on the Pull requests tab: reviews the selected pull request,
     /// picking up a pending review of it where it was left.
     pub(super) fn start_review(&mut self, cx: &mut gpui::Context<Self>) {
@@ -766,6 +859,7 @@ impl GitCometView {
         let cached_threads = prs.threads.ready().cloned();
         let selected_range = prs.commit_selection.selected_range(&detail.commits);
         let retry_diff_base = matches!(prs.diff_base, super::pull_requests::PrLoad::Failed(_));
+        let generated = prs.generated_files.ready().cloned().unwrap_or_default();
         if detail.too_large_for_app() || (selected_range.is_none() && detail.files.is_empty()) {
             self.push_toast(
                 components::ToastKind::Warning,
@@ -853,6 +947,9 @@ impl GitCometView {
             reopened_for: None,
             query: Default::default(),
             show_viewed: false,
+            generated,
+            show_generated: false,
+            generated_placeholder_dismissed: Default::default(),
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
@@ -1098,6 +1195,12 @@ impl GitCometView {
         }
         self.review_load_hunk_ranges(cx);
         self.sync_review_marks(cx);
+        // A generated file's diff isn't fetched until its placeholder is
+        // dismissed (`enter`): it's usually large and uninteresting (a
+        // lockfile), so there's no point loading it before the reader asks.
+        let placeholder_active = self
+            .active_review()
+            .is_some_and(ReviewMode::generated_placeholder_active);
         if let Some((base, head)) =
             self.review
                 .as_ref()
@@ -1108,14 +1211,20 @@ impl GitCometView {
                     })
                 })
         {
-            self.store.dispatch(Msg::SelectDiff {
-                repo_id,
-                target: DiffTarget::CommitRange {
-                    from_commit_id: CommitId(base.into()),
-                    to_commit_id: Some(CommitId(head.into())),
-                    path: Some(std::path::PathBuf::from(&path)),
-                },
-            });
+            // Leaving the previous target in place while the placeholder is
+            // up is harmless: `review_diff_shown` already refuses to treat
+            // another file's diff as this one's, and the placeholder covers
+            // the main pane regardless of what's loaded underneath it.
+            if !placeholder_active {
+                self.store.dispatch(Msg::SelectDiff {
+                    repo_id,
+                    target: DiffTarget::CommitRange {
+                        from_commit_id: CommitId(base.into()),
+                        to_commit_id: Some(CommitId(head.into())),
+                        path: Some(std::path::PathBuf::from(&path)),
+                    },
+                });
+            }
             self.notify_pull_request_panes(cx);
             return;
         }
@@ -1128,10 +1237,13 @@ impl GitCometView {
             .and_then(|prs| prs.detail.ready())
             .and_then(|detail| detail.files.iter().position(|file| file.path == path));
         if detail_ix.is_some() {
-            if let Some((base, head)) = self.review.as_ref().and_then(|review| {
+            let base_and_head = self.review.as_ref().and_then(|review| {
                 self.review_diff_base(repo_id, review.number)
                     .map(|base| (base, review.draft.head_oid.clone()))
-            }) {
+            });
+            // See the commit-range branch above: while the placeholder is up,
+            // leave whatever was loaded before in place rather than clear it.
+            if let (Some((base, head)), false) = (base_and_head, placeholder_active) {
                 self.store.dispatch(Msg::SelectDiff {
                     repo_id,
                     target: DiffTarget::CommitRange {
@@ -1140,7 +1252,7 @@ impl GitCometView {
                         path: Some(std::path::PathBuf::from(&path)),
                     },
                 });
-            } else {
+            } else if !placeholder_active {
                 self.store.dispatch(Msg::ClearDiffSelection { repo_id });
             }
         } else {
@@ -1156,6 +1268,26 @@ impl GitCometView {
             self.push_toast(components::ToastKind::Warning, message, cx);
         }
         self.notify_pull_request_panes(cx);
+    }
+
+    /// `enter` on the open file's "Generated file" placeholder: loads its
+    /// diff for the rest of this review, reachable from the Sidebar or from
+    /// the Diff panel itself once focus moves there.
+    fn review_dismiss_generated_placeholder(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some((ix, path)) = self
+            .active_review()
+            .filter(|review| review.generated_placeholder_active())
+            .and_then(|review| Some((review.file_ix, review.current_path()?.to_string())))
+        else {
+            return;
+        };
+        if let Some(review) = self.review.as_mut() {
+            review.generated_placeholder_dismissed.insert(path);
+        }
+        // Re-opens the same file now that its placeholder is dismissed, which
+        // is what actually dispatches the diff load `review_open_file` skips
+        // while a generated file's placeholder is showing.
+        self.review_open_file(ix, cx);
     }
 
     pub(super) fn set_review_commit_range(
@@ -1726,6 +1858,84 @@ impl GitCometView {
         review.draft.viewed_moved(head, changed.as_ref());
         self.save_review(cx);
         self.notify_pull_request_panes(cx);
+    }
+
+    /// A minimal review of `files`, its cursor already placed, for tests that
+    /// drive review mode's keys without the real open flow (`gh pr view`, its
+    /// draft file, GitHub's viewed marks).
+    #[cfg(test)]
+    pub(super) fn open_review_for_test(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        files: Vec<String>,
+        head_oid: impl Into<String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.review = Some(ReviewMode {
+            repo_id,
+            number,
+            title: String::new(),
+            all_files: files.clone(),
+            files,
+            file_ix: 0,
+            draft: ReviewDraft {
+                head_oid: head_oid.into(),
+                ..ReviewDraft::default()
+            },
+            selected_comment: None,
+            head_moved: false,
+            pending_jump: None,
+            needs_cursor: false,
+            armed_delete: None,
+            write_seq: 0,
+            written_seq: Default::default(),
+            threads: Vec::new(),
+            threads_loading: false,
+            suggestions: Vec::new(),
+            suggestion_generation: 0,
+            since_base_oid: None,
+            since_review: None,
+            only_changed: false,
+            commit_range: None,
+            viewed_syncing_to: None,
+            since_seq: 0,
+            viewed_sync: ViewedSync::Idle,
+            viewed_seq: 0,
+            dismissed: Default::default(),
+            confirmed: Default::default(),
+            was_dismissed: Default::default(),
+            viewed_pushing: false,
+            hunk_ranges: Default::default(),
+            hunk_ranges_loading: Default::default(),
+            hunk_key: None,
+            reopened_for: None,
+            query: Default::default(),
+            show_viewed: false,
+            generated: Default::default(),
+            show_generated: false,
+            generated_placeholder_dismissed: Default::default(),
+        });
+        self.main_pane.update(cx, |pane, _| pane.review_active = true);
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// Seeds the active review's generated-files set directly, bypassing the
+    /// real gix fetch, for tests that only care about `Shift+G` and the
+    /// generated-file placeholder.
+    #[cfg(test)]
+    pub(super) fn seed_review_generated_files_for_test(
+        &mut self,
+        paths: impl IntoIterator<Item = String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(review) = self.review.as_mut() {
+            review.generated = Arc::new(paths.into_iter().collect());
+        }
+        // The placeholder flag `sync_review_marks` copies into `main_pane`
+        // only updates when this runs; production always reaches it because
+        // `generated` and `review_open_file` land together (`start_review`).
+        self.sync_review_marks(cx);
     }
 
     /// Your last review and what changed since it, as gh and git would load
@@ -2484,11 +2694,16 @@ impl GitCometView {
                 Some((marks, threads, suggestions, scope))
             })
             .unwrap_or_default();
+        let generated_placeholder = self
+            .review
+            .as_ref()
+            .is_some_and(ReviewMode::generated_placeholder_active);
         self.main_pane.update(cx, |pane, cx| {
             pane.review_marks = marks;
             pane.review_thread_marks = threads;
             pane.review_suggestion_marks = suggestions;
             pane.review_comment_scope = scope;
+            pane.review_generated_placeholder = generated_placeholder;
             cx.notify();
         });
     }
@@ -2828,6 +3043,10 @@ impl GitCometView {
             _ => 0,
         };
         let shown = self.review_diff_shown();
+        // A rendered block has no single text-diff line: reading the cursor
+        // as one (`r`, `t`/`T`, `a`/`x`) would act on whatever row happens to
+        // share that row number, not the block actually under the cursor.
+        let markdown_preview = self.main_pane.read(cx).is_markdown_preview_active();
         match (current, lower.as_str(), shift) {
             (_, "c", true) => {
                 self.open_commit_scope_picker(cx);
@@ -2836,6 +3055,11 @@ impl GitCometView {
             (_, "s", true) => self.open_review_submit(window, cx),
             // History is hidden while reviewing; the diff stays.
             (_, "2", false) if !self.diff_is_open() => {}
+            (Some(FocusPanel::Diff), "r", false) if markdown_preview => self.push_toast(
+                components::ToastKind::Warning,
+                "A rendered block has no line to reply on; c switches to Text.".to_string(),
+                cx,
+            ),
             (Some(FocusPanel::Diff), "r", false)
                 if !self
                     .active_review()
@@ -2849,6 +3073,11 @@ impl GitCometView {
             (Some(FocusPanel::Details), "r", false) => self.review_reply_to_outdated(window, cx),
             // Elsewhere `r` does nothing rather than start another review.
             (_, "r", false) => {}
+            (Some(FocusPanel::Diff), "t", _) if markdown_preview => self.push_toast(
+                components::ToastKind::Warning,
+                "A rendered block has no line to step threads by; c switches to Text.".to_string(),
+                cx,
+            ),
             (Some(FocusPanel::Diff), "t", _)
                 if !self
                     .active_review()
@@ -2863,6 +3092,12 @@ impl GitCometView {
             (_, "v", true) => {
                 if let Some(review) = self.review.as_mut() {
                     review.show_viewed = !review.show_viewed;
+                }
+                self.notify_pull_request_panes(cx);
+            }
+            (_, "g", true) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.show_generated = !review.show_generated;
                 }
                 self.notify_pull_request_panes(cx);
             }
@@ -2899,13 +3134,31 @@ impl GitCometView {
             }
             (Some(FocusPanel::Diff), _, _) if direction != 0 => {
                 if shown {
+                    let markdown_preview = self.main_pane.read(cx).is_markdown_preview_active();
                     self.defer_pane_action(self.main_pane.clone(), cx, move |pane, _, cx| {
-                        pane.review_move_cursor(i32::from(direction), shift, cx)
+                        if markdown_preview {
+                            pane.review_move_markdown_block_cursor(i32::from(direction), cx)
+                        } else {
+                            pane.review_move_cursor(i32::from(direction), shift, cx)
+                        }
                     });
                     self.notify_review_details_after_move(cx);
                 }
             }
+            // In the rendered preview a row has no single line to comment on,
+            // so `c` does what GitHub's own preview offers instead: switch to
+            // Text with the cursor already on the block's first source line.
+            (Some(FocusPanel::Diff), "c", false)
+                if self.main_pane.read(cx).is_markdown_preview_active() =>
+            {
+                self.review_switch_markdown_preview_to_text_at_cursor(cx)
+            }
             (Some(FocusPanel::Diff), "c", false) => self.review_comment_at_cursor(window, cx),
+            (Some(FocusPanel::Diff), "a" | "x", false) if markdown_preview => self.push_toast(
+                components::ToastKind::Warning,
+                "A rendered block isn't a suggestion's line; c switches to Text.".to_string(),
+                cx,
+            ),
             (Some(FocusPanel::Diff), "a", false) => self.review_take_suggestion(true, cx),
             (Some(FocusPanel::Diff), "x", false) => self.review_take_suggestion(false, cx),
             (Some(FocusPanel::Diff | FocusPanel::Sidebar), "space", false) => {
@@ -2916,9 +3169,28 @@ impl GitCometView {
                 self.review_step_file(direction, cx)
             }
             (Some(FocusPanel::Sidebar), "enter", false) => {
-                if self.diff_is_open() {
+                let dismissed_placeholder = self
+                    .active_review()
+                    .is_some_and(ReviewMode::generated_placeholder_active);
+                self.review_dismiss_generated_placeholder(cx);
+                if dismissed_placeholder {
+                    // The diff this just asked for is still in flight (it was
+                    // never requested while the placeholder was up); focus it
+                    // as soon as it opens rather than needing a second enter.
+                    self.focus_diff_when_open = true;
+                } else if self.diff_is_open() {
                     self.focus_panel(FocusPanel::Diff, window, cx);
                 }
+            }
+            // `enter` also loads a generated file's diff from the Diff panel
+            // itself (the placeholder can be reached by moving there while
+            // it's up, not only from the Sidebar).
+            (Some(FocusPanel::Diff), "enter", false)
+                if self
+                    .active_review()
+                    .is_some_and(ReviewMode::generated_placeholder_active) =>
+            {
+                self.review_dismiss_generated_placeholder(cx);
             }
             (Some(FocusPanel::Details), _, false) if direction != 0 => {
                 self.review_select_comment(direction, cx)
@@ -2993,6 +3265,39 @@ impl GitCometView {
         };
         review.query = query;
         self.notify_pull_request_panes(cx);
+    }
+
+    /// `c` in the rendered preview: a rendered row has no single line to
+    /// comment on the way a text diff row does, so this switches to Text
+    /// instead, with the cursor already on the block's first source line.
+    fn review_switch_markdown_preview_to_text_at_cursor(&mut self, cx: &mut gpui::Context<Self>) {
+        let landed = self.main_pane.update(cx, |pane, cx| {
+            let Some((side, line)) = pane.markdown_preview_cursor_source_line() else {
+                return false;
+            };
+            pane.rendered_preview_modes
+                .set(RenderedPreviewKind::Markdown, RenderedPreviewMode::Source);
+            pane.diff_search_recompute_matches();
+            let landed = pane.review_jump_to(side, line, cx);
+            if !landed {
+                // The mode already flipped to Text, so the markdown row index
+                // still sitting in `diff_selection_anchor`/`range` no longer
+                // names a row at all there; leaving it would draw the cursor
+                // on whatever text-diff row happens to share that number.
+                pane.diff_selection_anchor = None;
+                pane.diff_selection_range = None;
+            }
+            landed
+        });
+        if landed {
+            self.notify_review_details_after_move(cx);
+        } else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "That block has no line to switch to in Text.".to_string(),
+                cx,
+            );
+        }
     }
 
     /// `S`: the submit dialog for the review in progress.
@@ -3426,9 +3731,59 @@ mod tests {
             reopened_for: None,
             query: Default::default(),
             show_viewed: false,
+            generated: Default::default(),
+            show_generated: false,
+            generated_placeholder_dismissed: Default::default(),
         };
         review.draft.head_oid = "h1".into();
         review
+    }
+
+    /// A generated file that's also viewed is hidden, and counted once —
+    /// under `generated_hidden`, never `viewed_hidden` too — until `Shift+G`
+    /// shows it. Viewing it doesn't change that.
+    #[test]
+    fn generated_files_are_hidden_regardless_of_viewed_and_counted_once() {
+        let mut review = test_review();
+        review.generated = Arc::new(["b.rs".to_string()].into_iter().collect());
+        // Nothing viewed yet: b.rs is hidden only because it's generated.
+        assert_eq!(
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(review.viewed_hidden(), 0);
+        assert_eq!(review.generated_hidden(), 1);
+        assert_eq!(review.non_generated_file_count(), 2);
+
+        // Viewing the generated file changes nothing about its visibility or
+        // which counter it falls under.
+        review.draft.viewed.insert("b.rs".to_string());
+        assert_eq!(
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(review.viewed_hidden(), 0);
+        assert_eq!(review.generated_hidden(), 1);
+
+        // A separately viewed, non-generated file is hidden under
+        // `viewed_hidden` instead.
+        review.draft.viewed.insert("a.rs".to_string());
+        assert_eq!(review.viewed_hidden(), 1);
+        assert_eq!(review.generated_hidden(), 1);
+
+        // Shift+G shows the generated file; it still doesn't count as viewed.
+        review.show_generated = true;
+        assert_eq!(
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(review.generated_hidden(), 0);
     }
 
     #[test]

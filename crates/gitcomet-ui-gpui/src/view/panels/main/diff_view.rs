@@ -298,7 +298,15 @@ impl MainPaneView {
                 self.review_collapse_selection(cx);
                 return true;
             }
-            if key.chars().count() == 1 || matches!(key, "space" | "up" | "down" | "enter") {
+            // `,`/`.` are single characters review mode would otherwise claim
+            // for itself below, but while an image diff is shown they belong
+            // to the Swipe divider / Onion opacity handling further down this
+            // function, which review mode has no key of its own for.
+            let is_image_diff_divider_key =
+                matches!(key, "," | ".") && self.wants_image_diff();
+            if !is_image_diff_divider_key
+                && (key.chars().count() == 1 || matches!(key, "space" | "up" | "down" | "enter"))
+            {
                 return false;
             }
         }
@@ -849,6 +857,95 @@ impl MainPaneView {
         {
             self.toggle_file_editor(window, cx);
             return true;
+        }
+
+        // Alt+P flips the Preview/Text (or Image/Code) switch wherever it
+        // shows, mirroring the toolbar buttons; excluded from text inputs for
+        // the same reason as Alt+E above.
+        if mods.alt
+            && !mods.control
+            && !mods.platform
+            && !mods.function
+            && !mods.shift
+            && key == "p"
+            && !text_input_focused
+            && !self.is_conflict_resolver_active()
+            && let Some(preview_kind) = self.main_pane_surface().toggle_kind
+        {
+            let next = match self.rendered_preview_modes.get(preview_kind) {
+                RenderedPreviewMode::Rendered => RenderedPreviewMode::Source,
+                RenderedPreviewMode::Source => RenderedPreviewMode::Rendered,
+            };
+            self.rendered_preview_modes.set(preview_kind, next);
+            // Rendered rows and source lines are different row spaces, so an
+            // open search has to rescan rather than keep indices into the old
+            // one (same reasoning as the toolbar buttons').
+            self.diff_search_recompute_matches();
+            if self.review_active {
+                // The review cursor (`diff_selection_anchor`/`range`) is a row
+                // index into whichever space was showing; a flip invalidates
+                // it in either direction rather than leaving it pointing at
+                // an unrelated row in the new one.
+                self.diff_selection_anchor = None;
+                self.diff_selection_range = None;
+            }
+            self.restore_diff_panel_focus_after_toolbar_action(window, cx);
+            cx.notify();
+            return true;
+        }
+
+        // Alt+V cycles Side by side -> Swipe -> Onion skin -> Side by side,
+        // wherever an image diff shows; excluded from text inputs like Alt+E
+        // and Alt+P above. Inert when the rare SVG-render-failure fallback
+        // has forced Side by side: cycling to Swipe/Onion would change
+        // `image_diff_mode` with nothing on screen to show it took effect.
+        if mods.alt
+            && !mods.control
+            && !mods.platform
+            && !mods.function
+            && !mods.shift
+            && key == "v"
+            && !text_input_focused
+            && self.wants_image_diff()
+            && self.image_diff_overlay_modes_available()
+        {
+            self.image_diff_mode = self.image_diff_mode.next();
+            cx.notify();
+            return true;
+        }
+
+        // `,`/`.` move the Swipe divider, or step the Onion skin opacity by
+        // 10%, only while an image diff actually shows and nothing is being
+        // typed. In Side by side there is neither a divider nor an opacity to
+        // move, so the keys fall through unhandled; same when the overlay
+        // modes aren't available (see the Alt+V comment above) and the view
+        // is forced to Side by side regardless of the picked mode.
+        if (key == "," || key == ".")
+            && !mods.control
+            && !mods.alt
+            && !mods.platform
+            && !mods.function
+            && !mods.shift
+            && !text_input_focused
+            && self.wants_image_diff()
+            && self.image_diff_overlay_modes_available()
+        {
+            let delta = if key == "." { 0.1 } else { -0.1 };
+            match self.image_diff_mode {
+                ImageDiffMode::Swipe => {
+                    self.image_diff_swipe_position =
+                        (self.image_diff_swipe_position + delta).clamp(0.0, 1.0);
+                    cx.notify();
+                    return true;
+                }
+                ImageDiffMode::OnionSkin => {
+                    self.image_diff_onion_opacity =
+                        (self.image_diff_onion_opacity + delta).clamp(0.0, 1.0);
+                    cx.notify();
+                    return true;
+                }
+                ImageDiffMode::SideBySide => {}
+            }
         }
 
         let copy_target_is_focused = self

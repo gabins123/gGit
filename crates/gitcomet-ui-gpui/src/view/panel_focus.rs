@@ -461,6 +461,8 @@ impl GitCometView {
                 ("}/{", "change"),
                 ("]/[", "file"),
                 ("space", "viewed"),
+                ("G", "show generated"),
+                ("alt+p", "preview"),
                 ("L", "changed since"),
                 ("C", "commits"),
                 ("S", "submit"),
@@ -473,6 +475,7 @@ impl GitCometView {
                     ("space", "viewed"),
                     ("/", "filter"),
                     ("V", "show viewed"),
+                    ("G", "show generated"),
                     ("L", "changed since"),
                     ("C", "commits"),
                     ("enter", "diff"),
@@ -489,6 +492,9 @@ impl GitCometView {
                     ("}/{", "change"),
                     ("]/[", "file"),
                     ("space", "viewed"),
+                    ("alt+p", "preview"),
+                    ("alt+v", "image mode"),
+                    (",/.", "divider/opacity"),
                     ("L", "changed since"),
                     ("C", "commits"),
                     ("S", "submit"),
@@ -588,6 +594,14 @@ impl GitCometView {
                 ("} / {", "Next / previous change"),
                 ("] / [", "Next / previous file"),
                 ("space", "Mark viewed"),
+                (
+                    "Shift+G",
+                    "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                ),
+                (
+                    "Alt+P",
+                    "Toggle the rendered Preview / Text switch, where it shows",
+                ),
                 ("L", "Changes since your last review"),
                 ("C", "Pick a commit range"),
                 ("S", "Submit the review"),
@@ -612,6 +626,10 @@ impl GitCometView {
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
                     (
+                        "Shift+G",
+                        "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                    ),
+                    (
                         "C",
                         "Pick all changes, since last review, or a commit range",
                     ),
@@ -621,20 +639,44 @@ impl GitCometView {
                     ("q", "Leave review mode; pending comments stay"),
                 ],
                 FocusPanel::Diff | FocusPanel::History => &[
-                    ("j / k", "Line cursor down / up"),
+                    ("j / k", "Line cursor down / up; by rendered block in Preview"),
                     ("shift+j / k", "Select lines from the cursor"),
                     (
                         "c",
-                        "Comment on the line or selection; alt+s suggests a change",
+                        "Comment on the line or selection (alt+s suggests a change); in Preview, switches to Text at the block's first line",
                     ),
-                    ("t / T", "Next / previous thread or Codex suggestion"),
-                    ("r", "Reply to the thread on this line"),
-                    ("a / x", "Adopt / drop the Codex suggestion on this line"),
-                    ("} / {", "Next / previous change"),
+                    (
+                        "t / T",
+                        "Next / previous thread or Codex suggestion; switch to Text first in Preview",
+                    ),
+                    (
+                        "r",
+                        "Reply to the thread on this line; switch to Text first in Preview",
+                    ),
+                    (
+                        "a / x",
+                        "Adopt / drop the Codex suggestion on this line; switch to Text first in Preview",
+                    ),
+                    (
+                        "} / {",
+                        "Next / previous change; by rendered block in Preview",
+                    ),
                     ("] / [", "Next / previous file"),
                     (
                         "space",
                         "Mark viewed (on GitHub too), then the next unviewed file",
+                    ),
+                    (
+                        "Alt+P",
+                        "Toggle the rendered Preview / Text switch, where it shows",
+                    ),
+                    (
+                        "Alt+V",
+                        "Cycle Side by side / Swipe / Onion skin, where an image diff shows",
+                    ),
+                    (
+                        ", / .",
+                        "Move the Swipe divider or the Onion skin opacity by 10%",
                     ),
                     (
                         "L",
@@ -645,6 +687,10 @@ impl GitCometView {
                         "Filter the file list: fuzzy words, .rs for a type; esc clears",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "Shift+G",
+                        "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                    ),
                     (
                         "C",
                         "Pick all changes, since last review, or a commit range",
@@ -667,6 +713,10 @@ impl GitCometView {
                         "Changes since your last review (files and diff) / the whole PR",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "Shift+G",
+                        "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                    ),
                     (
                         "C",
                         "Pick all changes, since last review, or a commit range",
