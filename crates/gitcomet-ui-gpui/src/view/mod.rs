@@ -248,6 +248,7 @@ mod perf;
 mod permalink;
 pub(super) mod platform_open;
 mod poller;
+mod pr_symbols;
 mod preference_sync;
 mod preferences;
 mod pull_requests;

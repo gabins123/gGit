@@ -94,6 +94,34 @@ fn keys_help(cx: &mut gpui::VisualTestContext, view: &View) -> Option<FocusPanel
     cx.update(|_window, app| view.read(app).keys_help_panel)
 }
 
+/// The `?` list adds a plain-text symbol legend of its own under the pull
+/// requests tab, rather than more `key_help` rows (those render through
+/// `shortcut_keys`, which turns any left-column text into keycap chips, and
+/// "PR shape" / "Review" / "Checks" / "Kind" aren't keys).
+#[gpui::test]
+fn pull_request_legend_opens_from_keyboard(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    apply_state(cx, &view, pull_request_state());
+    press(cx, "1 ?");
+    assert_eq!(keys_help(cx, &view), Some(Sidebar));
+    assert!(
+        cx.debug_bounds("legend_review_required").is_some(),
+        "the PR symbol legend should render under the pull requests tab"
+    );
+    press(cx, "escape");
+    assert_eq!(keys_help(cx, &view), None);
+
+    // Not on the branches tab: nothing there uses these symbols.
+    apply_state(cx, &view, Arc::new(AppState::test_default()));
+    press(cx, "1 ?");
+    assert!(
+        cx.debug_bounds("legend_review_required").is_none(),
+        "the PR symbol legend should not render outside the pull requests tab"
+    );
+    press(cx, "escape");
+}
+
 fn selected_branch(
     cx: &mut gpui::VisualTestContext,
     view: &View,
@@ -267,6 +295,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
                     review: None,
                     checks: Default::default(),
                     review_requested: false,
+                    is_mine: false,
                 }],
                 Some(7),
             );
@@ -1666,6 +1695,7 @@ fn the_create_dialog_steps_the_base_toggles_the_push_and_guards_submit(
                         review: None,
                         checks: Default::default(),
                         review_requested: false,
+                        is_mine: false,
                     }],
                     None,
                 );

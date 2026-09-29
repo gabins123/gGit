@@ -147,15 +147,8 @@ impl MainPaneView {
                 .filter(|thread| !thread.is_resolved && !thread.outdated())
                 .count()
         });
-        let (state_icon, state_color) = if detail.is_draft {
-            ("◌", theme.colors.foreground.secondary)
-        } else {
-            match detail.state.as_str() {
-                "MERGED" => ("◆", theme.colors.status.info.foreground),
-                "CLOSED" => ("×", theme.colors.status.danger.foreground),
-                _ => ("●", theme.colors.status.success.foreground),
-            }
-        };
+        let icon_size = crate::ui_scale::UiScale::current(cx).px(14.0);
+        let (kind, title) = crate::view::pr_symbols::title(&detail.title);
         let root_for_github = self.root_view.clone();
         let root_for_conversation = self.root_view.clone();
         let root_for_comments = self.root_view.clone();
@@ -173,13 +166,27 @@ impl MainPaneView {
                     .items_center()
                     .gap_2()
                     .text_size(theme.ui_text(14.0))
-                    .child(div().text_color(state_color).child(state_icon))
+                    .child(
+                        crate::view::pr_symbols::state(&detail.state, detail.is_draft, theme)
+                            .render(
+                                format!("pr_header_{}_state", detail.number),
+                                theme,
+                                icon_size,
+                            ),
+                    )
+                    .when_some(kind, |header, kind| {
+                        header.child(crate::view::pr_symbols::kind_tag(
+                            kind,
+                            theme,
+                            theme.ui_text(11.0),
+                        ))
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
                             .truncate()
-                            .child(detail.title.clone()),
+                            .child(title.to_owned()),
                     )
                     .child(
                         div()
@@ -393,12 +400,24 @@ impl MainPaneView {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let theme = self.theme;
-        let glyph = match entry.verb {
-            "approved" => PrReviewerStatus::Approved.glyph(),
-            "requested changes" => PrReviewerStatus::ChangesRequested.glyph(),
-            "commented" | "reviewed" => PrReviewerStatus::Commented.glyph(),
-            "reviewed (dismissed)" => PrReviewerStatus::Dismissed.glyph(),
-            _ => PrReviewerStatus::Requested.glyph(),
+        let status = match entry.verb {
+            "approved" => PrReviewerStatus::Approved,
+            "requested changes" => PrReviewerStatus::ChangesRequested,
+            "commented" | "reviewed" => PrReviewerStatus::Commented,
+            "reviewed (dismissed)" => PrReviewerStatus::Dismissed,
+            _ => PrReviewerStatus::Requested,
+        };
+        let icon_size = crate::ui_scale::UiScale::current(cx).px(12.0);
+        let status_icon = match crate::view::pr_symbols::reviewer_status(status, theme) {
+            Ok(symbol) => symbol.render(
+                format!("pr_conversation_entry_{ix}_status"),
+                theme,
+                icon_size,
+            ),
+            Err(text) => div()
+                .text_color(theme.colors.foreground.secondary)
+                .child(text)
+                .into_any_element(),
         };
         let mut row = div()
             .id(SharedString::from(format!("pr_conversation_entry_{ix}")))
@@ -413,12 +432,20 @@ impl MainPaneView {
             } else {
                 theme.colors.surface.panel
             })
-            .child(div().text_size(theme.ui_text(12.0)).child(format!(
-                "{glyph} {} {} · {}",
-                entry.author,
-                entry.verb,
-                entry.at.get(..10).unwrap_or(&entry.at)
-            )));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(theme.ui_text(12.0))
+                    .child(status_icon)
+                    .child(format!(
+                        "{} {} · {}",
+                        entry.author,
+                        entry.verb,
+                        entry.at.get(..10).unwrap_or(&entry.at)
+                    )),
+            );
         if !entry.body.is_empty() {
             row = row.child(self.pr_markdown(
                 number,

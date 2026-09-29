@@ -60,6 +60,7 @@ pub(crate) enum ReviewDecision {
     Approved,
     ChangesRequested,
     ReviewRequired,
+    Commented,
 }
 
 impl ReviewDecision {
@@ -77,6 +78,63 @@ impl ReviewDecision {
             Self::Approved => "Approved",
             Self::ChangesRequested => "Changes requested",
             Self::ReviewRequired => "Review required",
+            Self::Commented => "Commented",
+        }
+    }
+
+    /// `author_login` is the pull request's own author: their replies show up
+    /// as a COMMENTED review and must not stand in for an actual reviewer.
+    fn from_reviews(
+        decision: &str,
+        requests: &[RawReviewRequest],
+        reviews: &[RawLatestReview],
+        author_login: &str,
+    ) -> Option<Self> {
+        if let Some(decision) = Self::parse(decision) {
+            return Some(decision);
+        }
+        let requested_logins: Vec<String> = requests
+            .iter()
+            .filter_map(|request| {
+                request
+                    .requested_reviewer
+                    .as_ref()
+                    .and_then(RawReviewerIdentity::display_name)
+                    .or_else(|| request.identity.display_name())
+            })
+            .collect();
+        let mut approved = false;
+        let mut commented = false;
+        let mut changes_requested = false;
+        for review in reviews {
+            // gh sometimes omits a review's author; without one there's no PR
+            // author or pending request to match, so the review still counts.
+            let login = review.author.as_ref().map_or("", |author| &author.login);
+            if !login.is_empty()
+                && (login.eq_ignore_ascii_case(author_login)
+                    || requested_logins
+                        .iter()
+                        .any(|requested| requested.eq_ignore_ascii_case(login)))
+            {
+                continue;
+            }
+            match review.state.as_str() {
+                "CHANGES_REQUESTED" => changes_requested = true,
+                "APPROVED" => approved = true,
+                "COMMENTED" => commented = true,
+                _ => {}
+            }
+        }
+        if changes_requested {
+            Some(Self::ChangesRequested)
+        } else if !requested_logins.is_empty() {
+            Some(Self::ReviewRequired)
+        } else if approved {
+            Some(Self::Approved)
+        } else if commented {
+            Some(Self::Commented)
+        } else {
+            None
         }
     }
 }
@@ -108,16 +166,6 @@ impl PrReviewerStatus {
             Self::ChangesRequested => "Changes requested",
             Self::Commented => "Commented",
             Self::Dismissed => "Dismissed",
-        }
-    }
-
-    pub(crate) fn glyph(self) -> &'static str {
-        match self {
-            Self::Requested => "?",
-            Self::Approved => "✓",
-            Self::ChangesRequested => "!",
-            Self::Commented => "●",
-            Self::Dismissed => "×",
         }
     }
 }
@@ -223,6 +271,10 @@ struct RawSummary {
     review_decision: String,
     #[serde(default)]
     status_check_rollup: Vec<CheckEntry>,
+    #[serde(default)]
+    review_requests: Vec<RawReviewRequest>,
+    #[serde(default)]
+    latest_reviews: Vec<RawLatestReview>,
 }
 
 /// A row of the open pull request list.
@@ -241,10 +293,18 @@ pub(crate) struct PullRequestSummary {
     pub(crate) checks: ChecksSummary,
     /// Your review is requested on it.
     pub(crate) review_requested: bool,
+    /// The signed-in GitHub account authored this pull request.
+    pub(crate) is_mine: bool,
 }
 
 impl From<RawSummary> for PullRequestSummary {
     fn from(raw: RawSummary) -> Self {
+        let review = ReviewDecision::from_reviews(
+            &raw.review_decision,
+            &raw.review_requests,
+            &raw.latest_reviews,
+            &raw.author.login,
+        );
         Self {
             number: raw.number,
             title: raw.title,
@@ -253,9 +313,10 @@ impl From<RawSummary> for PullRequestSummary {
             head_owner: raw.head_repository_owner.login,
             base: raw.base_ref_name,
             is_draft: raw.is_draft,
-            review: ReviewDecision::parse(&raw.review_decision),
+            review,
             checks: ChecksSummary::from_entries(&raw.status_check_rollup),
             review_requested: false,
+            is_mine: false,
         }
     }
 }
@@ -587,6 +648,12 @@ impl PullRequestDetail {
 
 impl From<RawDetail> for PullRequestDetail {
     fn from(raw: RawDetail) -> Self {
+        let review = ReviewDecision::from_reviews(
+            &raw.review_decision,
+            &raw.review_requests,
+            &raw.latest_reviews,
+            &raw.author.login,
+        );
         Self {
             number: raw.number,
             title: raw.title,
@@ -605,7 +672,7 @@ impl From<RawDetail> for PullRequestDetail {
             is_draft: raw.is_draft,
             is_cross_repository: raw.is_cross_repository,
             state: raw.state,
-            review: ReviewDecision::parse(&raw.review_decision),
+            review,
             mergeable: match raw.mergeable.as_str() {
                 "MERGEABLE" => Some(true),
                 "CONFLICTING" => Some(false),
@@ -1011,7 +1078,7 @@ pub(crate) fn list_open(
         &repo_flag(repo),
         "--state=open",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
     ]);
     let raw: Vec<RawSummary> = parse_json(&run(command, None)?)?;
     let complete = raw.len() < LIST_LIMIT as usize;
@@ -1026,9 +1093,22 @@ pub(crate) fn list_open(
         "--state=open",
         "--search=review-requested:@me",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
     ]);
-    let requested = run(requested, None).and_then(|out| parse_json::<Vec<RawSummary>>(&out));
+    // Run alongside the login lookup below: both are independent `gh` calls
+    // on the critical path of every list load and refresh.
+    let (requested, login) = std::thread::scope(|scope| {
+        let requested = scope.spawn(|| {
+            run(requested, None).and_then(|out| parse_json::<Vec<RawSummary>>(&out))
+        });
+        let login = viewer_login(workdir);
+        (
+            requested
+                .join()
+                .unwrap_or_else(|_| Err(PrError::Failed("gh pr list panicked".to_string()))),
+            login,
+        )
+    });
     let known = requested.is_ok();
     for raw in requested.unwrap_or_default() {
         match list.iter_mut().find(|pr| pr.number == raw.number) {
@@ -1038,6 +1118,14 @@ pub(crate) fn list_open(
                 ..raw.into()
             }),
         }
+    }
+    match login {
+        Ok(login) => {
+            for pr in &mut list {
+                pr.is_mine = pr.author.eq_ignore_ascii_case(&login);
+            }
+        }
+        Err(error) => eprintln!("Couldn't identify pull request author: {error}"),
     }
     Ok((list, known, complete))
 }
@@ -2146,6 +2234,44 @@ pub(crate) fn prepare_diff_range(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn review_decision_ranks_changes_requested_over_a_pending_request() {
+        let requests: Vec<super::RawReviewRequest> =
+            serde_json::from_str(r#"[{"requestedReviewer": {"login": "bob"}}]"#)
+                .expect("requests");
+        let reviews: Vec<super::RawLatestReview> = serde_json::from_str(
+            r#"[{"author": {"login": "alice"}, "state": "CHANGES_REQUESTED"}]"#,
+        )
+        .expect("reviews");
+        assert_eq!(
+            super::ReviewDecision::from_reviews("", &requests, &reviews, "pr-author"),
+            Some(super::ReviewDecision::ChangesRequested)
+        );
+    }
+
+    #[test]
+    fn review_decision_is_review_required_with_only_a_pending_request() {
+        let requests: Vec<super::RawReviewRequest> =
+            serde_json::from_str(r#"[{"requestedReviewer": {"login": "bob"}}]"#)
+                .expect("requests");
+        assert_eq!(
+            super::ReviewDecision::from_reviews("", &requests, &[], "pr-author"),
+            Some(super::ReviewDecision::ReviewRequired)
+        );
+    }
+
+    #[test]
+    fn review_decision_ignores_the_authors_own_comment() {
+        let reviews: Vec<super::RawLatestReview> = serde_json::from_str(
+            r#"[{"author": {"login": "pr-author"}, "state": "COMMENTED"}]"#,
+        )
+        .expect("reviews");
+        assert_eq!(
+            super::ReviewDecision::from_reviews("", &[], &reviews, "pr-author"),
+            None
+        );
+    }
+
+    #[test]
     fn your_last_review_is_your_latest_submitted_one() {
         let pages: Vec<Vec<super::RawRestReview>> = serde_json::from_str(
             r#"[[
@@ -2361,6 +2487,24 @@ mod tests {
         assert!(prs[1].is_draft);
         assert_eq!(prs[1].review, None);
         assert_eq!(prs[1].checks.total(), 0);
+    }
+
+    #[test]
+    fn review_summary_distinguishes_comment_only_and_requested_again() {
+        let raw: Vec<RawSummary> = parse_json(
+            br#"[{
+            "number":1,"title":"one","headRefName":"one","baseRefName":"main",
+            "latestReviews":[{"state":"COMMENTED"}]
+        },{
+            "number":2,"title":"two","headRefName":"two","baseRefName":"main",
+            "reviewRequests":[{"login":"reviewer"}],
+            "latestReviews":[{"state":"APPROVED"}]
+        }]"#,
+        )
+        .expect("reviews");
+        let prs: Vec<PullRequestSummary> = raw.into_iter().map(Into::into).collect();
+        assert_eq!(prs[0].review, Some(ReviewDecision::Commented));
+        assert_eq!(prs[1].review, Some(ReviewDecision::ReviewRequired));
     }
 
     #[test]

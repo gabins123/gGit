@@ -1900,6 +1900,7 @@ mod tests {
             review: None,
             checks: Default::default(),
             review_requested,
+            is_mine: false,
         };
         let mut list = vec![pr(1, false), pr(2, false), pr(3, true), pr(4, false)];
         let drafts = FxHashMap::from_iter([(4, 2usize)]);

@@ -131,6 +131,8 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Open on GitHub | `o` | The selected pull request, or the repository's pull request list. |
 | Refresh | `Shift+R` | The list loads when the tab first shows; there is no polling. Also lists again the files of the selected pull request that failed to list. |
 
+The pull request list and Details header use a colored shape for state (open, draft, merged, closed), a review symbol (required, approved, changes requested, commented), and a check, cross or spinner for checks. Hover a symbol for its meaning, or press `?` in the Pull requests tab for the legend. A filled `@` marks a request for your review, a person marks your PR, and a pencil with a count marks your pending comments. Titles beginning `feat:`, `fix(scope):`, `refactor:`, `docs:`, `deps:`, `chore:`, `ci:` or `build:` show a kind tag in place of the prefix; the last four use `deps`.
+
 ### Review mode
 
 `r` on a pull request reviews it file by file. Line comments wait as a pending review, saved on this computer (per repository and pull request) until `S` posts them all together as one GitHub review, through `gh api`, on the head commit the diff shows. If the pull request gets new commits, the review moves to them and asks you to check your comments' lines. Nothing of the review reaches GitHub before that; viewed marks are the exception, your own private state on GitHub, sent as you mark each file. The Sidebar lists the pull request's files, the main area shows the file's diff, and Details becomes Your review.

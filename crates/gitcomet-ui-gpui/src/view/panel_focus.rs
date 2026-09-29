@@ -9,6 +9,8 @@
 use super::branch_sidebar::BranchMenuTarget;
 use super::panels::{branch_action_reference, can_amend};
 use super::*;
+use crate::github::{ChecksSummary, ReviewDecision};
+use crate::view::pr_symbols;
 use gitcomet_core::domain::DiffArea;
 use gitcomet_state::model::SidebarMode;
 
@@ -1664,6 +1666,183 @@ impl GitCometView {
                 )
                 .children(rows.iter().map(|&(keys, label)| row(keys, label)))
         };
+        let legend_row = |id: &'static str, icon: AnyElement, label: &'static str| {
+            div()
+                .debug_selector(move || id.to_string())
+                .flex()
+                .items_center()
+                .gap(scale.px(8.0))
+                .py(scale.px(2.0))
+                .child(
+                    div()
+                        .w(scale.px(20.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .text_size(scale.ui_text(13.0))
+                        .text_color(theme.colors.foreground.primary)
+                        .child(label),
+                )
+        };
+        // A section of its own rather than more `key_help` rows: those render
+        // through `shortcut_keys`, which turns any left column text into
+        // keycap chips, and "Symbols" / "Review" aren't keys.
+        let pr_legend = || {
+            let size = scale.px(14.0);
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .pb(scale.px(4.0))
+                        .text_size(scale.ui_text(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.colors.foreground.secondary)
+                        .child("Pull request symbols"),
+                )
+                .child(legend_row(
+                    "legend_open",
+                    pr_symbols::state("OPEN", false, theme).render(
+                        "legend_open".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Open",
+                ))
+                .child(legend_row(
+                    "legend_draft",
+                    pr_symbols::state("OPEN", true, theme).render(
+                        "legend_draft".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Draft",
+                ))
+                .child(legend_row(
+                    "legend_merged",
+                    pr_symbols::state("MERGED", false, theme).render(
+                        "legend_merged".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Merged",
+                ))
+                .child(legend_row(
+                    "legend_closed",
+                    pr_symbols::state("CLOSED", false, theme).render(
+                        "legend_closed".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Closed",
+                ))
+                .child(legend_row(
+                    "legend_review_required",
+                    pr_symbols::review(ReviewDecision::ReviewRequired, theme).render(
+                        "legend_review_required".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Review required",
+                ))
+                .child(legend_row(
+                    "legend_review_approved",
+                    pr_symbols::review(ReviewDecision::Approved, theme).render(
+                        "legend_review_approved".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Approved",
+                ))
+                .child(legend_row(
+                    "legend_review_changes",
+                    pr_symbols::review(ReviewDecision::ChangesRequested, theme).render(
+                        "legend_review_changes".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Changes requested",
+                ))
+                .child(legend_row(
+                    "legend_review_commented",
+                    pr_symbols::review(ReviewDecision::Commented, theme).render(
+                        "legend_review_commented".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Commented",
+                ))
+                .child(legend_row(
+                    "legend_checks_failing",
+                    pr_symbols::checks(
+                        ChecksSummary {
+                            failing: 1,
+                            pending: 0,
+                            passing: 0,
+                        },
+                        theme,
+                    )
+                    .expect("failing > 0 always renders a symbol")
+                    .render("legend_checks_failing".to_string(), theme, size),
+                    "Checks failing",
+                ))
+                .child(legend_row(
+                    "legend_checks_pending",
+                    pr_symbols::checks(
+                        ChecksSummary {
+                            failing: 0,
+                            pending: 1,
+                            passing: 0,
+                        },
+                        theme,
+                    )
+                    .expect("pending > 0 always renders a symbol")
+                    .render("legend_checks_pending".to_string(), theme, size),
+                    "Checks running",
+                ))
+                .child(legend_row(
+                    "legend_checks_passing",
+                    pr_symbols::checks(
+                        ChecksSummary {
+                            failing: 0,
+                            pending: 0,
+                            passing: 1,
+                        },
+                        theme,
+                    )
+                    .expect("passing > 0 always renders a symbol")
+                    .render("legend_checks_passing".to_string(), theme, size),
+                    "Checks passing",
+                ))
+                .child(legend_row(
+                    "legend_person",
+                    pr_symbols::person(theme).render("legend_person".to_string(), theme, size),
+                    "Your pull request",
+                ))
+                .child(legend_row(
+                    "legend_pending",
+                    pr_symbols::pending(1, theme).render(
+                        "legend_pending".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Pending review comments",
+                ))
+                .child(legend_row(
+                    "legend_at_pill",
+                    pr_symbols::at_pill(theme, "legend_at_pill"),
+                    "Your review is requested",
+                ))
+                .child(legend_row(
+                    "legend_kind_tag",
+                    pr_symbols::kind_tag("feat", theme, scale.ui_text(11.0)),
+                    "feat / fix / refactor / docs / deps from the title",
+                ))
+        };
         let body = components::modal_surface(theme)
             .p(scale.px(14.0))
             .flex()
@@ -1677,6 +1856,9 @@ impl GitCometView {
                     .child(format!("Keys · {}", panel.name())),
             )
             .child(section(panel.name(), self.key_help(panel)))
+            .when(self.state.sidebar_mode == SidebarMode::PullRequests, |body| {
+                body.child(pr_legend())
+            })
             .child(section("Every panel", PANEL_KEYS_HELP))
             .child(
                 div()

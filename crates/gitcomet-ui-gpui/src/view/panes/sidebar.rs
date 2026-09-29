@@ -3762,9 +3762,8 @@ impl SidebarPaneView {
         selected: Option<u64>,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
-        use crate::github::ReviewDecision;
-
         let secondary = theme.colors.foreground.secondary;
+        let icon_size = crate::ui_scale::UiScale::current(cx).px(14.0);
         let drafts = self
             .root_view
             .upgrade()
@@ -3806,43 +3805,38 @@ impl SidebarPaneView {
 
         let row = |pr: &crate::github::PullRequestSummary| {
             let number = pr.number;
-            let mut badges: Vec<(String, gpui::Rgba)> = Vec::new();
-            if let Some(pending) = drafts.get(&number) {
-                badges.push((
-                    format!("{pending} drafted"),
-                    theme.colors.status.warning.foreground,
+            let (kind, title) = super::super::pr_symbols::title(&pr.title);
+            let mut symbols = Vec::new();
+            if let Some(review) = pr.review {
+                symbols.push(super::super::pr_symbols::review(review, theme).render(
+                    format!("pr_{number}_review"),
+                    theme,
+                    icon_size,
                 ));
             }
-            if pr.is_draft {
-                badges.push(("Draft".to_string(), secondary));
+            if let Some(checks) = super::super::pr_symbols::checks(pr.checks, theme) {
+                symbols.push(checks.render(format!("pr_{number}_checks"), theme, icon_size));
             }
-            if let Some(review) = pr.review {
-                let color = match review {
-                    ReviewDecision::Approved => theme.colors.status.success.foreground,
-                    ReviewDecision::ChangesRequested => theme.colors.status.danger.foreground,
-                    ReviewDecision::ReviewRequired => theme.colors.status.warning.foreground,
-                };
-                badges.push((review.label().to_string(), color));
+            if let Some(pending) = drafts.get(&number) {
+                symbols.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(super::super::pr_symbols::pending(*pending, theme).render(
+                            format!("pr_{number}_pending"),
+                            theme,
+                            icon_size,
+                        ))
+                        .child(pending.to_string())
+                        .into_any_element(),
+                );
             }
-            let checks = pr.checks;
-            if checks.total() > 0 {
-                let (label, color) = if checks.failing > 0 {
-                    (
-                        format!("{} failing", checks.failing),
-                        theme.colors.status.danger.foreground,
-                    )
-                } else if checks.pending > 0 {
-                    (
-                        format!("{} pending", checks.pending),
-                        theme.colors.status.warning.foreground,
-                    )
-                } else {
-                    (
-                        format!("{} passing", checks.passing),
-                        theme.colors.status.success.foreground,
-                    )
-                };
-                badges.push((label, color));
+            if pr.review_requested {
+                symbols.push(super::super::pr_symbols::at_pill(
+                    theme,
+                    SharedString::from(format!("pr_{number}_at")),
+                ));
             }
             div()
                 .id(SharedString::from(format!("pull_request_row_{number}")))
@@ -3875,9 +3869,42 @@ impl SidebarPaneView {
                 )
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .text_size(theme.ui_text(13.0))
-                        .truncate()
-                        .child(pr.title.clone()),
+                        .child(
+                            super::super::pr_symbols::state("OPEN", pr.is_draft, theme).render(
+                                format!("pr_{number}_state"),
+                                theme,
+                                icon_size,
+                            ),
+                        )
+                        .when(pr.is_mine, |row| {
+                            row.child(super::super::pr_symbols::person(theme).render(
+                                format!("pr_{number}_mine"),
+                                theme,
+                                icon_size,
+                            ))
+                        })
+                        .when_some(kind, |row, kind| {
+                            row.child(super::super::pr_symbols::kind_tag(
+                                kind,
+                                theme,
+                                theme.ui_text(10.0),
+                            ))
+                        })
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_color(if pr.is_draft {
+                                    secondary
+                                } else {
+                                    theme.colors.foreground.primary
+                                })
+                                .child(title.to_owned()),
+                        ),
                 )
                 .child(
                     div()
@@ -3885,13 +3912,11 @@ impl SidebarPaneView {
                         .gap_2()
                         .text_size(theme.ui_text(11.0))
                         .text_color(secondary)
-                        .child(div().truncate().child(format!(
+                        .child(div().flex_1().min_w(px(0.0)).truncate().child(format!(
                             "#{number} · {} · {} → {}",
                             pr.author, pr.head, pr.base
                         )))
-                        .children(badges.into_iter().map(|(label, color)| {
-                            div().flex_none().text_color(color).child(label)
-                        })),
+                        .children(symbols),
                 )
                 .into_any_element()
         };
@@ -3907,12 +3932,21 @@ impl SidebarPaneView {
                 let count = ranks.iter().filter(|other| **other == rank).count();
                 rows.push(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .px_3()
                         .pt_2()
                         .pb_1()
                         .text_size(theme.ui_text(11.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(secondary)
+                        .when(rank == 0, |header| {
+                            header.child(super::super::pr_symbols::at_pill(
+                                theme,
+                                "pr_section_at_pill",
+                            ))
+                        })
                         .child(format!("{title} · {count}"))
                         .into_any_element(),
                 );

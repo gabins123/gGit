@@ -2897,18 +2897,8 @@ impl DetailsPaneView {
                 .text_color(secondary)
                 .child(text)
         };
-        let state = if detail.is_draft {
-            "Draft"
-        } else {
-            match detail.state.as_str() {
-                "MERGED" => "Merged",
-                "CLOSED" => "Closed",
-                _ => "Open",
-            }
-        };
-        let review = detail
-            .review
-            .map_or("No review yet", |review| review.label());
+        let icon_size = crate::ui_scale::UiScale::current(cx).px(16.0);
+        let (kind, title) = super::super::pr_symbols::title(&detail.title);
         let mergeable = match detail.mergeable {
             Some(true) => "No conflicts",
             Some(false) => "Has conflicts",
@@ -2937,11 +2927,56 @@ impl DetailsPaneView {
             .track_scroll(&self.pr_details_scroll)
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_size(theme.ui_text(15.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("{} #{}", detail.title, detail.number)),
+                    .child(
+                        super::super::pr_symbols::state(&detail.state, detail.is_draft, theme)
+                            .render(
+                                format!("pr_detail_{}_state", detail.number),
+                                theme,
+                                icon_size,
+                            ),
+                    )
+                    .when_some(kind, |header, kind| {
+                        header.child(super::super::pr_symbols::kind_tag(
+                            kind,
+                            theme,
+                            theme.ui_text(11.0),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(if detail.is_draft && detail.state == "OPEN" {
+                                secondary
+                            } else {
+                                theme.colors.foreground.primary
+                            })
+                            .child(format!("{title} #{}", detail.number)),
+                    )
+                    .when_some(detail.review, |header, review| {
+                        header.child(super::super::pr_symbols::review(review, theme).render(
+                            format!("pr_detail_{}_review", detail.number),
+                            theme,
+                            icon_size,
+                        ))
+                    })
+                    .when_some(
+                        super::super::pr_symbols::checks(detail.checks, theme),
+                        |header, checks| {
+                            header.child(checks.render(
+                                format!("pr_detail_{}_checks", detail.number),
+                                theme,
+                                icon_size,
+                            ))
+                        },
+                    ),
             )
-            .child(line(format!("{state} · {review} · {mergeable}")))
+            .child(line(mergeable.to_owned()))
             .child(line(format!(
                 "{} wants to merge {} into {}",
                 detail.author, detail.head, detail.base
@@ -2992,25 +3027,24 @@ impl DetailsPaneView {
             panel = panel.child(line("No reviewers yet".to_owned()));
         } else {
             for reviewer in &detail.reviewers {
-                let color = match reviewer.status {
-                    crate::github::PrReviewerStatus::Requested => {
-                        theme.colors.status.warning.foreground
-                    }
-                    crate::github::PrReviewerStatus::Approved => {
-                        theme.colors.status.success.foreground
-                    }
-                    crate::github::PrReviewerStatus::ChangesRequested => {
-                        theme.colors.status.danger.foreground
-                    }
-                    crate::github::PrReviewerStatus::Commented
-                    | crate::github::PrReviewerStatus::Dismissed => secondary,
+                let status_icon = match super::super::pr_symbols::reviewer_status(
+                    reviewer.status,
+                    theme,
+                ) {
+                    Ok(symbol) => symbol.render(
+                        format!("pr_reviewer_{}_status", reviewer.login),
+                        theme,
+                        icon_size,
+                    ),
+                    Err(text) => div().text_color(secondary).child(text).into_any_element(),
                 };
                 panel = panel.child(
                     div()
                         .flex()
+                        .items_center()
                         .gap_2()
                         .text_size(theme.ui_text(12.0))
-                        .child(div().text_color(color).child(reviewer.status.glyph()))
+                        .child(status_icon)
                         .child(format!("{} · {}", reviewer.login, reviewer.status.label())),
                 );
             }
