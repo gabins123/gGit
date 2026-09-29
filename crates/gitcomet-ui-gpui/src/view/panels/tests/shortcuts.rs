@@ -6637,6 +6637,7 @@ mod hook_activity;
 mod image_diff_modes;
 mod markdown_preview_diff;
 mod panel_focus;
+mod reviewer_menu;
 mod status_selection;
 mod window_and_file_actions;
 

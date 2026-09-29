@@ -19,8 +19,10 @@ pub(crate) const MAX_LISTED_FILES: u64 = 3_000;
 /// Files per page of that list; `gh pr view` carries the first page.
 pub(crate) const FILES_PER_PAGE: u64 = 100;
 /// Codex reads the whole diff in one prompt: past these it's too much.
-const MAX_CODEX_FILES: u64 = 100;
-const MAX_CODEX_CHANGED_LINES: u64 = 20_000;
+/// `pub(crate)` so `reviewer::diff_too_large` can apply the same limit to a
+/// reviewer scope's assembled material, not just a whole pull request.
+pub(crate) const MAX_CODEX_FILES: u64 = 100;
+pub(crate) const MAX_CODEX_CHANGED_LINES: u64 = 20_000;
 
 /// How far `gh pr list` looks. Open PRs past this are on GitHub.
 const LIST_LIMIT: u32 = 100;
@@ -2393,6 +2395,25 @@ pub(crate) fn new_pull_request_defaults(
         .unwrap_or_default();
     let (title, body) = fill_from_commits(&commits, branch);
     NewPullRequestDefaults { base, title, body }
+}
+
+/// The default branch's name and its local tracking ref's commit id: the
+/// commit a pull request's base "leaves" the default branch at is measured
+/// from this. `None` when the default branch, or its local tracking ref,
+/// isn't known (never fetched, or no such remote-tracking branch locally).
+pub(crate) fn default_branch_ref_and_oid(workdir: &Path, remote: &str) -> Option<(String, String)> {
+    let branch = default_branch(workdir, remote)?;
+    let mut command = git(workdir);
+    command.args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/remotes/{remote}/{branch}"),
+    ]);
+    let oid = String::from_utf8_lossy(&run_git(command).ok()?)
+        .trim()
+        .to_string();
+    is_object_id(&oid).then_some((branch, oid))
 }
 
 /// `refs/remotes/<remote>/HEAD`, as clone sets it; else main or master.

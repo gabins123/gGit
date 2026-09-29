@@ -234,7 +234,7 @@ pub(super) struct ReviewMode {
     /// Pending comments were written on an older head than the one shown.
     pub(super) head_moved: bool,
     /// A line to put the cursor on once its file's diff is on screen.
-    pending_jump: Option<(ReviewSide, u32)>,
+    pub(super) pending_jump: Option<(ReviewSide, u32)>,
     /// The shown file hasn't had its cursor placed yet.
     needs_cursor: bool,
     /// `d` pressed once on a comment in Your review, waiting for the second.
@@ -2448,7 +2448,7 @@ impl GitCometView {
     ) {
         let Some(review) = self
             .review
-            .as_mut()
+            .as_ref()
             .filter(|review| review.repo_id == repo_id && review.number == number)
         else {
             return;
@@ -2470,18 +2470,93 @@ impl GitCometView {
             );
             return;
         };
+        let total = suggestions.len();
+        let (suggestions, dropped) = self.filter_suggestions_to_hunks(repo_id, number, suggestions);
+        let Some(review) = self
+            .review
+            .as_mut()
+            .filter(|review| review.repo_id == repo_id && review.number == number)
+        else {
+            return;
+        };
         let count = suggestions.len();
         review.suggestions = suggestions;
         self.sync_review_marks(cx);
         self.notify_pull_request_panes(cx);
-        let message = match count {
-            0 => "Codex had no line comments to suggest.".to_string(),
+        let mut message = match count {
+            0 if total == 0 => "Codex had no line comments to suggest.".to_string(),
+            0 => "Codex's line comments were all outside the diff's hunks; none could be kept."
+                .to_string(),
             n => format!(
                 "Codex suggested {n} line comment{}. t steps to them; a adds one to your review, x drops it.",
                 if n == 1 { "" } else { "s" }
             ),
         };
+        if dropped > 0 && count > 0 {
+            message.push_str(&format!(
+                " ({dropped} outside the diff's hunks {} dropped)",
+                if dropped == 1 { "was" } else { "were" }
+            ));
+        }
         self.push_toast(components::ToastKind::Success, message, cx);
+    }
+
+    /// Drops suggestions whose line falls outside the PR's own diff hunks
+    /// (GitHub would refuse the whole review over one such line): best
+    /// effort, so a path whose hunk ranges can't be read right now (still
+    /// loading, or on the old side, which has no equivalent range here)
+    /// passes its suggestions through unfiltered rather than guessing.
+    /// Returns the kept suggestions and how many were dropped.
+    fn filter_suggestions_to_hunks(
+        &self,
+        repo_id: RepoId,
+        number: u64,
+        suggestions: Vec<ReviewComment>,
+    ) -> (Vec<ReviewComment>, usize) {
+        let Some(workdir) = self
+            .state
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .map(|repo| repo.spec.workdir.clone())
+        else {
+            return (suggestions, 0);
+        };
+        let Some(base) = self.review_diff_base(repo_id, number) else {
+            return (suggestions, 0);
+        };
+        let Some(head) = self
+            .review_of(repo_id, number)
+            .map(|review| review.range_head().to_string())
+        else {
+            return (suggestions, 0);
+        };
+        let mut ranges_by_path: FxHashMap<String, Vec<(u32, u32)>> = FxHashMap::default();
+        let mut dropped = 0;
+        let kept = suggestions
+            .into_iter()
+            .filter(|comment| {
+                // Only right-side (added/unchanged, new-file) lines have a
+                // ready-made ranges helper; an old-side line is left as is.
+                if comment.anchor.side != ReviewSide::Right {
+                    return true;
+                }
+                let ranges = ranges_by_path
+                    .entry(comment.anchor.path.clone())
+                    .or_insert_with(|| {
+                        crate::github::pr_hunk_ranges(&workdir, &base, &head, &comment.anchor.path)
+                            .unwrap_or_default()
+                    });
+                let ok = ranges
+                    .iter()
+                    .any(|(lo, hi)| comment.anchor.line >= *lo && comment.anchor.line <= *hi);
+                if !ok {
+                    dropped += 1;
+                }
+                ok
+            })
+            .collect();
+        (kept, dropped)
     }
 
     /// Details shows the thread under the cursor; the cursor lives in the
@@ -2906,12 +2981,31 @@ impl GitCometView {
             self.push_toast(components::ToastKind::Warning, message, cx);
             return;
         };
+        self.review_jump_to(file_ix, anchor.side, anchor.line, window, cx);
+    }
+
+    /// Opens `file_ix` (if it isn't already) and lands the cursor on
+    /// `side`/`line` once its diff is on screen, focusing the diff (or
+    /// asking to once it opens). Shared tail of `review_jump_to_comment`
+    /// (above) and the reviewer menu's `b`-row jump
+    /// (`reviewer_menu::review_jump_to_line`).
+    pub(super) fn review_jump_to(
+        &mut self,
+        file_ix: usize,
+        side: ReviewSide,
+        line: u32,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
         if file_ix != review.file_ix {
             self.review_open_file(file_ix, cx);
         }
         // Lands once the file's diff is on screen (right away if it is).
         if let Some(review) = self.review.as_mut() {
-            review.pending_jump = Some((anchor.side, anchor.line));
+            review.pending_jump = Some((side, line));
         }
         if self.diff_is_open() {
             self.focus_panel(FocusPanel::Diff, window, cx);

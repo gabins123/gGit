@@ -1554,6 +1554,9 @@ impl GitCometView {
     ) -> bool {
         // With nothing focused the root's capture listener never runs, so the
         // open `?` list and Codex menu are served from here too.
+        if self.reviewer_menu.is_some() {
+            return self.handle_reviewer_menu_key(keystroke, window, cx);
+        }
         if self.codex_menu_open {
             return self.handle_codex_menu_key(keystroke, window, cx);
         }
@@ -1575,7 +1578,11 @@ impl GitCometView {
         {
             let key = keystroke.key.as_str();
             if key == "i" {
-                self.codex_menu_open = true;
+                if self.pr_reviewer_context_active() {
+                    self.open_reviewer_menu(cx);
+                } else {
+                    self.codex_menu_open = true;
+                }
                 cx.notify();
                 return true;
             }
@@ -1619,7 +1626,11 @@ impl GitCometView {
                 return true;
             }
             "i" => {
-                self.codex_menu_open = true;
+                if self.pr_reviewer_context_active() {
+                    self.open_reviewer_menu(cx);
+                } else {
+                    self.codex_menu_open = true;
+                }
                 cx.notify();
                 return true;
             }

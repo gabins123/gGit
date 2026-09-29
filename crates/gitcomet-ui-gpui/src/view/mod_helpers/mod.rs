@@ -1156,6 +1156,15 @@ pub struct GitCometView {
     /// The Codex panel, created the first time it is used.
     pub(super) codex: Option<super::codex_panel::CodexPanel>,
     pub(super) codex_menu_open: bool,
+    /// The reviewer `i` menu (scope + `.reviewer`-driven actions), shown
+    /// instead of the plain Codex menu while a pull request is on screen.
+    pub(super) reviewer_menu: Option<super::reviewer_menu::ReviewerMenuState>,
+    /// `.reviewer/` configs, one per PR base commit; see `reviewer_menu.rs`.
+    pub(super) reviewer_cache: super::reviewer_menu::ReviewerCache,
+    /// Set by the reviewer menu's `q` (Ask) when the question box was empty:
+    /// the scope to run it at once a question is typed and `Enter` pressed,
+    /// so that `Enter` routes to the reviewer Ask instead of the plain one.
+    pub(super) pending_reviewer_ask: Option<super::reviewer_menu::ReviewScope>,
     /// The panel `esc` returns to from the Codex panel.
     pub(super) codex_return_panel: super::panel_focus::FocusPanel,
     /// The panel that last held focus, where focus returns when the element

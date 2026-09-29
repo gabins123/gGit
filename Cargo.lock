@@ -2308,6 +2308,7 @@ dependencies = [
  "gitcomet-state",
  "gitcomet-tree-sitter-alloc",
  "gitcomet-win32-window-utils",
+ "glob",
  "gpui-ce",
  "gpui_ce_platform",
  "image",

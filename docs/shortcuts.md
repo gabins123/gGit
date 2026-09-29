@@ -171,9 +171,29 @@ Read-only suggestions from Codex through the `codex` CLI on your ChatGPT subscri
 
 | Action | Key | Notes |
 | --- | --- | --- |
-| Codex actions | `i` | A menu: `m` commit message, `r` review local changes, `d` explain the open diff, `c` explain the selected commit, `f` explain the open file, `p` review the selected pull request, `q` ask about the repository. |
-| Focus the Codex panel | `0` | The answer is editable. In the panel: `y` copy, `u` use as the selected pull request's review, `e` edit, `a` ask, `s` stop a run, `x` or `Escape` close. |
+| Codex actions | `i` | A menu: `m` commit message, `r` review local changes, `d` explain the open diff, `c` explain the selected commit, `f` explain the open file, `p` review the selected pull request, `q` ask about the repository. On the Pull requests tab or in review mode, `i` opens the reviewer menu instead (below). |
+| Focus the Codex panel | `0` | The answer is editable. In the panel: `y` copy, `u` use as the selected pull request's review, `e` edit, `a` ask, `s` stop a run, `x` or `Escape` close. When the answer is a list (`b` brief me, `r` review against the rules), `j` / `k` move over its rows and `Enter` jumps a `b` row to its file and line in review mode. |
 | Draft a review with Codex | `Alt+G` | In the review dialog. The draft fills the box when it is still empty. |
+
+### Reviewer menu
+
+On a pull request (the Pull requests tab or review mode), `i` opens the reviewer menu instead of the plain Codex menu above. It reads a repository-authored `.reviewer/` folder from the pull request's **base commit** (never its head or the worktree): `README.md` is always sent, `checklist.md` is one rule per `- ` line, `areas/*.md` (front matter `paths: [globs]`) are sent only when the scope touches a matching path, and `agents/*.md` (front matter `title`, `key` 1-9, `scope`, optional `paths`) each add a numbered action whose body is the agent's own instructions. A missing or empty folder falls back to a built-in reviewer, and the menu says so; if the pull request itself changes `.reviewer/`, the result says so too. `.reviewer` text is trusted and goes into Codex's instructions; the pull request's own diffs, description and threads stay in the untrusted material, same as everywhere else Codex runs.
+
+| Action | Key | Notes |
+| --- | --- | --- |
+| Scope | `Tab` | Starts at what you're on — the review-mode line selection, else the open file, else the thread under the cursor, else the whole pull request — and widens: Lines -> File -> Commits -> Whole PR. Chips list the `.reviewer` files that will be sent at the current scope. |
+| Move / run | `j` / `k`, `Enter` | Over the action rows; a row's own letter also runs it directly. `Escape` or `i` closes the menu. A disabled row (for example `h` with no thread under the cursor) says why instead of running. |
+| Brief me | `b` | A summary, a reading order, and spots to look at, as a navigable list in the Codex panel. |
+| Explain this | `e` | What the scope's material changes and why. |
+| Thread | `h` | Summarizes the thread under the cursor, checks later commits for a fix, and drafts a reply. Disabled with no thread under the cursor. |
+| Review against the rules | `r` | A verdict (pass, flag or not applicable) per `checklist.md` line, plus findings as the existing Codex line-comment suggestions (`a` adopts, `x` drops). |
+| Test gaps | `t` | What tests are missing for the change. |
+| Description vs code | `v` | Whether the pull request's description matches what its diff actually does. |
+| Draft my review summary | `s` | Fills the Submit dialog's summary, like `Alt+G`. |
+| Ask | `q` | A free question about the scope's material. |
+| `.reviewer/agents` | `1`-`9` | One action per agent found under `.reviewer/agents`, each running that agent's own instructions on the current scope. |
+
+The 100-file / 20,000-line limit that keeps a whole pull request's diff out of one Codex prompt applies to the material a scope actually assembles, so a narrow scope (Lines, File) still works on an otherwise oversized pull request; generated files (see "Show generated files" above) are left out of the material unless the scope is exactly that one file.
 
 ## Text input shortcuts
 
