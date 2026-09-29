@@ -645,6 +645,7 @@ mod tests {
             head_owner: owner.into(),
             base: "main".into(),
             is_draft: false,
+            is_cross_repository: false,
             review: None,
             checks: Default::default(),
             review_requested: false,

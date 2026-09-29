@@ -268,6 +268,8 @@ struct RawSummary {
     #[serde(default)]
     is_draft: bool,
     #[serde(default)]
+    is_cross_repository: bool,
+    #[serde(default)]
     review_decision: String,
     #[serde(default)]
     status_check_rollup: Vec<CheckEntry>,
@@ -289,6 +291,9 @@ pub(crate) struct PullRequestSummary {
     pub(crate) head_owner: String,
     pub(crate) base: String,
     pub(crate) is_draft: bool,
+    /// From a fork: its head branch name means nothing in this repository,
+    /// so it can never be part of a stack here.
+    pub(crate) is_cross_repository: bool,
     pub(crate) review: Option<ReviewDecision>,
     pub(crate) checks: ChecksSummary,
     /// Your review is requested on it.
@@ -313,6 +318,7 @@ impl From<RawSummary> for PullRequestSummary {
             head_owner: raw.head_repository_owner.login,
             base: raw.base_ref_name,
             is_draft: raw.is_draft,
+            is_cross_repository: raw.is_cross_repository,
             review,
             checks: ChecksSummary::from_entries(&raw.status_check_rollup),
             review_requested: false,
@@ -328,6 +334,518 @@ pub(crate) struct PullRequestFile {
     pub(crate) additions: u64,
     #[serde(default)]
     pub(crate) deletions: u64,
+}
+
+/// A stacked pull request unit: every PR from the stack base up. GitHub
+/// allows a PR to have two children (a tree); it is flattened here, depth
+/// first, ordered by number, so it still "shows as one" — `stack_parent`,
+/// `stack_child` and `stack_depth` below recover the real shape from base and
+/// head branches (or, for a native stack, straight-line by construction).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestStack {
+    /// Every pull request in the stack; `members[0]` is always the base.
+    pub(crate) members: Vec<u64>,
+    /// One of GitHub's own stacks (the GraphQL `stack` field), not just a
+    /// base-branch chain gGit inferred.
+    pub(crate) native: bool,
+}
+
+/// Builds stacks from the base-branch chain: PR B is on PR A when B's base
+/// branch is A's head branch, both in `repo_owner`'s repository (a fork's PR
+/// can't stack: GitHub's `isCrossRepository` is trusted first, a
+/// case-insensitive owner compare backs it up in case gh ever fails to
+/// report it). `native_stacks` are GitHub's own stacks (from the live
+/// GraphQL `stack` field, see `native_stacks` below); a chain is `native`
+/// when its member set matches one of them exactly. Pure and cycle-safe: a
+/// chain that loops back on itself stops instead of growing forever.
+pub(crate) fn compute_pull_request_stacks(
+    prs: &[PullRequestSummary],
+    repo_owner: &str,
+    native_stacks: &[PullRequestStack],
+) -> Vec<PullRequestStack> {
+    use std::collections::HashMap;
+
+    let eligible: Vec<&PullRequestSummary> = prs
+        .iter()
+        .filter(|pr| !pr.is_cross_repository && pr.head_owner.eq_ignore_ascii_case(repo_owner))
+        .collect();
+    let by_head: HashMap<&str, u64> = eligible
+        .iter()
+        .map(|pr| (pr.head.as_str(), pr.number))
+        .collect();
+    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut has_parent: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for pr in &eligible {
+        if let Some(&parent) = by_head.get(pr.base.as_str())
+            && parent != pr.number
+        {
+            children.entry(parent).or_default().push(pr.number);
+            has_parent.insert(pr.number);
+        }
+    }
+    for kids in children.values_mut() {
+        kids.sort_unstable();
+    }
+
+    let mut roots: Vec<u64> = eligible
+        .iter()
+        .map(|pr| pr.number)
+        .filter(|number| !has_parent.contains(number) && children.contains_key(number))
+        .collect();
+    roots.sort_unstable();
+
+    roots
+        .into_iter()
+        .filter_map(|root| stack_from_root(root, &children))
+        .map(|members| {
+            let native = native_stacks.iter().any(|native| {
+                native.members.len() == members.len()
+                    && native.members.iter().all(|number| members.contains(number))
+            });
+            PullRequestStack { members, native }
+        })
+        .collect()
+}
+
+/// Every pull request reachable from `root` through `children`, depth-first
+/// pre-order (a parent before its children), or `None` when that's fewer
+/// than the two pull requests a stack needs. Cycle-safe: a number already
+/// visited is never queued again.
+fn stack_from_root(
+    root: u64,
+    children: &std::collections::HashMap<u64, Vec<u64>>,
+) -> Option<Vec<u64>> {
+    let mut members = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = vec![root];
+    while let Some(number) = pending.pop() {
+        if !visited.insert(number) {
+            continue;
+        }
+        members.push(number);
+        if let Some(kids) = children.get(&number) {
+            pending.extend(kids.iter().rev());
+        }
+    }
+    (members.len() >= 2).then_some(members)
+}
+
+/// The pull request `number`'s base branch points at, among `members` — its
+/// real parent, not just the entry before it in a flattened list (a tree's
+/// depth-first order can put a sibling there instead).
+pub(crate) fn stack_parent(members: &[u64], number: u64, prs: &[PullRequestSummary]) -> Option<u64> {
+    let pr = prs.iter().find(|pr| pr.number == number)?;
+    members.iter().copied().find(|&candidate| {
+        candidate != number
+            && prs
+                .iter()
+                .any(|other| other.number == candidate && other.head == pr.base)
+    })
+}
+
+/// The lowest-numbered pull request based directly on `number`, among
+/// `members` — deterministic when `number` has more than one child.
+pub(crate) fn stack_child(members: &[u64], number: u64, prs: &[PullRequestSummary]) -> Option<u64> {
+    let pr = prs.iter().find(|pr| pr.number == number)?;
+    members
+        .iter()
+        .copied()
+        .filter(|&candidate| {
+            candidate != number
+                && prs
+                    .iter()
+                    .any(|other| other.number == candidate && other.base == pr.head)
+        })
+        .min()
+}
+
+/// `number`'s distance from the stack's base (0 = bottom), following real
+/// parent links (`stack_parent`) rather than a flattened member order a tree
+/// can put out of a line. `None` when `number` isn't among `members`.
+pub(crate) fn stack_depth(members: &[u64], number: u64, prs: &[PullRequestSummary]) -> Option<usize> {
+    if !members.contains(&number) {
+        return None;
+    }
+    let mut depth = 0;
+    let mut current = number;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(parent) = stack_parent(members, current, prs) {
+        if !seen.insert(current) {
+            break;
+        }
+        depth += 1;
+        current = parent;
+    }
+    Some(depth)
+}
+
+/// GitHub's own stacks among `numbers` (queried pull requests), read from the
+/// live GraphQL `stack` field: each stack's members, in GitHub's own order
+/// (its `entries`, sorted by `position`; `members[0]` is the stack's base).
+/// Best-effort: a repository without the public preview, or any GraphQL
+/// failure, comes back empty rather than failing the whole list.
+pub(crate) fn native_stacks(workdir: &Path, repo: &str, numbers: &[u64]) -> Vec<PullRequestStack> {
+    if numbers.is_empty() || !is_repo_slug(repo) {
+        return Vec::new();
+    }
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Vec::new();
+    };
+    let mut fields = String::new();
+    for number in numbers {
+        if *number > i32::MAX as u64 {
+            continue;
+        }
+        fields.push_str(&format!(
+            "pr{number}: pullRequest(number: {number}) {{ stack {{ number entries(first: 50) {{ nodes {{ position pullRequest {{ number }} }} }} }} }}\n"
+        ));
+    }
+    let query =
+        format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ {fields} }} }}");
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "graphql",
+        "--hostname=github.com",
+        &format!("--raw-field=query={query}"),
+    ]);
+    match run(command, None) {
+        Ok(bytes) => parse_native_stacks(&bytes).unwrap_or_default(),
+        Err(err) => {
+            eprintln!("Couldn't read GitHub's native pull request stacks: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn parse_native_stacks(bytes: &[u8]) -> Result<Vec<PullRequestStack>, PrError> {
+    #[derive(Deserialize)]
+    struct EntryPr {
+        number: u64,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EntryNode {
+        position: i64,
+        #[serde(default)]
+        pull_request: Option<EntryPr>,
+    }
+    #[derive(Deserialize, Default)]
+    struct EntryConnection {
+        #[serde(default)]
+        nodes: Vec<Option<EntryNode>>,
+    }
+    #[derive(Deserialize)]
+    struct Stack {
+        number: u64,
+        #[serde(default)]
+        entries: EntryConnection,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        stack: Option<Stack>,
+    }
+    let value: serde_json::Value = parse_json(bytes)?;
+    let repository = value
+        .get("data")
+        .and_then(|data| data.get("repository"))
+        .and_then(|repo| repo.as_object())
+        .ok_or_else(|| PrError::Failed("unexpected gh output".to_string()))?;
+    let mut by_stack_id: std::collections::HashMap<u64, Vec<(i64, u64)>> =
+        std::collections::HashMap::new();
+    for entry in repository.values() {
+        if entry.is_null() {
+            continue;
+        }
+        let entry: Entry = serde_json::from_value(entry.clone())
+            .map_err(|err| PrError::Failed(format!("unexpected gh output: {err}")))?;
+        let Some(stack) = entry.stack else { continue };
+        let members = by_stack_id.entry(stack.number).or_default();
+        for node in stack.entries.nodes.into_iter().flatten() {
+            let Some(pr) = node.pull_request else { continue };
+            if !members.iter().any(|(_, number)| *number == pr.number) {
+                members.push((node.position, pr.number));
+            }
+        }
+    }
+    let mut stacks: Vec<PullRequestStack> = by_stack_id
+        .into_values()
+        .filter_map(|mut members| {
+            members.sort_by_key(|(position, _)| *position);
+            let members: Vec<u64> = members.into_iter().map(|(_, number)| number).collect();
+            (members.len() >= 2).then_some(PullRequestStack {
+                members,
+                native: true,
+            })
+        })
+        .collect();
+    stacks.sort_by_key(|stack| stack.members.first().copied());
+    Ok(stacks)
+}
+
+/// What merging `number` in `stack` would do, following GitHub's stacked
+/// merge rules: the selected pull request and every unmerged one below it
+/// land together, bottom-up. Only the pull requests *below* `number` need to
+/// be approved, pass their checks, and be ready; `number` itself only needs
+/// to satisfy the base branch's protection rules, which GitHub checks (and
+/// reports through `merge_stack`'s `failed` outcome) at merge time — as does
+/// a non-linear stack, so this never re-derives that shape itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StackMergePlan {
+    /// This pull request and everything below it, bottom-up: what merges.
+    pub(crate) merges: Vec<u64>,
+    /// The rest of the stack, staying open.
+    pub(crate) stays_open: Vec<u64>,
+    /// Why the merge is refused, naming the pull request, or `None` when it
+    /// can go ahead.
+    pub(crate) refusal: Option<String>,
+}
+
+/// Plans a stack merge of `number`, or `None` when it isn't in `stack`.
+pub(crate) fn plan_stack_merge(
+    stack: &PullRequestStack,
+    number: u64,
+    prs: &[PullRequestSummary],
+) -> Option<StackMergePlan> {
+    let ix = stack.members.iter().position(|member| *member == number)?;
+    let by_number: std::collections::HashMap<u64, &PullRequestSummary> =
+        prs.iter().map(|pr| (pr.number, pr)).collect();
+    let refuse = |reason: String| StackMergePlan {
+        merges: Vec::new(),
+        stays_open: stack.members.clone(),
+        refusal: Some(reason),
+    };
+    for &below in &stack.members[..ix] {
+        let Some(pr) = by_number.get(&below) else {
+            return Some(refuse(format!(
+                "#{below} below isn't loaded — refresh or open on GitHub"
+            )));
+        };
+        // No review decision at all means this repository doesn't require
+        // one: that's fine. Anything short of approved is not.
+        if matches!(pr.review, Some(decision) if decision != ReviewDecision::Approved) {
+            return Some(refuse(format!("#{below} isn't approved")));
+        }
+        if pr.checks.failing > 0 {
+            return Some(refuse(format!("#{below} has failing checks")));
+        }
+        if pr.checks.pending > 0 {
+            return Some(refuse(format!("#{below} has checks still running")));
+        }
+        if pr.is_draft {
+            return Some(refuse(format!("#{below} is a draft")));
+        }
+    }
+    Some(StackMergePlan {
+        merges: stack.members[..=ix].to_vec(),
+        stays_open: stack.members[ix + 1..].to_vec(),
+        refusal: None,
+    })
+}
+
+/// How long `merge_stack` polls GitHub's asynchronous merge job before
+/// reporting the outcome as unknown (not failed: GitHub may still finish it).
+const STACK_MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const STACK_MERGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Transient poll failures (a dropped connection, a gh hiccup) tolerated
+/// before giving up on the poll and reporting the outcome as unknown.
+const STACK_MERGE_MAX_POLL_FAILURES: u32 = 3;
+
+/// What GitHub did with a stack merge. Both are terminal: `Enqueued` means it
+/// went into a required merge queue instead of merging immediately, and
+/// GitHub gives nothing further to poll for once it has.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StackMergeOutcome {
+    Merged,
+    Enqueued,
+}
+
+/// The JSON body `merge_stack` sends: the merge method, and the head commit
+/// pinned the way the single-PR path's `--match-head-commit` pins it — per
+/// GitHub's docs, "if the PR is pushed in between the merge being requested
+/// and being executed, the merge will be cancelled."
+fn merge_async_payload(method: MergeMethod, head_oid: &str) -> String {
+    serde_json::json!({
+        "merge_method": method.api_name(),
+        "sha": head_oid,
+    })
+    .to_string()
+}
+
+/// Merges `number` through GitHub's asynchronous stack merge API
+/// (`PUT .../pulls/{number}/merge-async`), the one GitHub documents as
+/// required for a stacked pull request: "the operation includes all open
+/// downstack pull requests." Polls `GET .../merge-async/{uuid}` while the job
+/// is `pending`.
+pub(crate) fn merge_stack(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+    method: MergeMethod,
+    head_oid: &str,
+) -> Result<StackMergeOutcome, PrError> {
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
+    if !is_object_id(head_oid) {
+        return Err(PrError::Failed(format!(
+            "#{number}'s head commit isn't known yet"
+        )));
+    }
+    let payload = merge_async_payload(method, head_oid);
+    let mut start = gh(workdir);
+    start.args([
+        "api",
+        "--hostname=github.com",
+        &format!("repos/{repo}/pulls/{number}/merge-async"),
+        "--method=PUT",
+        "--input=-",
+    ]);
+    let mut job = parse_merge_async_job(&run_merge_async_start(start, &payload)?)?;
+    let deadline = std::time::Instant::now() + STACK_MERGE_TIMEOUT;
+    let mut poll_failures = 0u32;
+    let unknown = || {
+        PrError::Failed(format!(
+            "#{number}'s stack merge outcome is unknown; check it on GitHub"
+        ))
+    };
+    loop {
+        match job.status {
+            MergeAsyncStatus::Merged => return Ok(StackMergeOutcome::Merged),
+            MergeAsyncStatus::Enqueued => return Ok(StackMergeOutcome::Enqueued),
+            MergeAsyncStatus::Failed => {
+                return Err(PrError::Failed(job.message.unwrap_or_else(|| {
+                    format!("#{number}'s stack merge failed on GitHub")
+                })));
+            }
+            MergeAsyncStatus::Pending => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(unknown());
+        }
+        std::thread::sleep(STACK_MERGE_POLL_INTERVAL);
+        let Some(uuid) = job.uuid.clone() else {
+            return Err(unknown());
+        };
+        let mut poll = gh(workdir);
+        poll.args([
+            "api",
+            "--hostname=github.com",
+            &format!("repos/{repo}/pulls/{number}/merge-async/{uuid}"),
+        ]);
+        match run(poll, None).and_then(|bytes| parse_merge_async_job(&bytes)) {
+            Ok(next) => {
+                job = next;
+                poll_failures = 0;
+            }
+            Err(_) => {
+                poll_failures += 1;
+                if poll_failures >= STACK_MERGE_MAX_POLL_FAILURES {
+                    return Err(unknown());
+                }
+            }
+        }
+    }
+}
+
+/// GitHub's asynchronous merge job status
+/// (`pending`/`merged`/`enqueued`/`failed`, per GitHub's OpenAPI schema for
+/// `pull-request-merge-async-result`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeAsyncStatus {
+    Pending,
+    Merged,
+    Enqueued,
+    Failed,
+}
+
+/// GitHub's asynchronous merge job, as both `merge-async` and its polling
+/// endpoint return it: `{status, details}`. `details.uuid` polls a `pending`
+/// job; `details.message` explains a `failed` one.
+struct MergeAsyncJob {
+    status: MergeAsyncStatus,
+    uuid: Option<String>,
+    message: Option<String>,
+}
+
+fn parse_merge_async_job(bytes: &[u8]) -> Result<MergeAsyncJob, PrError> {
+    #[derive(Deserialize, Default)]
+    struct RawDetails {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        uuid: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct RawJob {
+        status: String,
+        #[serde(default)]
+        details: Option<RawDetails>,
+    }
+    let raw: RawJob = parse_json(bytes)?;
+    let status = match raw.status.as_str() {
+        "pending" => MergeAsyncStatus::Pending,
+        "merged" => MergeAsyncStatus::Merged,
+        "enqueued" => MergeAsyncStatus::Enqueued,
+        "failed" => MergeAsyncStatus::Failed,
+        other => {
+            return Err(PrError::Failed(format!(
+                "unexpected gh output: unknown merge status {other}"
+            )));
+        }
+    };
+    let details = raw.details.unwrap_or_default();
+    Ok(MergeAsyncJob {
+        status,
+        uuid: details.uuid,
+        message: details.message,
+    })
+}
+
+/// `run`, but on a non-zero exit it first looks at stdout for GitHub's own
+/// explanation: `merge-async` returns its `{status, details}` body even on
+/// 400 and 409 (a non-linear stack, a branch protection rule), and gh's exit
+/// code otherwise hides it behind a generic HTTP error that only stderr's
+/// status line explains. Used only by `merge_stack`'s starting `PUT`; every
+/// other caller keeps plain `run`, whose stderr-only failure is what gh
+/// normally gives.
+fn run_merge_async_start(mut command: Command, body: &str) -> Result<Vec<u8>, PrError> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => PrError::GhMissing,
+        _ => PrError::Failed(err.to_string()),
+    })?;
+    if let Some(mut pipe) = child.stdin.take() {
+        // A write error surfaces as the child's own failure below.
+        let _ = pipe.write_all(body.as_bytes());
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| PrError::Failed(err.to_string()))?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    if let Some(message) = merge_async_failure_message(&output.stdout) {
+        return Err(PrError::Failed(message));
+    }
+    Err(classify_failure(
+        String::from_utf8_lossy(&output.stderr).trim(),
+    ))
+}
+
+/// GitHub's own explanation from a `merge-async` response's
+/// `details.message`, when gh's stdout on a failed exit is that response
+/// body (a 400 or 409, per GitHub's OpenAPI schema for
+/// `pull-request-merge-async-result`); `None` when stdout isn't that body,
+/// or has no message.
+fn merge_async_failure_message(stdout: &[u8]) -> Option<String> {
+    parse_merge_async_job(stdout).ok()?.message
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -970,6 +1488,15 @@ impl MergeMethod {
             Self::Rebase => "--rebase",
         }
     }
+
+    /// The REST API's own spelling, for the async stack merge's JSON body.
+    fn api_name(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
 }
 
 /// What the merge dialog confirmed.
@@ -1078,7 +1605,7 @@ pub(crate) fn list_open(
         &repo_flag(repo),
         "--state=open",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
     ]);
     let raw: Vec<RawSummary> = parse_json(&run(command, None)?)?;
     let complete = raw.len() < LIST_LIMIT as usize;
@@ -1093,7 +1620,7 @@ pub(crate) fn list_open(
         "--state=open",
         "--search=review-requested:@me",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
     ]);
     // Run alongside the login lookup below: both are independent `gh` calls
     // on the critical path of every list load and refresh.
@@ -2937,5 +3464,383 @@ mod tests {
         assert!(!is_object_id("--upload-pack=evil"));
         assert!(!is_object_id("HEAD"));
         assert!(!is_object_id(&"g".repeat(40)));
+    }
+
+    fn stack_pr(number: u64, head: &str, base: &str, owner: &str) -> super::PullRequestSummary {
+        super::PullRequestSummary {
+            number,
+            title: format!("pr {number}"),
+            author: "someone".to_string(),
+            head: head.to_string(),
+            head_owner: owner.to_string(),
+            base: base.to_string(),
+            is_draft: false,
+            is_cross_repository: false,
+            review: None,
+            checks: super::ChecksSummary::default(),
+            review_requested: false,
+            is_mine: false,
+        }
+    }
+
+    #[test]
+    fn a_linear_chain_becomes_one_stack_bottom_first() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+            stack_pr(3, "feat-c", "feat-b", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].members, vec![1, 2, 3]);
+        assert!(!stacks[0].native);
+    }
+
+    #[test]
+    fn a_pr_with_two_children_is_a_tree_shown_as_one_stack() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+            stack_pr(3, "feat-c", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].members.len(), 3);
+        assert_eq!(stacks[0].members[0], 1);
+        assert_eq!(
+            stacks[0].members[1..].iter().collect::<std::collections::HashSet<_>>(),
+            [&2, &3].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn a_cross_repository_pull_request_never_stacks() {
+        let mut fork = stack_pr(2, "feat-a", "feat-a", "me");
+        fork.is_cross_repository = true;
+        let prs = vec![stack_pr(1, "feat-a", "dev", "me"), fork];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn a_differently_owned_head_never_stacks_even_when_not_flagged_cross_repository() {
+        // The case-insensitive owner compare is a fallback for when
+        // `isCrossRepository` itself can't be trusted.
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "someone-else"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn the_owner_compare_is_case_insensitive() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "Me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "ME", &[]);
+        assert_eq!(stacks.len(), 1);
+    }
+
+    #[test]
+    fn a_base_branch_cycle_does_not_grow_the_stack_forever() {
+        // Two pull requests whose base branches point at each other: not a
+        // real GitHub state, but detection must terminate and skip it.
+        let prs = vec![
+            stack_pr(1, "feat-a", "feat-b", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn a_pr_whose_base_branch_has_no_pull_request_is_not_a_stack() {
+        let prs = vec![stack_pr(1, "feat-a", "dev", "me")];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn a_chain_matching_a_native_stacks_members_is_native() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let native = [super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        }];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &native);
+        assert_eq!(stacks.len(), 1);
+        assert!(stacks[0].native);
+    }
+
+    #[test]
+    fn a_chain_with_no_matching_native_stack_stays_a_plain_base_branch_chain() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert_eq!(stacks.len(), 1);
+        assert!(!stacks[0].native);
+    }
+
+    #[test]
+    fn stack_parent_and_child_follow_real_base_and_head_not_flattened_order() {
+        // 1 has two children, 2 and 3: a tree, flattened as [1, 2, 3] or
+        // [1, 3, 2] depending on traversal, but 2 and 3 are siblings, not
+        // parent and child.
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+            stack_pr(3, "feat-c", "feat-a", "me"),
+        ];
+        let members = [1, 2, 3];
+        assert_eq!(super::stack_parent(&members, 2, &prs), Some(1));
+        assert_eq!(super::stack_parent(&members, 3, &prs), Some(1));
+        assert_eq!(super::stack_parent(&members, 1, &prs), None);
+        // Two children: the lowest number wins, deterministically.
+        assert_eq!(super::stack_child(&members, 1, &prs), Some(2));
+        assert_eq!(super::stack_depth(&members, 1, &prs), Some(0));
+        assert_eq!(super::stack_depth(&members, 2, &prs), Some(1));
+        assert_eq!(super::stack_depth(&members, 3, &prs), Some(1));
+        assert_eq!(super::stack_depth(&members, 99, &prs), None);
+    }
+
+    fn approved_stack_pr(number: u64, head: &str, base: &str) -> super::PullRequestSummary {
+        let mut pr = stack_pr(number, head, base, "me");
+        pr.review = Some(super::ReviewDecision::Approved);
+        pr
+    }
+
+    #[test]
+    fn merging_the_top_of_a_clean_stack_takes_everything_below_it() {
+        let prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+            approved_stack_pr(3, "feat-c", "feat-b"),
+        ];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2, 3],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.merges, vec![1, 2]);
+        assert_eq!(plan.stays_open, vec![3]);
+        assert_eq!(plan.refusal, None);
+    }
+
+    #[test]
+    fn the_selected_pull_request_itself_needs_no_review_or_checks() {
+        // Only #1 (below #2) is checked; #2 itself has no review and no
+        // checks recorded, and that's fine: branch protection is GitHub's
+        // job at merge time.
+        let prs = vec![approved_stack_pr(1, "feat-a", "dev"), stack_pr(2, "feat-b", "feat-a", "me")];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, None);
+    }
+
+    #[test]
+    fn no_review_decision_below_is_not_a_refusal() {
+        // A repository with no required reviews reports no decision at all;
+        // that must not be confused with an explicit non-approval.
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, None);
+    }
+
+    #[test]
+    fn an_unapproved_pull_request_below_refuses_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].review = Some(super::ReviewDecision::ChangesRequested);
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert!(plan.merges.is_empty());
+        assert_eq!(plan.refusal, Some("#1 isn't approved".to_string()));
+    }
+
+    #[test]
+    fn failing_checks_below_refuse_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].checks.failing = 1;
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, Some("#1 has failing checks".to_string()));
+    }
+
+    #[test]
+    fn pending_checks_below_refuse_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].checks.pending = 1;
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, Some("#1 has checks still running".to_string()));
+    }
+
+    #[test]
+    fn a_draft_below_refuses_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].is_draft = true;
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, Some("#1 is a draft".to_string()));
+    }
+
+    #[test]
+    fn a_below_pull_request_missing_from_the_loaded_list_refuses_by_name() {
+        // #1 exists in the real stack (GitHub said so) but never loaded
+        // locally: LIST_LIMIT, a filter, or a merged pull request gh's list
+        // left out.
+        let prs = vec![approved_stack_pr(2, "feat-b", "feat-a")];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert!(plan.merges.is_empty());
+        assert_eq!(
+            plan.refusal,
+            Some("#1 below isn't loaded — refresh or open on GitHub".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_async_payload_pins_the_head_and_names_the_method() {
+        let payload = super::merge_async_payload(super::MergeMethod::Squash, "deadbeef");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("json");
+        assert_eq!(value["merge_method"], "squash");
+        assert_eq!(value["sha"], "deadbeef");
+    }
+
+    #[test]
+    fn merge_async_job_reads_a_pending_result() {
+        let job = super::parse_merge_async_job(
+            br#"{"status": "pending", "details": {"message": "Merge in progress", "uuid": "11111111-1111-1111-1111-111111111111", "merge_method": "merge", "merge_action": "merge", "expected_head_sha": "deadbeef"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Pending);
+        assert_eq!(
+            job.uuid.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+    }
+
+    #[test]
+    fn merge_async_job_reads_a_merged_result() {
+        let job = super::parse_merge_async_job(br#"{"status": "merged"}"#).expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Merged);
+    }
+
+    #[test]
+    fn merge_async_job_reads_an_enqueued_result() {
+        let job = super::parse_merge_async_job(
+            br#"{"status": "enqueued", "details": {"message": "Added to the merge queue"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Enqueued);
+    }
+
+    #[test]
+    fn merge_async_job_reads_a_failed_result_with_its_message() {
+        let job = super::parse_merge_async_job(
+            br#"{"status": "failed", "details": {"message": "Required status check has not succeeded"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Failed);
+        assert_eq!(
+            job.message.as_deref(),
+            Some("Required status check has not succeeded")
+        );
+    }
+
+    #[test]
+    fn a_409_failed_body_on_stdout_gives_githubs_own_reason() {
+        // A 400 or 409 from `merge-async` still returns the
+        // `pull-request-merge-async-result` body; gh's own exit is non-zero,
+        // but the reason is on stdout, not stderr.
+        let stdout = br#"{"status": "failed", "details": {"message": "The stack needs to be rebased before it can be merged"}}"#;
+        assert_eq!(
+            super::merge_async_failure_message(stdout),
+            Some("The stack needs to be rebased before it can be merged".to_string())
+        );
+    }
+
+    #[test]
+    fn stdout_that_isnt_a_merge_async_body_has_no_message() {
+        assert_eq!(super::merge_async_failure_message(b"not json"), None);
+        assert_eq!(
+            super::merge_async_failure_message(br#"{"message": "some other API error"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn native_stacks_parse_dynamic_graphql_aliases_ordered_by_position() {
+        let body = br#"{"data":{"repository":{
+            "pr1": {"stack": {"number": 7, "entries": {"nodes": [
+                {"position": 1, "pullRequest": {"number": 2}},
+                {"position": 0, "pullRequest": {"number": 1}}
+            ]}}},
+            "pr2": {"stack": {"number": 7, "entries": {"nodes": [
+                {"position": 1, "pullRequest": {"number": 2}},
+                {"position": 0, "pullRequest": {"number": 1}}
+            ]}}},
+            "pr3": {"stack": null},
+            "pr4": null
+        }}}"#;
+        let stacks = super::parse_native_stacks(body).expect("parses");
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].members, vec![1, 2]);
+        assert!(stacks[0].native);
+    }
+
+    #[test]
+    fn a_native_stack_with_only_one_entry_is_dropped() {
+        let body = br#"{"data":{"repository":{
+            "pr1": {"stack": {"number": 7, "entries": {"nodes": [
+                {"position": 0, "pullRequest": {"number": 1}}
+            ]}}}
+        }}}"#;
+        let stacks = super::parse_native_stacks(body).expect("parses");
+        assert!(stacks.is_empty());
     }
 }

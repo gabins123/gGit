@@ -102,9 +102,30 @@ pub(super) struct SelectedCommitRange {
     pub(super) total: usize,
 }
 
+/// The merge dialog's note for a pull request on a plain base-branch chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum BaseChainMergeNote {
+    /// Not the chain's bottom: names where it actually merges, and the
+    /// stack's real base.
+    NotStackBase { into: String, stack_base: String },
+    /// The chain's bottom: deleting the branch (`Alt+D`) retargets the next
+    /// pull request to this one's base.
+    BottomOfChain,
+}
+
 #[derive(Default)]
 pub(super) struct RepoPullRequests {
     pub(super) list: PrLoad<Arc<Vec<PullRequestSummary>>>,
+    /// The stacks found in `list` (base-branch chains, `native` marked where
+    /// GitHub's own stack agrees), recomputed with it. Drives the list's
+    /// grouping, Details' Stack section, and `<`/`>`. Empty when the
+    /// repository has none.
+    pub(super) stacks: Vec<github::PullRequestStack>,
+    /// GitHub's own stacks (from the live GraphQL `stack` field), queried
+    /// only for `stacks`' members. The merge dialog and `submit_pull_request_merge`
+    /// use this, per pull request, rather than `stacks`' chain-wide `native`
+    /// flag: a chain can be a real stack for only part of its members.
+    pub(super) native_stacks: Vec<github::PullRequestStack>,
     pub(super) selected: Option<u64>,
     pub(super) detail: PrLoad<Arc<PullRequestDetail>>,
     pub(super) threads: PrLoad<Arc<Vec<github::ReviewThread>>>,
@@ -158,6 +179,173 @@ impl RepoPullRequests {
             .map(|threads| visible_pr_thread_indexes(threads, self.show_hidden_threads))
             .unwrap_or_default()
     }
+
+    /// The merge dialog's note for a pull request on a plain base-branch
+    /// chain (not one of GitHub's own native stacks, where the stack merge
+    /// plan is shown instead): where the merge actually lands, or that
+    /// deleting the branch retargets the next pull request.
+    pub(super) fn base_chain_merge_note(&self, number: u64) -> Option<BaseChainMergeNote> {
+        if self.native_stack_containing(number).is_some() {
+            return None;
+        }
+        let (stack, _) = self.stack_position(number)?;
+        let list = self.list.ready()?;
+        let base_of = |candidate: u64| {
+            list.iter()
+                .find(|pr| pr.number == candidate)
+                .map(|pr| pr.base.clone())
+        };
+        if github::stack_parent(&stack.members, number, list).is_none() {
+            Some(BaseChainMergeNote::BottomOfChain)
+        } else {
+            Some(BaseChainMergeNote::NotStackBase {
+                into: base_of(number)?,
+                stack_base: base_of(stack.members[0])?,
+            })
+        }
+    }
+
+    /// The native GitHub stack `number` belongs to, if any — per pull
+    /// request, not `stacks`' chain-wide `native` flag: a chain can be a
+    /// real stack for only part of its members.
+    fn native_stack_containing(&self, number: u64) -> Option<&github::PullRequestStack> {
+        self.native_stacks
+            .iter()
+            .find(|stack| stack.members.contains(&number))
+    }
+
+    /// What merging `number` would do, when GitHub reports it as part of one
+    /// of its own stacks. `None` outside a native stack, where merging works
+    /// as it does today.
+    pub(super) fn stack_merge_plan(&self, number: u64) -> Option<github::StackMergePlan> {
+        let stack = self.native_stack_containing(number)?;
+        let list = self.list.ready()?;
+        github::plan_stack_merge(stack, number, list)
+    }
+
+    /// The stack `number` belongs to (for display: base-branch chains,
+    /// native or not), and its position within it (bottom is 0). The
+    /// position is the flattened member index; for a real depth, or the
+    /// actual parent/child, see `github::stack_depth`/`stack_parent`/
+    /// `stack_child`, which follow base/head links instead — a tree can put
+    /// siblings next to each other in this flattened order.
+    pub(super) fn stack_position(&self, number: u64) -> Option<(&github::PullRequestStack, usize)> {
+        self.stacks.iter().find_map(|stack| {
+            stack
+                .members
+                .iter()
+                .position(|member| *member == number)
+                .map(|ix| (stack, ix))
+        })
+    }
+
+    /// The pull request below (`direction < 0`, its real parent) or above
+    /// (`direction > 0`, its lowest-numbered child) `number` in its stack,
+    /// or `None` off either end or outside a stack.
+    pub(super) fn stack_neighbor(&self, number: u64, direction: i8) -> Option<u64> {
+        let (stack, _) = self.stack_position(number)?;
+        let list = self.list.ready()?;
+        if direction < 0 {
+            github::stack_parent(&stack.members, number, list)
+        } else {
+            github::stack_child(&stack.members, number, list)
+        }
+    }
+}
+
+/// `inbox_rank` for every pull request in `list`, except a stack's members
+/// all take the stack's best (lowest) rank: otherwise a stack that straddles
+/// ranks (one member waiting on review, another not) would split its own
+/// section header, or interleave sections around itself.
+pub(super) fn stack_adjusted_ranks(
+    list: &[PullRequestSummary],
+    drafts: &FxHashMap<u64, usize>,
+    stacks: &[github::PullRequestStack],
+) -> Vec<u8> {
+    let mut ranks: Vec<u8> = list.iter().map(|pr| inbox_rank(pr, drafts)).collect();
+    let index_of: FxHashMap<u64, usize> = list
+        .iter()
+        .enumerate()
+        .map(|(ix, pr)| (pr.number, ix))
+        .collect();
+    for stack in stacks {
+        let Some(best) = stack
+            .members
+            .iter()
+            .filter_map(|number| index_of.get(number))
+            .map(|&ix| ranks[ix])
+            .min()
+        else {
+            continue;
+        };
+        for member in &stack.members {
+            if let Some(&ix) = index_of.get(member) {
+                ranks[ix] = best;
+            }
+        }
+    }
+    ranks
+}
+
+/// The base-branch chains in `list`, and GitHub's own stacks among them
+/// (`native` marked correctly once those are known). The GraphQL stack query
+/// only ever asks about pull requests already in a chain — skipped entirely
+/// when there are none — since GitHub's real stacks are a subset of gGit's
+/// inferred chains. Best-effort: a failed or unsupported stack query leaves
+/// every chain plain rather than breaking the list.
+fn compute_stacks_and_native(
+    workdir: &std::path::Path,
+    repo: &str,
+    list: &[PullRequestSummary],
+    owner: &str,
+) -> (Vec<github::PullRequestStack>, Vec<github::PullRequestStack>) {
+    let chains = github::compute_pull_request_stacks(list, owner, &[]);
+    if chains.is_empty() {
+        return (chains, Vec::new());
+    }
+    let numbers: Vec<u64> = chains.iter().flat_map(|stack| stack.members.iter().copied()).collect();
+    let native_stacks = github::native_stacks(workdir, repo, &numbers);
+    let stacks = if native_stacks.is_empty() {
+        chains
+    } else {
+        github::compute_pull_request_stacks(list, owner, &native_stacks)
+    };
+    (stacks, native_stacks)
+}
+
+/// Reorders `list` so each stack's pull requests sit together, bottom PR
+/// first, at the position of whichever member `list` already ranks highest
+/// (inbox order runs first, so that is the stack's most important pull
+/// request). Pull requests outside any stack keep their relative order.
+pub(super) fn apply_stack_order(list: &mut Vec<PullRequestSummary>, stacks: &[github::PullRequestStack]) {
+    if stacks.is_empty() {
+        return;
+    }
+    let member_stack: FxHashMap<u64, usize> = stacks
+        .iter()
+        .enumerate()
+        .flat_map(|(ix, stack)| stack.members.iter().map(move |number| (*number, ix)))
+        .collect();
+    let by_number: FxHashMap<u64, PullRequestSummary> =
+        list.iter().cloned().map(|pr| (pr.number, pr)).collect();
+    let mut emitted = vec![false; stacks.len()];
+    let mut ordered = Vec::with_capacity(list.len());
+    for pr in list.iter() {
+        match member_stack.get(&pr.number) {
+            Some(&stack_ix) if !emitted[stack_ix] => {
+                emitted[stack_ix] = true;
+                ordered.extend(
+                    stacks[stack_ix]
+                        .members
+                        .iter()
+                        .filter_map(|number| by_number.get(number).cloned()),
+                );
+            }
+            Some(_) => {}
+            None => ordered.push(pr.clone()),
+        }
+    }
+    *list = ordered;
 }
 
 pub(super) fn visible_pr_thread_indexes(
@@ -303,9 +491,11 @@ impl GitCometView {
             return;
         }
         let drafts = entry.drafts.clone();
+        let stacks = entry.stacks.clone();
         if let PrLoad::Ready(list) = &mut entry.list {
             let list: &mut Vec<PullRequestSummary> = Arc::make_mut(list);
             inbox_order(list, &drafts);
+            apply_stack_order(list, &stacks);
         }
     }
 }
@@ -317,6 +507,14 @@ struct ReviewSubmitted {
     /// The pending comments and replies now on GitHub.
     comments: Vec<crate::github::ReviewComment>,
     error: Option<PrError>,
+}
+
+/// What a successful merge submit actually did, so the toast can say so.
+enum MergeOutcome {
+    /// The single-PR `gh pr merge` path.
+    Plain,
+    /// GitHub's asynchronous stack merge API.
+    Stack(github::StackMergeOutcome),
 }
 
 /// The dialog a gh submit came from, so its outcome reaches that dialog and
@@ -477,7 +675,11 @@ impl GitCometView {
                         .then(|| list.iter().map(|pr| pr.number).chain(reviewing).collect());
                     let drafts = super::review::pending_review_counts(&target.slug, open.as_ref());
                     inbox_order(&mut list, &drafts);
-                    (list, drafts, requested_known)
+                    let owner = target.slug.split('/').next().unwrap_or_default();
+                    let (stacks, native_stacks) =
+                        compute_stacks_and_native(&target.workdir, &target.slug, &list, owner);
+                    apply_stack_order(&mut list, &stacks);
+                    (list, drafts, requested_known, stacks, native_stacks)
                 },
             )
         });
@@ -489,7 +691,7 @@ impl GitCometView {
                     return;
                 }
                 entry.list = match result {
-                    Ok((mut list, drafts, requested_known)) => {
+                    Ok((mut list, drafts, requested_known, stacks, native_stacks)) => {
                         // gh couldn't say who is waiting this time: keep what
                         // it said last, so rows don't jump sections.
                         if !requested_known && let Some(previous) = entry.list.ready() {
@@ -499,8 +701,11 @@ impl GitCometView {
                                     .any(|old| old.number == pr.number && old.review_requested);
                             }
                             inbox_order(&mut list, &drafts);
+                            apply_stack_order(&mut list, &stacks);
                         }
                         entry.drafts = drafts;
+                        entry.stacks = stacks;
+                        entry.native_stacks = native_stacks;
                         PrLoad::Ready(Arc::new(list))
                     }
                     Err(err) => PrLoad::Failed(err),
@@ -987,6 +1192,26 @@ impl GitCometView {
         true
     }
 
+    /// `<`/`>`: the pull request below or above the selected one in its
+    /// stack. No-op outside a stack, or at either end of it.
+    pub(super) fn select_pull_request_stack_neighbor(
+        &mut self,
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(prs) = self.active_pull_requests() else {
+            return false;
+        };
+        let Some(current) = prs.selected else {
+            return false;
+        };
+        let Some(neighbor) = prs.stack_neighbor(current, direction) else {
+            return false;
+        };
+        self.select_pull_request(neighbor, cx);
+        true
+    }
+
     pub(super) fn set_pull_request_content_tab(
         &mut self,
         tab: PrContentTab,
@@ -1413,27 +1638,53 @@ impl GitCometView {
             self.notify_pull_request_panes(cx);
             return;
         };
+        // A native stack merges through GitHub's own stack merge API; the
+        // dialog already showed the plan, so a refusal here should not
+        // normally happen, but nothing here trusts stale UI state.
+        let stack_plan = entry.stack_merge_plan(number);
+        if let Some(plan) = &stack_plan
+            && let Some(refusal) = &plan.refusal
+        {
+            entry.submit_error = Some(refusal.clone());
+            self.notify_pull_request_panes(cx);
+            return;
+        }
         entry.submitting = true;
         entry.submit_error = None;
         let slug = target.slug.clone();
-        let request = MergeRequest {
-            method,
-            delete_branch,
-            head_oid,
-        };
         let task = cx.background_spawn(async move {
-            github::merge(&target.workdir, &target.slug, number, &request)
+            match stack_plan {
+                Some(_) => github::merge_stack(&target.workdir, &target.slug, number, method, &head_oid)
+                    .map(MergeOutcome::Stack),
+                None => {
+                    let request = MergeRequest {
+                        method,
+                        delete_branch,
+                        head_oid,
+                    };
+                    github::merge(&target.workdir, &target.slug, number, &request)
+                        .map(|()| MergeOutcome::Plain)
+                }
+            }
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
                 this.pull_requests.repo_mut(repo_id).submitting = false;
                 match result {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         this.close_pull_request_prompt(repo_id, PrDialog::Merge(number), cx);
+                        let message = match outcome {
+                            MergeOutcome::Plain | MergeOutcome::Stack(github::StackMergeOutcome::Merged) => {
+                                format!("Merged #{number}")
+                            }
+                            MergeOutcome::Stack(github::StackMergeOutcome::Enqueued) => {
+                                format!("#{number} added to the merge queue")
+                            }
+                        };
                         this.push_toast_with_link(
                             components::ToastKind::Success,
-                            format!("Merged #{number}"),
+                            message,
                             format!("https://github.com/{slug}/pull/{number}"),
                             "View on GitHub".to_string(),
                             cx,
@@ -1449,6 +1700,9 @@ impl GitCometView {
                         cx,
                     ),
                 }
+                // A native stack merge (merged or enqueued) can change every
+                // pull request in it, not just this one; the list refresh
+                // below recomputes stacks and every row's state regardless.
                 this.reload_pull_request(repo_id, number, cx);
             });
         })
@@ -1897,6 +2151,7 @@ mod tests {
             head_owner: String::new(),
             base: String::new(),
             is_draft: false,
+            is_cross_repository: false,
             review: None,
             checks: Default::default(),
             review_requested,
@@ -1908,5 +2163,119 @@ mod tests {
         // GitHub's order holds within each part.
         let numbers: Vec<u64> = list.iter().map(|pr| pr.number).collect();
         assert_eq!(numbers, [3, 4, 1, 2]);
+    }
+
+    fn plain_pr(number: u64) -> PullRequestSummary {
+        PullRequestSummary {
+            number,
+            title: String::new(),
+            author: String::new(),
+            head: String::new(),
+            head_owner: String::new(),
+            base: String::new(),
+            is_draft: false,
+            is_cross_repository: false,
+            review: None,
+            checks: Default::default(),
+            review_requested: false,
+            is_mine: false,
+        }
+    }
+
+    #[test]
+    fn a_stack_sits_together_at_its_top_ranked_members_place() {
+        // The list arrives already inbox-ordered [2, 5, 1]: 2 outranks 1
+        // (both in the stack) and 5. The stack [1, 2] must still move up to
+        // sit together at 2's spot, base (1) first — not stay split around 5.
+        let mut list = vec![plain_pr(2), plain_pr(5), plain_pr(1)];
+        let stack = github::PullRequestStack {
+            members: vec![1, 2],
+            native: false,
+        };
+        apply_stack_order(&mut list, std::slice::from_ref(&stack));
+        let numbers: Vec<u64> = list.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, [1, 2, 5]);
+    }
+
+    fn stack_chain_pr(number: u64, head: &str, base: &str, review_requested: bool) -> PullRequestSummary {
+        PullRequestSummary {
+            number,
+            title: String::new(),
+            author: String::new(),
+            head: head.to_string(),
+            head_owner: String::new(),
+            base: base.to_string(),
+            is_draft: false,
+            is_cross_repository: false,
+            review: None,
+            checks: Default::default(),
+            review_requested,
+            is_mine: false,
+        }
+    }
+
+    #[test]
+    fn a_stack_takes_the_best_rank_of_any_of_its_members_for_section_headers() {
+        // [2 waiting, 5 waiting, 1 open, 7 open], stack [1, 2]: without the
+        // fix, #1's own rank (open) would split the stack's section header
+        // away from #2's (waiting).
+        let list = vec![
+            stack_chain_pr(2, "feat-b", "feat-a", true),
+            stack_chain_pr(5, "feat-e", "dev", true),
+            stack_chain_pr(1, "feat-a", "dev", false),
+            stack_chain_pr(7, "feat-g", "dev", false),
+        ];
+        let stacks = [github::PullRequestStack {
+            members: vec![1, 2],
+            native: false,
+        }];
+        let ranks = stack_adjusted_ranks(&list, &FxHashMap::default(), &stacks);
+        // #1 (index 2) now takes #2's (index 0) best rank: waiting on review.
+        assert_eq!(ranks[2], ranks[0]);
+        assert_eq!(ranks[0], inbox_rank(&list[0], &FxHashMap::default()));
+        // #5 and #7, outside the stack, keep their own ranks.
+        assert_eq!(ranks[1], inbox_rank(&list[1], &FxHashMap::default()));
+        assert_eq!(ranks[3], inbox_rank(&list[3], &FxHashMap::default()));
+    }
+
+    #[test]
+    fn stack_neighbor_walks_up_and_down_and_stops_at_the_ends() {
+        let mut entry = RepoPullRequests::default();
+        let list = vec![
+            stack_chain_pr(1, "feat-a", "dev", false),
+            stack_chain_pr(2, "feat-b", "feat-a", false),
+            stack_chain_pr(3, "feat-c", "feat-b", false),
+        ];
+        entry.list = PrLoad::Ready(Arc::new(list));
+        entry.stacks = vec![github::PullRequestStack {
+            members: vec![1, 2, 3],
+            native: false,
+        }];
+        assert_eq!(entry.stack_neighbor(2, -1), Some(1));
+        assert_eq!(entry.stack_neighbor(2, 1), Some(3));
+        assert_eq!(entry.stack_neighbor(1, -1), None);
+        assert_eq!(entry.stack_neighbor(3, 1), None);
+        assert_eq!(entry.stack_neighbor(99, 1), None);
+    }
+
+    #[test]
+    fn stack_neighbor_follows_the_real_parent_and_child_in_a_tree() {
+        // 1 has two children, 2 and 3: `<` from either goes to 1, and `>`
+        // from 1 goes to the lowest-numbered child, not whichever the
+        // flattened member order happens to list next.
+        let mut entry = RepoPullRequests::default();
+        let list = vec![
+            stack_chain_pr(1, "feat-a", "dev", false),
+            stack_chain_pr(2, "feat-b", "feat-a", false),
+            stack_chain_pr(3, "feat-c", "feat-a", false),
+        ];
+        entry.list = PrLoad::Ready(Arc::new(list));
+        entry.stacks = vec![github::PullRequestStack {
+            members: vec![1, 3, 2],
+            native: false,
+        }];
+        assert_eq!(entry.stack_neighbor(2, -1), Some(1));
+        assert_eq!(entry.stack_neighbor(3, -1), Some(1));
+        assert_eq!(entry.stack_neighbor(1, 1), Some(2));
     }
 }

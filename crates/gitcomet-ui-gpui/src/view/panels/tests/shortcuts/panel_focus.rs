@@ -292,6 +292,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
                     head_owner: "someone".into(),
                     base: "main".into(),
                     is_draft: false,
+                    is_cross_repository: false,
                     review: None,
                     checks: Default::default(),
                     review_requested: false,
@@ -367,6 +368,109 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
     press(cx, "escape");
     assert!(!popover_is_open(cx, &view));
     assert_eq!(focused(cx, &view), Some(Sidebar));
+}
+
+fn stack_pull_request(number: u64, head: &str, base: &str) -> crate::github::PullRequestSummary {
+    crate::github::PullRequestSummary {
+        number,
+        title: format!("pr {number}"),
+        author: "someone".into(),
+        head: head.into(),
+        head_owner: "owner".into(),
+        base: base.into(),
+        is_draft: false,
+        is_cross_repository: false,
+        review: None,
+        checks: Default::default(),
+        review_requested: false,
+        is_mine: false,
+    }
+}
+
+#[gpui::test]
+fn less_and_greater_walk_a_pull_requests_stack(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let selected = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .active_pull_requests()
+                .and_then(|prs| prs.selected)
+        })
+    };
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_pull_requests_for_test(
+                REPO,
+                vec![
+                    stack_pull_request(1, "feat-a", "main"),
+                    stack_pull_request(2, "feat-b", "feat-a"),
+                    stack_pull_request(3, "feat-c", "feat-b"),
+                ],
+                Some(2),
+            );
+            this.pull_requests.repo_mut(REPO).stacks = vec![crate::github::PullRequestStack {
+                members: vec![1, 2, 3],
+                native: false,
+            }];
+        })
+    });
+    apply_state(cx, &view, pull_request_state());
+    press(cx, "1");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+    assert_eq!(selected(cx), Some(2));
+
+    press(cx, "shift-,");
+    assert_eq!(selected(cx), Some(1));
+    // The bottom of the stack: `<` again is a no-op.
+    press(cx, "shift-,");
+    assert_eq!(selected(cx), Some(1));
+
+    press(cx, "shift-.");
+    assert_eq!(selected(cx), Some(2));
+    press(cx, "shift-.");
+    assert_eq!(selected(cx), Some(3));
+    // The top of the stack: `>` again is a no-op.
+    press(cx, "shift-.");
+    assert_eq!(selected(cx), Some(3));
+
+    // Panel 2 (the PR's own conversation view): the same keys work there.
+    press(cx, "enter");
+    assert_eq!(focused(cx, &view), Some(History));
+    press(cx, "shift-,");
+    assert_eq!(selected(cx), Some(2));
+    press(cx, "shift-,");
+    assert_eq!(selected(cx), Some(1));
+
+    // Details: same again, and the literal `<`/`>` (ISO/DE layouts) work too.
+    press(cx, "3");
+    assert_eq!(focused(cx, &view), Some(Details));
+    press(cx, "shift-.");
+    assert_eq!(selected(cx), Some(2));
+    press(cx, ">");
+    assert_eq!(selected(cx), Some(3));
+    press(cx, "<");
+    assert_eq!(selected(cx), Some(2));
+
+    // Inert while typing: focus a text input and confirm the stack
+    // selection never moves while it holds focus.
+    cx.update(|window, app| {
+        let input = view
+            .read(app)
+            .details_pane
+            .read(app)
+            .commit_message_input
+            .clone();
+        let handle = input.read(app).focus_handle();
+        window.focus(&handle, app);
+    });
+    draw_and_drain_test_window(cx);
+    press(cx, "shift-,");
+    assert_eq!(focused(cx, &view), None);
+    assert_eq!(selected(cx), Some(2));
+    press(cx, ">");
+    assert_eq!(focused(cx, &view), None);
+    assert_eq!(selected(cx), Some(2));
 }
 
 fn selected_commit(cx: &mut gpui::VisualTestContext, view: &View) -> Option<CommitId> {
@@ -1692,6 +1796,7 @@ fn the_create_dialog_steps_the_base_toggles_the_push_and_guards_submit(
                         head_owner: owner.into(),
                         base: "main".into(),
                         is_draft: false,
+                        is_cross_repository: false,
                         review: None,
                         checks: Default::default(),
                         review_requested: false,

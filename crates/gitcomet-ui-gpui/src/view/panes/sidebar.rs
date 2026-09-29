@@ -11,7 +11,7 @@ use gitcomet_core::domain::{FileEntry, FileEntryKind, LogScope};
 use gitcomet_state::model::{Loadable, SidebarDataRequest, SidebarMode};
 use gitcomet_state::msg::Msg;
 use palette::IntoColor;
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -3248,11 +3248,15 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (number, title, current, since, range_hidden, counts) = {
+        let (number, title, current, since, range_hidden, counts, stacked_on) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
             };
+            let stacked_on = root
+                .pull_requests
+                .repo(review.repo_id)
+                .and_then(|prs| prs.stack_neighbor(review.number, -1));
             // Up to 3,000 files: only the listed indices are kept here, and
             // the per-file counts come from one pass over comments and
             // threads; the rows on screen read the rest as they paint.
@@ -3361,6 +3365,7 @@ impl SidebarPaneView {
                 since,
                 range_hidden,
                 counts,
+                stacked_on,
             )
         };
         let (viewed, total, hidden, show_viewed, filtering, listing, files_missing) = counts;
@@ -3458,7 +3463,12 @@ impl SidebarPaneView {
                         div()
                             .text_size(theme.ui_text(12.0))
                             .text_color(secondary)
-                            .child(format!("Reviewing #{number} · {viewed} of {total} viewed")),
+                            .child(match stacked_on {
+                                Some(base) => format!(
+                                    "Reviewing #{number} · stacked on #{base} · {viewed} of {total} viewed"
+                                ),
+                                None => format!("Reviewing #{number} · {viewed} of {total} viewed"),
+                            }),
                     )
                     .child(
                         div()
@@ -3707,13 +3717,14 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (has_github, list, selected) = {
+        let (has_github, list, selected, stacks) = {
             let root = root.read(cx);
             let prs = root.active_pull_requests();
             (
                 root.github_target().is_some(),
                 prs.map(|prs| prs.list.clone()).unwrap_or_default(),
                 prs.and_then(|prs| prs.selected),
+                prs.map(|prs| prs.stacks.clone()).unwrap_or_default(),
             )
         };
         if has_github && matches!(list, PrLoad::Idle) {
@@ -3751,7 +3762,7 @@ impl SidebarPaneView {
                 "No open pull requests",
                 "n opens one from the checked-out branch.".to_string(),
             ),
-            PrLoad::Ready(list) => self.pull_request_rows(theme, &list, selected, cx),
+            PrLoad::Ready(list) => self.pull_request_rows(theme, &list, selected, &stacks, cx),
         }
     }
 
@@ -3760,8 +3771,23 @@ impl SidebarPaneView {
         theme: AppTheme,
         list: &[crate::github::PullRequestSummary],
         selected: Option<u64>,
+        stacks: &[crate::github::PullRequestStack],
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
+        // Depth from the stack's base (0 = bottom) and stack size, for the
+        // indented "2/3" rows. Depth follows real base/head parent links
+        // (`stack_depth`), not the flattened member order, which a tree
+        // (two children on the same pull request) can put out of a line.
+        let stack_position: FxHashMap<u64, (usize, usize)> = stacks
+            .iter()
+            .flat_map(|stack| {
+                let total = stack.members.len();
+                stack.members.iter().filter_map(move |number| {
+                    crate::github::stack_depth(&stack.members, *number, list)
+                        .map(|depth| (*number, (depth, total)))
+                })
+            })
+            .collect();
         let secondary = theme.colors.foreground.secondary;
         let icon_size = crate::ui_scale::UiScale::current(cx).px(14.0);
         let drafts = self
@@ -3773,10 +3799,8 @@ impl SidebarPaneView {
                     .map(|prs| prs.drafts.clone())
             })
             .unwrap_or_default();
-        let ranks: Vec<u8> = list
-            .iter()
-            .map(|pr| super::super::pull_requests::inbox_rank(pr, &drafts))
-            .collect();
+        let ranks: Vec<u8> =
+            super::super::pull_requests::stack_adjusted_ranks(list, &drafts, stacks);
         // Section titles only once something is waiting on you.
         let sectioned = ranks.iter().any(|rank| *rank < 2);
         let header = div()
@@ -3805,6 +3829,8 @@ impl SidebarPaneView {
 
         let row = |pr: &crate::github::PullRequestSummary| {
             let number = pr.number;
+            let stack_depth = stack_position.get(&number).map(|(ix, _)| *ix).unwrap_or(0);
+            let stack_pos = stack_position.get(&number).copied();
             let (kind, title) = super::super::pr_symbols::title(&pr.title);
             let mut symbols = Vec::new();
             if let Some(review) = pr.review {
@@ -3844,6 +3870,7 @@ impl SidebarPaneView {
                 .flex_col()
                 .gap(px(2.0))
                 .mx_1()
+                .ml(px(2.0 + stack_depth as f32 * 14.0))
                 .px_2()
                 .py_1()
                 .rounded(px(theme.radii.control))
@@ -3873,6 +3900,14 @@ impl SidebarPaneView {
                         .items_center()
                         .gap_1()
                         .text_size(theme.ui_text(13.0))
+                        .when(stack_depth > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(secondary)
+                                    .child("└"),
+                            )
+                        })
                         .child(
                             super::super::pr_symbols::state("OPEN", pr.is_draft, theme).render(
                                 format!("pr_{number}_state"),
@@ -3880,6 +3915,18 @@ impl SidebarPaneView {
                                 icon_size,
                             ),
                         )
+                        .when_some(stack_pos, |row, (ix, total)| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .rounded(px(3.0))
+                                    .px_1()
+                                    .bg(theme.colors.surface.panel)
+                                    .text_size(theme.ui_text(10.0))
+                                    .text_color(secondary)
+                                    .child(format!("{}/{total}", ix + 1)),
+                            )
+                        })
                         .when(pr.is_mine, |row| {
                             row.child(super::super::pr_symbols::person(theme).render(
                                 format!("pr_{number}_mine"),

@@ -512,6 +512,7 @@ impl GitCometView {
                 FocusPanel::Sidebar => {
                     return &[
                         ("j/k", "PR"),
+                        ("</>", "stack"),
                         ("enter", "read"),
                         ("space", "checkout"),
                         ("r", "review"),
@@ -522,6 +523,7 @@ impl GitCometView {
                 FocusPanel::History if self.pull_request_content_active() => {
                     return &[
                         ("j/k", "entry"),
+                        ("</>", "stack"),
                         ("[/]", "tab"),
                         ("enter", "thread"),
                         ("V", "resolved"),
@@ -533,6 +535,7 @@ impl GitCometView {
                     return &[
                         ("j/k", "commit"),
                         ("J/K", "range"),
+                        ("</>", "stack"),
                         ("esc", "all"),
                         ("enter", "read"),
                         ("space", "checkout"),
@@ -681,6 +684,7 @@ impl GitCometView {
                 FocusPanel::Sidebar => {
                     return &[
                         ("j / k", "Next / previous pull request"),
+                        ("< / >", "Pull request below / above it in its stack"),
                         ("enter", "Read the pull request in the middle panel"),
                         ("space", "Check it out locally"),
                         ("n", "New pull request"),
@@ -695,6 +699,7 @@ impl GitCometView {
                 FocusPanel::History if self.pull_request_content_active() => {
                     return &[
                         ("j / k", "Next / previous entry or thread"),
+                        ("< / >", "Pull request below / above it in its stack"),
                         ("[ / ]", "Conversation / Comments tab"),
                         ("enter", "Review at the selected thread's line"),
                         ("V", "Show / hide resolved and outdated threads"),
@@ -706,6 +711,7 @@ impl GitCometView {
                     return &[
                         ("j / k", "Next / previous PR commit"),
                         ("J / K", "Extend the contiguous commit range"),
+                        ("< / >", "Pull request below / above it in its stack"),
                         ("esc", "Select all commits"),
                         ("enter", "Read the pull request in the middle panel"),
                         ("space", "Check it out locally"),
@@ -1331,6 +1337,23 @@ impl GitCometView {
         let selected = self.active_pull_requests().and_then(|prs| prs.selected);
         let in_details = current == Some(FocusPanel::Details) && self.pull_request_details_active();
         let in_content = current == Some(FocusPanel::History) && self.pull_request_content_active();
+        let in_sidebar = current == Some(FocusPanel::Sidebar);
+        // `<`/`>` move to the pull request below/above the selected one in
+        // its stack, in the list, panel 2 and Details. US layouts send them
+        // as shift+`,`/`.`; ISO/DE layouts have `<`/`>` as their own key
+        // (there, shift+`,` sends `;`), so both are matched.
+        let stack_step = match key {
+            "," if shift => Some(-1),
+            "." if shift => Some(1),
+            "<" => Some(-1),
+            ">" => Some(1),
+            _ => None,
+        };
+        if let Some(direction) = stack_step
+            && (in_sidebar || in_content || in_details)
+        {
+            return Some(self.select_pull_request_stack_neighbor(direction, cx));
+        }
         if shift {
             return match key.to_ascii_lowercase().as_str() {
                 "j" | "k" if in_details => {

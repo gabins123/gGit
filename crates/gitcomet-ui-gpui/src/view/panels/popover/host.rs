@@ -2048,6 +2048,28 @@ impl PopoverHost {
         }
     }
 
+    /// The stack merge plan for a pull request in a native GitHub stack:
+    /// which pull requests merge with it and which stay open, or a refusal.
+    pub(super) fn pull_request_stack_merge_plan(
+        &self,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<crate::github::StackMergePlan> {
+        self.open_pull_request_state(cx, |prs| prs.stack_merge_plan(number))
+            .flatten()
+    }
+
+    /// The merge dialog's note for a pull request on a plain base-branch
+    /// chain (not a native stack).
+    pub(super) fn pull_request_base_chain_merge_note(
+        &self,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<crate::view::pull_requests::BaseChainMergeNote> {
+        self.open_pull_request_state(cx, |prs| prs.base_chain_merge_note(number))
+            .flatten()
+    }
+
     /// The pull request being merged, once its details are in.
     pub(super) fn pull_request_merge_detail(
         &self,

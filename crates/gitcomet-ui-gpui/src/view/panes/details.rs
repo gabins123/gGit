@@ -2861,18 +2861,28 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (detail, number, listing, files_error, commit_selection, last_review) = {
+        let (detail, number, listing, files_error, commit_selection, last_review, stack_members) = {
             let root = root.read(cx);
             let Some(prs) = root.active_pull_requests() else {
                 return div().into_any_element();
             };
+            let selected = prs.selected.unwrap_or_default();
+            let stack_members = prs.stack_position(selected).map(|(stack, _)| {
+                let list = prs.list.ready().cloned().unwrap_or_default();
+                stack
+                    .members
+                    .iter()
+                    .filter_map(|number| list.iter().find(|pr| pr.number == *number).cloned())
+                    .collect::<Vec<_>>()
+            });
             (
                 prs.detail.clone(),
-                prs.selected.unwrap_or_default(),
+                selected,
                 prs.files_listing(),
                 prs.files_error.clone(),
                 prs.commit_selection,
                 prs.last_review.clone(),
+                stack_members,
             )
         };
         let detail = match detail {
@@ -3049,6 +3059,18 @@ impl DetailsPaneView {
                 );
             }
         }
+        if let Some(members) = stack_members.filter(|members| !members.is_empty()) {
+            panel = panel.child(
+                div()
+                    .pt_2()
+                    .text_size(theme.ui_text(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Stack"),
+            );
+            panel = panel.children(pull_request_stack_rows(
+                &members, number, theme, icon_size,
+            ));
+        }
         panel = panel.child(
             div()
                 .pt_2()
@@ -3194,6 +3216,85 @@ impl DetailsPaneView {
             ))
             .into_any_element()
     }
+}
+
+/// The Stack section's rows: every pull request in the stack, base at the
+/// bottom like GitHub's own stack map, each with its state, review and
+/// checks symbols; `current` is highlighted.
+fn pull_request_stack_rows(
+    members: &[crate::github::PullRequestSummary],
+    current: u64,
+    theme: AppTheme,
+    icon_size: Pixels,
+) -> Vec<AnyElement> {
+    let secondary = theme.colors.foreground.secondary;
+    let total = members.len();
+    // Depth from the stack's base (0 = bottom), following real base/head
+    // parent links (`stack_depth`) rather than this list's own order, which
+    // a tree (two children on the same pull request) can put out of a line.
+    let numbers: Vec<u64> = members.iter().map(|member| member.number).collect();
+    members
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(ix, member)| {
+            let position = crate::github::stack_depth(&numbers, member.number, members)
+                .unwrap_or(ix);
+            let highlighted = member.number == current;
+            let (_, member_title) = super::super::pr_symbols::title(&member.title);
+            let mut row = div()
+                .id(SharedString::from(format!("pr_stack_{}", member.number)))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .py(px(1.0))
+                .rounded(px(theme.radii.control))
+                .text_size(theme.ui_text(12.0))
+                .when(highlighted, |row| {
+                    row.bg(theme.colors.interaction.selected_background)
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(secondary)
+                        .child(format!("{}/{total}", position + 1)),
+                )
+                .child(
+                    super::super::pr_symbols::state("OPEN", member.is_draft, theme).render(
+                        format!("pr_stack_{}_state", member.number),
+                        theme,
+                        icon_size,
+                    ),
+                );
+            if let Some(review) = member.review {
+                row = row.child(super::super::pr_symbols::review(review, theme).render(
+                    format!("pr_stack_{}_review", member.number),
+                    theme,
+                    icon_size,
+                ));
+            }
+            if let Some(checks) = super::super::pr_symbols::checks(member.checks, theme) {
+                row = row.child(checks.render(
+                    format!("pr_stack_{}_checks", member.number),
+                    theme,
+                    icon_size,
+                ));
+            }
+            row.child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(if highlighted {
+                        theme.colors.foreground.primary
+                    } else {
+                        secondary
+                    })
+                    .child(format!("{member_title} #{}", member.number)),
+            )
+            .into_any_element()
+        })
+        .collect()
 }
 
 impl Render for DetailsPaneView {
