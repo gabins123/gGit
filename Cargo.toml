@@ -305,6 +305,13 @@ opt-level = 1
 [profile.test.package."*"]
 opt-level = 1
 
+# The UI crate dominates test build time. At opt-level 0 its test binary rebuilds
+# in ~32s instead of ~72s after an edit, while the 4.3k tests run in ~145s
+# instead of ~121s (Windows, 12 cores), so both edit-test loops and full runs
+# come out ahead. ci-test makes the same choice.
+[profile.test.package.gitcomet-ui-gpui]
+opt-level = 0
+
 # CI avoids generating and packaging debugger symbols on ephemeral runners.
 # Keep algorithm/dependency optimization; the large UI crate favors fast builds.
 [profile.ci-test]
