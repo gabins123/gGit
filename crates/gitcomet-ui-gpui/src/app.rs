@@ -325,7 +325,7 @@ pub(crate) struct WindowSystemMenuRequest {
 }
 
 #[cfg(target_os = "windows")]
-fn window_hwnd(window: &Window) -> Option<isize> {
+pub(crate) fn window_hwnd(window: &Window) -> Option<isize> {
     let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
         return None;
     };
@@ -572,6 +572,12 @@ fn open_gitcomet_window(
     #[cfg(target_os = "macos")]
     if intercept_native_close {
         refresh_macos_app_menus(cx);
+    }
+
+    // Dev-only agent control; needs GITCOMET_CONTROL_DIR and never ships in release.
+    #[cfg(debug_assertions)]
+    if intercept_native_close {
+        crate::control_bridge::start(window, cx);
     }
 
     window

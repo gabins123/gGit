@@ -3,20 +3,24 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FALSE, FILETIME, HANDLE, HWND, LPARAM, POINT, TRUE, WPARAM,
+    CloseHandle, FALSE, FILETIME, HANDLE, HWND, LPARAM, POINT, RECT, TRUE, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, HDC, SelectObject,
+};
 use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, SetConsoleCtrlHandler};
 use windows_sys::Win32::System::Threading::{
     ExitProcess, GetCurrentProcess, GetCurrentThreadId, GetThreadTimes, OpenThread,
     THREAD_QUERY_LIMITED_INFORMATION, TerminateProcess,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnableMenuItem, GWL_STYLE, GetSystemMenu, GetWindowLongPtrW, HMENU, IsIconic, IsZoomed,
-    MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, PostMessageW, SC_CLOSE, SC_MAXIMIZE,
-    SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx, WINDOW_STYLE,
-    WM_NULL, WM_SYSCOMMAND, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    EnableMenuItem, GWL_STYLE, GetSystemMenu, GetWindowLongPtrW, GetWindowRect, HMENU, IsIconic,
+    IsZoomed, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, PostMessageW, SC_CLOSE,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SW_RESTORE, SetForegroundWindow,
+    ShowWindowAsync, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx,
+    WINDOW_STYLE, WM_NULL, WM_SYSCOMMAND, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 use windows_sys::core::BOOL;
 
@@ -150,6 +154,104 @@ pub fn restore_window(hwnd: isize) -> bool {
     unsafe { ShowWindowAsync(hwnd, SW_RESTORE) != 0 }
 }
 
+/// A window's pixels, row-major RGBA with straight, fully opaque alpha.
+pub struct WindowPixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+// `PrintWindow` sits in `Win32_Storage_Xps`; declaring it here avoids turning
+// that windows-sys feature on (and rebuilding everything that shares the crate).
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> BOOL;
+}
+
+/// `PrintWindow` flag: render the whole window, including DirectComposition
+/// and DirectX content that plain `PW_CLIENTONLY`/`BitBlt` capture misses.
+const PW_RENDERFULLCONTENT: u32 = 2;
+
+/// Capture a window's own pixels with `PrintWindow`, independent of anything
+/// covering it and without touching focus or input. Dev tooling: the window is
+/// asked to paint itself into an off-screen DIB.
+pub fn capture_window(hwnd: isize) -> Result<WindowPixels, String> {
+    let hwnd = hwnd as HWND;
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            return Err("window is minimized; restore it to capture".into());
+        }
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return Err("GetWindowRect failed".into());
+        }
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        if width <= 0 || height <= 0 {
+            return Err(format!("window has no area ({width}x{height})"));
+        }
+
+        let dc = CreateCompatibleDC(std::ptr::null_mut());
+        if dc.is_null() {
+            return Err("CreateCompatibleDC failed".into());
+        }
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            dc,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        let result = if bitmap.is_null() || bits.is_null() {
+            Err("CreateDIBSection failed".to_string())
+        } else {
+            let previous = SelectObject(dc, bitmap);
+            let printed = PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT) != 0;
+            GdiFlush();
+            let pixels = printed.then(|| {
+                let len = width as usize * height as usize * 4;
+                let mut rgba = std::slice::from_raw_parts(bits as *const u8, len).to_vec();
+                for px in rgba.chunks_exact_mut(4) {
+                    px.swap(0, 2); // BGRA -> RGBA
+                    px[3] = 255;
+                }
+                WindowPixels {
+                    width: width as u32,
+                    height: height as u32,
+                    rgba,
+                }
+            });
+            SelectObject(dc, previous);
+            pixels.ok_or_else(|| "PrintWindow failed".to_string())
+        };
+        if !bitmap.is_null() {
+            DeleteObject(bitmap);
+        }
+        DeleteDC(dc);
+        result
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct SystemMenuState {
     restore: bool,
@@ -242,6 +344,11 @@ pub fn show_window_system_menu(hwnd: isize, x: i32, y: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capturing_an_invalid_window_is_an_error() {
+        assert!(capture_window(0).is_err());
+    }
 
     #[test]
     fn restored_window_menu_state_enables_move_size_minimize_and_maximize() {

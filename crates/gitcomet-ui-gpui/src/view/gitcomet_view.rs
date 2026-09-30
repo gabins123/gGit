@@ -2556,6 +2556,42 @@ impl GitCometView {
             .map(|repo| repo.spec.workdir.clone())
     }
 
+    /// Read-only UI snapshot for the dev-only control bridge. Debug builds only.
+    #[cfg(debug_assertions)]
+    pub(crate) fn control_bridge_state(
+        &self,
+        window: &Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> serde_json::Value {
+        use gitcomet_state::model::SidebarMode;
+        // ponytail: Debug output lowercased; these enums are single words.
+        let lower = |value: &dyn std::fmt::Debug| format!("{value:?}").to_lowercase();
+        let sidebar_mode = match self.state.sidebar_mode {
+            SidebarMode::Branches => "branches",
+            SidebarMode::Files => "files",
+            SidebarMode::PullRequests => "pull_requests",
+        };
+        let prs = self.active_pull_requests();
+        let selected_pr = prs.and_then(|prs| prs.selected);
+        let review = self.active_review();
+        let scale_percent = crate::ui_scale::current(cx).percent;
+        serde_json::json!({
+            "repo_workdir": self.active_repo_workdir().map(|p| p.display().to_string()),
+            "sidebar_mode": sidebar_mode,
+            "focused_panel": self.focused_panel(window, cx).map(|panel| lower(&panel)),
+            "selected_pr": selected_pr,
+            "pr_content_tab": prs.filter(|_| selected_pr.is_some()).map(|prs| lower(&prs.content_tab)),
+            "review_active": review.is_some(),
+            "review_file": review.and_then(|r| r.files.get(r.file_ix)),
+            "file_list_layout": self.file_list_layout.key(),
+            "window_size": [
+                f32::from(window.viewport_size().width),
+                f32::from(window.viewport_size().height),
+            ],
+            "ui_scale_percent": scale_percent,
+        })
+    }
+
     pub(crate) fn open_active_repo_in_external_code_editor(
         &mut self,
         cx: &mut gpui::Context<Self>,
