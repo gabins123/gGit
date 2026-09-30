@@ -4350,7 +4350,7 @@ mod tests {
             is_resolved: false,
             is_outdated: false,
             pull_request_review_id: None,
-            diff_hunk: String::new(),
+            diff_tail: Vec::new(),
             comments: vec![ThreadComment {
                 author: "octo".into(),
                 body: "?".into(),

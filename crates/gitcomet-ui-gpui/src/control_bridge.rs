@@ -20,6 +20,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const KEY_SETTLE: Duration = Duration::from_millis(75);
 const MAX_WAIT_MS: u64 = 30_000;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// A command is one short line; anything larger is refused unread.
+const MAX_COMMAND_BYTES: u64 = 64 * 1024;
 /// `PrintWindow` reads DWM's composed surface, which trails `present()` slightly.
 const PRESENT_SETTLE: Duration = Duration::from_millis(50);
 
@@ -247,11 +249,11 @@ async fn screenshot(window: AnyWindowHandle, cx: &mut AsyncApp, path: &Path) -> 
     let hwnd = window_hwnd(window, cx)?;
     // Let DWM compose the frame that was just presented.
     cx.background_executor().timer(PRESENT_SETTLE).await;
-    let pixels = cx
-        .background_executor()
-        .spawn(async move { grab(hwnd) })
-        .await?;
-    save_png(pixels, path)
+    // Capture and PNG encode/write both stay off the UI thread.
+    let path = path.to_path_buf();
+    cx.background_executor()
+        .spawn(async move { save_png(grab(hwnd)?, &path) })
+        .await
 }
 
 async fn execute(
@@ -292,6 +294,19 @@ pub(crate) fn run_for_test(
     format_result(&result)
 }
 
+/// The command file's text, refusing one over [`MAX_COMMAND_BYTES`].
+fn read_command(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_COMMAND_BYTES + 1).read_to_string(&mut text))
+        .map_err(|err| format!("cannot read command file: {err}"))?;
+    if text.len() as u64 > MAX_COMMAND_BYTES {
+        return Err(format!("command file is over {MAX_COMMAND_BYTES} bytes"));
+    }
+    Ok(text)
+}
+
 /// `*.cmd` files in name order.
 fn pending_commands(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -321,8 +336,8 @@ async fn poll(window: AnyWindowHandle, dir: PathBuf, cx: &mut AsyncApp) {
             return; // the main window is gone
         }
         for cmd_path in pending_commands(&dir) {
-            let result = match std::fs::read_to_string(&cmd_path) {
-                Err(err) => Err(format!("cannot read command file: {err}")),
+            let result = match read_command(&cmd_path) {
+                Err(message) => Err(message),
                 Ok(text) => match parse_command(&text) {
                     Err(message) => Err(message),
                     Ok(command) => execute(window, &dir, cx, command).await,
@@ -445,6 +460,18 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["a.cmd", "b.cmd"]);
+    }
+
+    #[test]
+    fn an_oversize_command_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = dir.path().join("big.cmd");
+        std::fs::write(&cmd, format!("keys {}", "a ".repeat(40_000))).unwrap();
+        let err = read_command(&cmd).unwrap_err();
+        assert!(err.contains("over 65536 bytes"), "{err}");
+        assert!(format_result(&Err(err)).starts_with("error: "));
+        std::fs::write(&cmd, "state\n").unwrap();
+        assert_eq!(read_command(&cmd).unwrap(), "state\n");
     }
 
     #[test]

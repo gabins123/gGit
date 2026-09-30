@@ -4251,19 +4251,16 @@ impl SidebarPaneView {
                 )
                 .into_any_element()
         };
-        // Stacked rows and everything else ranked past the waiting-on-you
-        // groups share the one "Open" section.
-        let section = |rank: u8| rank.min(2);
         let mut rows: Vec<AnyElement> = Vec::new();
         for (ix, pr) in list.iter().enumerate() {
-            let rank = section(ranks[ix]);
-            if ix == 0 || section(ranks[ix - 1]) != rank {
+            let rank = ranks[ix];
+            if ix == 0 || ranks[ix - 1] != rank {
                 let title = match rank {
                     0 => "Waiting for your review",
                     1 => "Your reviews in progress",
                     _ => "Open",
                 };
-                let count = ranks.iter().filter(|other| section(**other) == rank).count();
+                let count = ranks.iter().filter(|other| **other == rank).count();
                 rows.push(
                     div()
                         .flex()

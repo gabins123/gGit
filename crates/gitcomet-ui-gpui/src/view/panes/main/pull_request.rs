@@ -1,6 +1,7 @@
 use super::*;
 use crate::github::{
-    ConversationEntry, PrReviewerStatus, PullRequestCommit, PullRequestDetail, ReviewThread,
+    ConversationEntry, HunkLineKind, PrReviewerStatus, PullRequestCommit, PullRequestDetail,
+    ReviewThread,
 };
 use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use crate::theme::with_alpha;
@@ -110,82 +111,13 @@ fn pr_relative_time(at: &str, now: std::time::SystemTime) -> String {
         .unwrap_or_else(|| at.get(..10).unwrap_or(at).to_owned())
 }
 
-/// One line of a diff hunk's tail, for the selected review thread's context
-/// strip.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiffHunkLineKind {
-    Context,
-    Added,
-    Removed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DiffHunkLine {
-    kind: DiffHunkLineKind,
-    /// The new-file line for a context or added line, the old-file line for a
-    /// removed one — `None` only if the caller never gets a row (the header
-    /// always resolves both, once it parses at all).
-    line_number: Option<u32>,
-    text: String,
-}
-
-/// A hunk longer than this many content lines never finishes its walk: only
-/// the tail's line numbers matter, and GitHub's own hunks are always small,
-/// so this only guards a pathological or hostile `diff_hunk`.
-const MAX_HUNK_SCAN_LINES: usize = 2_000;
-/// Longest a single rendered hunk line gets, before truncation.
-const MAX_HUNK_LINE_CHARS: usize = 400;
-
-/// The last `max_lines` content lines of a unified-diff hunk (GitHub always
-/// ends one at the commented line), with each line's number derived by
-/// walking the hunk from its header. `diff_hunk` is untrusted plain text:
-/// never treated as markup, never interpreted beyond this line-by-line walk.
-fn diff_hunk_tail(hunk: &str, max_lines: usize) -> Vec<DiffHunkLine> {
-    let mut lines = hunk.lines();
-    let Some(header) = lines.next() else {
-        return Vec::new();
-    };
-    let Some(parsed) = crate::view::diff_utils::parse_unified_hunk_header_for_display(header)
-    else {
-        return Vec::new();
-    };
-    let mut old_line = parsed.old_start_line;
-    let mut new_line = parsed.new_start_line;
-    let mut rows = Vec::new();
-    for line in lines.take(MAX_HUNK_SCAN_LINES) {
-        let (kind, content) = match line.as_bytes().first() {
-            Some(b'+') => (DiffHunkLineKind::Added, &line[1..]),
-            Some(b'-') => (DiffHunkLineKind::Removed, &line[1..]),
-            // "\ No newline at end of file".
-            Some(b'\\') => continue,
-            _ => (DiffHunkLineKind::Context, line.get(1..).unwrap_or("")),
-        };
-        let line_number = match kind {
-            DiffHunkLineKind::Added => {
-                let number = new_line;
-                new_line += 1;
-                number
-            }
-            DiffHunkLineKind::Removed => {
-                let number = old_line;
-                old_line += 1;
-                number
-            }
-            DiffHunkLineKind::Context => {
-                let number = new_line;
-                old_line += 1;
-                new_line += 1;
-                number
-            }
-        };
-        rows.push(DiffHunkLine {
-            kind,
-            line_number: Some(line_number),
-            text: content.chars().take(MAX_HUNK_LINE_CHARS).collect(),
-        });
-    }
-    let start = rows.len().saturating_sub(max_lines);
-    rows.split_off(start)
+/// The collapsed thread row is one line tall: a multi-line body would lay out
+/// several lines and paint over its neighbours, so it shows only the first.
+fn first_nonempty_line(body: &str) -> &str {
+    body.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
 }
 
 /// Elevated card shared by every Conversation entry and the selected review
@@ -213,6 +145,30 @@ fn pr_card(theme: AppTheme, current: bool) -> Div {
             }])
     } else {
         card
+    }
+}
+
+/// The children of a `pr_content_scroll` container. The container itself spans
+/// the panel so the wheel works over the blank area beside the column; each
+/// child is wrapped (still one child per item, in order, so
+/// `pr_content_child_index` holds) and capped to the readable column.
+struct PrColumn {
+    max_w: Pixels,
+    items: Vec<AnyElement>,
+}
+
+impl PrColumn {
+    fn new(ui_scale: crate::ui_scale::UiScale) -> Self {
+        Self {
+            max_w: px(PR_CONTENT_MAX_WIDTH_PX) - ui_scale.px(PR_CONTENT_PAD_X_PX) * 2.0,
+            items: Vec::new(),
+        }
+    }
+
+    fn child(mut self, child: impl IntoElement) -> Self {
+        self.items
+            .push(div().max_w(self.max_w).child(child).into_any_element());
+        self
     }
 }
 
@@ -521,18 +477,18 @@ impl MainPaneView {
     ) -> AnyElement {
         let theme = self.theme;
         let ui_scale = crate::ui_scale::UiScale::current(cx);
-        let mut body = div()
+        let scroll = div()
             .id("pr_content_scroll")
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .max_w(px(PR_CONTENT_MAX_WIDTH_PX))
             .gap_3()
             .px(ui_scale.px(PR_CONTENT_PAD_X_PX))
             .py(ui_scale.px(PR_CONVERSATION_PAD_Y_PX))
             .overflow_y_scroll()
             .track_scroll(&self.pull_request_scroll);
+        let mut body = PrColumn::new(ui_scale);
 
         body = body.child(self.pr_description_card(detail, cx));
 
@@ -563,7 +519,7 @@ impl MainPaneView {
         }
 
         let checks_icon_size = ui_scale.px(13.0);
-        body.child(
+        let body = body.child(
             div()
                 .border_t_1()
                 .border_color(theme.colors.stroke.subtle)
@@ -583,8 +539,8 @@ impl MainPaneView {
                             .into_any_element()
                     }),
                 ),
-        )
-        .into_any_element()
+        );
+        scroll.children(body.items).into_any_element()
     }
 
     /// The opening post: the PR's own description, styled like every other
@@ -872,18 +828,18 @@ impl MainPaneView {
             }
         }
 
-        let mut body = div()
+        let scroll = div()
             .id("pr_content_scroll")
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .max_w(px(PR_CONTENT_MAX_WIDTH_PX))
             .gap_2()
             .px(ui_scale.px(PR_CONTENT_PAD_X_PX))
             .py(ui_scale.px(PR_COMMENTS_PAD_Y_PX))
             .overflow_y_scroll()
             .track_scroll(&self.pull_request_scroll);
+        let mut body = PrColumn::new(ui_scale);
 
         // Informational counts, not independent filters: the view only ever
         // has two states (open-only, or `V` to show everything), so only the
@@ -1019,7 +975,7 @@ impl MainPaneView {
                     }),
             );
         }
-        body.into_any_element()
+        scroll.children(body.items).into_any_element()
     }
 
     /// A collapsed, single-row (~36px) review thread: everything but the
@@ -1044,7 +1000,7 @@ impl MainPaneView {
                 &comment.author,
             )
         });
-        let excerpt = first.map_or(String::new(), |comment| comment.body.clone());
+        let excerpt = first.map_or("", |comment| first_nonempty_line(&comment.body));
         // Every comment, root included; a thread nobody answered shows none.
         let comment_count = thread.comments.len();
 
@@ -1059,6 +1015,7 @@ impl MainPaneView {
             .rounded(px(theme.radii.row))
             .border_1()
             .border_color(theme.colors.stroke.subtle)
+            .overflow_hidden()
             .cursor_pointer()
             .children(avatar)
             .child(
@@ -1074,7 +1031,7 @@ impl MainPaneView {
                     .min_w(px(0.0))
                     .truncate()
                     .text_size(theme.ui_text(12.5))
-                    .child(excerpt),
+                    .child(excerpt.to_owned()),
             )
             .when(comment_count > 1, |row| {
                 row.child(crate::view::pr_symbols::bubble_count(
@@ -1124,8 +1081,7 @@ impl MainPaneView {
         let now = std::time::SystemTime::now();
         let gutter = ui_scale.px(40.0);
         let sign_width = ui_scale.px(14.0);
-        let diff_context = diff_hunk_tail(&thread.diff_hunk, 3);
-        let diff_strip = (!diff_context.is_empty()).then(|| {
+        let diff_strip = (!thread.diff_tail.is_empty()).then(|| {
             div()
                 .flex()
                 .flex_col()
@@ -1133,22 +1089,22 @@ impl MainPaneView {
                 .bg(theme.colors.surface.canvas)
                 .border_b_1()
                 .border_color(theme.colors.stroke.subtle)
-                .children(diff_context.into_iter().map(|line| {
+                .children(thread.diff_tail.iter().map(|line| {
                     let sign = match line.kind {
-                        DiffHunkLineKind::Added => "+",
-                        DiffHunkLineKind::Removed => "-",
-                        DiffHunkLineKind::Context => " ",
+                        HunkLineKind::Added => "+",
+                        HunkLineKind::Removed => "-",
+                        HunkLineKind::Context => " ",
                     };
                     let (foreground, background) = match line.kind {
-                        DiffHunkLineKind::Added => (
+                        HunkLineKind::Added => (
                             theme.colors.diff.added.foreground,
                             Some(theme.colors.diff.added.background),
                         ),
-                        DiffHunkLineKind::Removed => (
+                        HunkLineKind::Removed => (
                             theme.colors.diff.removed.foreground,
                             Some(theme.colors.diff.removed.background),
                         ),
-                        DiffHunkLineKind::Context => (theme.colors.foreground.secondary, None),
+                        HunkLineKind::Context => (theme.colors.foreground.secondary, None),
                     };
                     div()
                         .flex()
@@ -1161,10 +1117,7 @@ impl MainPaneView {
                                 .w(gutter)
                                 .px_1()
                                 .text_color(theme.colors.foreground.secondary)
-                                .child(
-                                    line.line_number
-                                        .map_or(String::new(), |number| number.to_string()),
-                                ),
+                                .child(line.line_number.to_string()),
                         )
                         .child(
                             div()
@@ -1178,7 +1131,7 @@ impl MainPaneView {
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .text_color(foreground)
-                                .child(line.text),
+                                .child(line.text.clone()),
                         )
                 }))
         });
@@ -1612,34 +1565,10 @@ mod tests {
     }
 
     #[test]
-    fn diff_hunk_tail_derives_line_numbers_by_walking_from_the_header() {
-        let hunk = "@@ -10,3 +10,4 @@ fn thing\n context\n-old\n+new one\n+new two";
-        let tail = diff_hunk_tail(hunk, 3);
-        assert_eq!(
-            tail.iter()
-                .map(|line| (line.kind, line.line_number, line.text.as_str()))
-                .collect::<Vec<_>>(),
-            [
-                (DiffHunkLineKind::Removed, Some(11), "old"),
-                (DiffHunkLineKind::Added, Some(11), "new one"),
-                (DiffHunkLineKind::Added, Some(12), "new two"),
-            ]
-        );
-    }
-
-    #[test]
-    fn diff_hunk_tail_skips_the_no_newline_marker_and_caps_line_length() {
-        let long_line = "x".repeat(MAX_HUNK_LINE_CHARS + 50);
-        let hunk = format!("@@ -1,1 +1,1 @@\n+{long_line}\n\\ No newline at end of file");
-        let tail = diff_hunk_tail(&hunk, 3);
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].text.chars().count(), MAX_HUNK_LINE_CHARS);
-    }
-
-    #[test]
-    fn diff_hunk_tail_is_empty_without_a_parsable_header() {
-        assert!(diff_hunk_tail("", 3).is_empty());
-        assert!(diff_hunk_tail("not a hunk", 3).is_empty());
+    fn the_thread_row_excerpt_is_the_first_nonempty_line() {
+        assert_eq!(first_nonempty_line("\n  \n  first\nsecond"), "first");
+        assert_eq!(first_nonempty_line(" \n\n"), "");
+        assert_eq!(first_nonempty_line(""), "");
     }
 
     #[test]

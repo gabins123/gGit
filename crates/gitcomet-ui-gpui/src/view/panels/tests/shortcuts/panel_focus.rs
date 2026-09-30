@@ -1540,7 +1540,7 @@ fn viewed_marks_follow_github_and_outdated_threads_take_replies(cx: &mut gpui::T
         is_resolved: false,
         is_outdated: true,
         pull_request_review_id: None,
-        diff_hunk: String::new(),
+        diff_tail: Vec::new(),
         comments: vec![ThreadComment {
             author: "octo".into(),
             body: "Old point\nmore".into(),
@@ -2159,7 +2159,7 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
                 is_resolved: resolved,
                 is_outdated: outdated,
                 pull_request_review_id: None,
-                diff_hunk: String::new(),
+                diff_tail: Vec::new(),
                 comments: vec![ThreadComment {
                     author: "alice".into(),
                     body: "**Review this**".into(),
@@ -2366,6 +2366,48 @@ fn a_tall_description_scrolls_with_j_k_and_the_page_keys(cx: &mut gpui::TestAppC
 }
 
 #[gpui::test]
+fn ctrl_u_with_the_codex_panel_focused_is_not_the_review_prompt_key(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            this.seed_pull_requests_for_test(
+                REPO,
+                vec![crate::github::PullRequestSummary {
+                    number: 7,
+                    title: "Keyboard nav".into(),
+                    author: "someone".into(),
+                    head: "feat".into(),
+                    head_owner: "someone".into(),
+                    base: "main".into(),
+                    is_draft: false,
+                    is_cross_repository: false,
+                    review: None,
+                    checks: Default::default(),
+                    review_requested: false,
+                    is_mine: false,
+                    updated_at: String::new(),
+                }],
+                Some(7),
+            );
+        })
+    });
+    apply_state(cx, &view, pull_request_state());
+    press(cx, "1 0");
+    assert!(cx.update(|window, app| view.read(app).codex_panel_focused(window)));
+    let review = PopoverKind::PullRequestReview {
+        repo_id: REPO,
+        number: 7,
+        kind: crate::github::ReviewKind::Comment,
+    };
+    press(cx, "ctrl-u");
+    assert!(!popover_open(cx, &view, &review), "ctrl-u is not `u`");
+    // The plain key still opens it, so the assertion above is not vacuous.
+    press(cx, "u");
+    assert!(popover_open(cx, &view, &review));
+}
+
+#[gpui::test]
 fn comments_open_with_the_first_thread_selected_and_scroll_with_page_keys(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -2384,7 +2426,7 @@ fn comments_open_with_the_first_thread_selected_and_scroll_with_page_keys(
                 is_resolved: false,
                 is_outdated: false,
                 pull_request_review_id: None,
-                diff_hunk: String::new(),
+                diff_tail: Vec::new(),
                 comments: vec![ThreadComment {
                     author: "alice".into(),
                     body: "Look at this".into(),

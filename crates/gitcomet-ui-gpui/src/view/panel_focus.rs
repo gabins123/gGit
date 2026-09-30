@@ -534,6 +534,7 @@ impl GitCometView {
                     return &[
                         ("j/k", "entry"),
                         ("pgdn/pgup", "scroll"),
+                        ("home/end", "top/bottom"),
                         ("</>", "stack"),
                         ("[/]", "tab"),
                         ("enter", "thread"),
@@ -1615,6 +1616,7 @@ impl GitCometView {
             && !self.reveal_commit_open
             && !self.is_overlay_open(cx)
             && !mods.shift
+            && !half_page_chord
         {
             let key = keystroke.key.as_str();
             if key == "i" {

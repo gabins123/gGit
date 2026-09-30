@@ -2550,7 +2550,7 @@ mod tests {
             is_outdated: false,
             comments: vec![],
             pull_request_review_id: review_id,
-            diff_hunk: String::new(),
+            diff_tail: Vec::new(),
         }
     }
 

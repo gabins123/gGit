@@ -3294,12 +3294,11 @@ impl DetailsPaneView {
         items.push(
             commit_row()
                 .id("pr_all_commits")
-                .when(all_selected, |row| {
-                    row.bg(colors.interaction.selected_background)
-                })
-                .when(!all_selected, |row| {
-                    row.hover(|style| style.bg(colors.interaction.hover_background))
-                })
+                .control_interaction(
+                    controls::InteractionStyle::new(theme).selection_outline(false),
+                    controls::InteractionState::default()
+                        .selected(all_selected, colors.interaction.selected_background),
+                )
                 .child(svg_icon("icons/menu.svg", secondary, icon_size))
                 .child(div().flex_1().min_w(px(0.0)).child("All commits"))
                 .child(
@@ -3387,7 +3386,10 @@ impl DetailsPaneView {
                     .and_then(|last| last.submitted_at.parse::<jiff::Timestamp>().ok())
                     .map_or_else(
                         || "your last review".to_string(),
-                        |at| format!("your last review · {} ago", compact_age(at.as_second(), now)),
+                        |at| match compact_age(at.as_second(), now).as_str() {
+                            "now" => "your last review · just now".to_string(),
+                            age => format!("your last review · {age} ago"),
+                        },
                     );
                 let rule = || div().flex_1().h(px(1.0)).bg(colors.stroke.default);
                 items.push(
@@ -3409,13 +3411,18 @@ impl DetailsPaneView {
             items.push(
                 commit_row()
                     .id(SharedString::from(format!("pr_commit_{ix}")))
-                    .when(selected, |row| row.bg(colors.accent.subtle_background))
-                    .when(cursor, |row| {
-                        row.bg(cursor_fill).border_color(cursor_border)
-                    })
-                    .when(!selected, |row| {
-                        row.hover(|style| style.bg(colors.interaction.hover_background))
-                    })
+                    .control_interaction(
+                        controls::InteractionStyle::new(theme).selection_outline(false),
+                        controls::InteractionState::default().selected(
+                            selected || cursor,
+                            if cursor {
+                                cursor_fill
+                            } else {
+                                colors.accent.subtle_background
+                            },
+                        ),
+                    )
+                    .when(cursor, |row| row.border_color(cursor_border))
                     // A fixed column, so the shas line up with or without the dot.
                     .when(reviewed_ix.is_some(), |row| {
                         let new_since_review = reviewed_ix.is_some_and(|reviewed| ix < reviewed);
@@ -3490,11 +3497,10 @@ impl DetailsPaneView {
         let total = detail.commits.len();
         let review_label = match (selected_range, total) {
             (_, 0) => "Review".to_string(),
-            (Some((first, last)), _) => {
-                let n = last - first + 1;
-                format!("Review these {n} commit{}", if n == 1 { "" } else { "s" })
-            }
-            (None, n) => format!("Review all {n} commit{}", if n == 1 { "" } else { "s" }),
+            (Some((first, last)), _) if first == last => "Review this commit".to_string(),
+            (Some((first, last)), _) => format!("Review these {} commits", last - first + 1),
+            (None, 1) => "Review the commit".to_string(),
+            (None, n) => format!("Review all {n} commits"),
         };
         let root_for_review = self.root_view.clone();
         let on_solid = colors.accent.on_solid;
@@ -3525,12 +3531,16 @@ impl DetailsPaneView {
                     .gap(ui.px(8.0))
                     .h(ui.px(32.0))
                     .rounded(px(theme.radii.control))
-                    .bg(colors.accent.solid)
                     .text_color(on_solid)
                     .text_size(theme.ui_text(13.0))
                     .font_weight(FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .hover(|style| style.opacity(0.92))
+                    .control_interaction(
+                        controls::InteractionStyle::new(theme)
+                            .resting_background(colors.accent.solid)
+                            .hover(gpui::StyleRefinement::default().opacity(0.92))
+                            .pressed(gpui::StyleRefinement::default().opacity(0.85)),
+                        controls::InteractionState::default(),
+                    )
                     .child(review_label)
                     .child(
                         div()

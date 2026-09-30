@@ -17,7 +17,8 @@ development tooling, not a user-facing feature, so the keyboard-first rule in
 
 ```sh
 cargo build -j 8 -p gitcomet
-GITCOMET_CONTROL_DIR=/tmp/gitcomet-ctl target/debug/gitcomet.exe
+# A per-user folder: %LOCALAPPDATA%\Temp\gitcomet-ctl (or $XDG_RUNTIME_DIR/gitcomet-ctl off Windows).
+GITCOMET_CONTROL_DIR="$LOCALAPPDATA/Temp/gitcomet-ctl" target/debug/gitcomet.exe
 ```
 
 ## Protocol
@@ -63,7 +64,7 @@ returns an `error:` too.
 ## Helper
 
 ```sh
-export GITCOMET_CONTROL_DIR=/tmp/gitcomet-ctl
+export GITCOMET_CONTROL_DIR="$LOCALAPPDATA/Temp/gitcomet-ctl"
 scripts/dev/gitcomet-ctl.py keys 1 ] ]
 scripts/dev/gitcomet-ctl.py wait 1500
 scripts/dev/gitcomet-ctl.py screenshot shot.png
@@ -78,5 +79,7 @@ non-zero on `error:` or timeout.
 
 Any local process running as the same user can write to the control directory
 and so press keys in the app and read its screen: the same trust as the user
-themselves. Point it at a directory only you can write, and never enable it in
-release builds (it is compiled out there).
+themselves. Whoever can write the folder can drive the app and have `screenshot` write a
+PNG to any path the user can write, so the folder must be private to the user
+(not a shared location such as `/tmp`, where another user can pre-create it).
+Never enable it in release builds (it is compiled out there).

@@ -8,6 +8,7 @@
 //! argument that could parse as an option.
 
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -1128,8 +1129,17 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
         })
         .collect();
     entries.sort_by(|a, b| a.at.cmp(&b.at));
-    let skip = entries.len().saturating_sub(MAX_CONVERSATION);
-    entries.drain(..skip);
+    // The cap counts only entries that can show; bare reviews inside the kept
+    // time window stay so their line comments can still surface.
+    let mut shown = 0;
+    let start = entries
+        .iter()
+        .rposition(|entry| {
+            shown += usize::from(!entry.is_bare_review());
+            shown == MAX_CONVERSATION
+        })
+        .unwrap_or(0);
+    entries.drain(..start);
     entries
 }
 
@@ -1474,9 +1484,87 @@ pub(crate) struct ReviewThread {
     /// a [`ConversationEntry::review_id`] `view` filled in — `None` for a
     /// comment made outside of a review.
     pub(crate) pull_request_review_id: Option<u64>,
-    /// The root comment's unified-diff hunk, ending at the commented line;
-    /// untrusted plain text, empty when GitHub didn't send one.
-    pub(crate) diff_hunk: String,
+    /// The last lines of the root comment's unified-diff hunk (which ends at
+    /// the commented line), computed once on parse; empty when GitHub sent no
+    /// hunk or one whose header doesn't parse.
+    pub(crate) diff_tail: Vec<HunkLine>,
+}
+
+/// How many trailing hunk lines a thread keeps, and how long each may be.
+const HUNK_TAIL_LINES: usize = 3;
+const MAX_HUNK_LINE_CHARS: usize = 400;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HunkLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+/// One line of a review thread's diff hunk tail. Untrusted plain text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HunkLine {
+    pub(crate) kind: HunkLineKind,
+    /// The new-file line for a context or added line, the old-file line for a
+    /// removed one.
+    pub(crate) line_number: u32,
+    pub(crate) text: String,
+}
+
+/// The first line numbers of a `@@ -old[,n] +new[,n] @@` header.
+fn hunk_header_starts(header: &str) -> Option<(u32, u32)> {
+    let (ranges, _) = header.strip_prefix("@@")?.split_once("@@")?;
+    let mut tokens = ranges.split_whitespace();
+    let start = |token: &str, prefix: char| -> Option<u32> {
+        let body = token.strip_prefix(prefix)?;
+        body.split_once(',').map_or(body, |(start, _)| start).parse().ok()
+    };
+    Some((start(tokens.next()?, '-')?, start(tokens.next()?, '+')?))
+}
+
+/// The last [`HUNK_TAIL_LINES`] content lines of `hunk`, numbered by walking
+/// it from its header. The walk keeps counters and borrowed slices only (a
+/// hunk runs from its header to the commented line and can be long), and the
+/// counters saturate because the header is untrusted.
+fn hunk_tail(hunk: &str) -> Vec<HunkLine> {
+    let mut lines = hunk.lines();
+    let Some((mut old_line, mut new_line)) = lines.next().and_then(hunk_header_starts) else {
+        return Vec::new();
+    };
+    let bump = |counter: &mut u32| {
+        let number = *counter;
+        *counter = number.saturating_add(1);
+        number
+    };
+    let mut tail = VecDeque::with_capacity(HUNK_TAIL_LINES);
+    for line in lines {
+        let (kind, content) = match line.as_bytes().first() {
+            Some(b'+') => (HunkLineKind::Added, &line[1..]),
+            Some(b'-') => (HunkLineKind::Removed, &line[1..]),
+            // "\ No newline at end of file".
+            Some(b'\\') => continue,
+            _ => (HunkLineKind::Context, line.get(1..).unwrap_or("")),
+        };
+        let number = match kind {
+            HunkLineKind::Added => bump(&mut new_line),
+            HunkLineKind::Removed => bump(&mut old_line),
+            HunkLineKind::Context => {
+                bump(&mut old_line);
+                bump(&mut new_line)
+            }
+        };
+        if tail.len() == HUNK_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back((kind, number, content));
+    }
+    tail.into_iter()
+        .map(|(kind, line_number, content)| HunkLine {
+            kind,
+            line_number,
+            text: content.chars().take(MAX_HUNK_LINE_CHARS).collect(),
+        })
+        .collect()
 }
 
 impl ReviewThread {
@@ -1541,7 +1629,7 @@ fn review_threads(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
             // REST heuristic until then for callers that only parse REST.
             is_outdated: root.line.is_none() && root.original_line.is_some(),
             pull_request_review_id: root.pull_request_review_id,
-            diff_hunk: root.diff_hunk.clone(),
+            diff_tail: hunk_tail(&root.diff_hunk),
             comments: vec![comment(root)],
         })
         .collect();
@@ -1807,12 +1895,23 @@ pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullReques
          deletions,changedFiles,files,\
           statusCheckRollup,comments,reviews,reviewRequests,latestReviews,commits",
     ]);
-    let raw: RawDetail = parse_json(&run(command, None)?)?;
-    let mut detail: PullRequestDetail = raw.into();
+    // The REST id lookup is independent of `gh pr view`; run them together so
+    // selecting a pull request waits on one `gh` round trip, not two.
+    let (raw, rest_ids) = std::thread::scope(|scope| {
+        let rest_ids = scope.spawn(|| review_rest_ids(workdir, repo, number));
+        let raw = run(command, None).and_then(|out| parse_json::<RawDetail>(&out));
+        (
+            raw,
+            rest_ids
+                .join()
+                .unwrap_or_else(|_| Err(PrError::Failed("gh api panicked".to_string()))),
+        )
+    });
+    let mut detail: PullRequestDetail = raw?.into();
     // Best-effort, like `review_thread_statuses`: a review simply keeps
     // `review_id: None` (no "N line comments" footer) if this secondary
     // lookup fails.
-    match review_rest_ids(workdir, repo, number) {
+    match rest_ids {
         Ok(rest_reviews) => match_conversation_review_ids(&mut detail.conversation, &rest_reviews),
         Err(err) => {
             eprintln!("Couldn't match reviews to their REST ids for {repo}#{number}: {err}")
@@ -3082,8 +3181,16 @@ mod tests {
         let with_review = threads.iter().find(|thread| thread.root_id == 1).unwrap();
         assert_eq!(with_review.pull_request_review_id, Some(555));
         assert_eq!(
-            with_review.diff_hunk,
-            "@@ -10,3 +10,3 @@\n context\n-old\n+new"
+            with_review
+                .diff_tail
+                .iter()
+                .map(|line| (line.kind, line.line_number, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (super::HunkLineKind::Context, 10, "context"),
+                (super::HunkLineKind::Removed, 11, "old"),
+                (super::HunkLineKind::Added, 11, "new"),
+            ]
         );
         // A reply's own `pull_request_review_id`/`diff_hunk` never overwrite
         // the thread's, which are the root comment's only.
@@ -3092,7 +3199,43 @@ mod tests {
         // Absent on the wire (a comment made outside of a review): stays `None`/empty.
         let without_review = threads.iter().find(|thread| thread.root_id == 3).unwrap();
         assert_eq!(without_review.pull_request_review_id, None);
-        assert_eq!(without_review.diff_hunk, "");
+        assert!(without_review.diff_tail.is_empty());
+    }
+
+    #[test]
+    fn hunk_tail_numbers_the_real_last_lines_of_a_long_hunk() {
+        let mut hunk = String::from("@@ -1,5000 +1,5000 @@ fn thing");
+        for n in 0..5_000 {
+            hunk.push_str(&format!("\n line {n}"));
+        }
+        let tail = super::hunk_tail(&hunk);
+        assert_eq!(
+            tail.iter()
+                .map(|line| (line.line_number, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(4998, "line 4997"), (4999, "line 4998"), (5000, "line 4999")]
+        );
+    }
+
+    #[test]
+    fn hunk_tail_skips_the_no_newline_marker_and_caps_line_length() {
+        let long_line = "x".repeat(super::MAX_HUNK_LINE_CHARS + 50);
+        let tail = super::hunk_tail(&format!(
+            "@@ -1,1 +1,1 @@\n+{long_line}\n\\ No newline at end of file"
+        ));
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].text.chars().count(), super::MAX_HUNK_LINE_CHARS);
+    }
+
+    #[test]
+    fn hunk_tail_is_empty_without_a_parsable_header_and_never_overflows() {
+        assert!(super::hunk_tail("").is_empty());
+        assert!(super::hunk_tail("not a hunk").is_empty());
+        let tail = super::hunk_tail("@@ -1,1 +4294967295,2 @@\n one\n two\n three");
+        assert_eq!(
+            tail.iter().map(|line| line.line_number).collect::<Vec<_>>(),
+            [4294967295, 4294967295, 4294967295]
+        );
     }
 
     #[test]
@@ -3628,6 +3771,34 @@ mod tests {
             .collect();
         // A verdict without a body (amy's approval) is not bare.
         assert_eq!(bare, [true, false, false, false]);
+    }
+
+    #[test]
+    fn the_conversation_cap_counts_only_entries_that_can_show() {
+        let at = |n: usize| format!("2026-01-01T{:02}:{:02}:00Z", n / 60, n % 60);
+        // Real comments at even minutes, bare inline reviews in between.
+        let comments: Vec<super::RawComment> = (0..120)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "author": {"login": "amy"}, "body": format!("c{i}"), "createdAt": at(2 * i)
+                }))
+                .expect("comment")
+            })
+            .collect();
+        let reviews: Vec<super::RawReview> = (0..120)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "author": {"login": "bob"}, "body": "", "state": "COMMENTED",
+                    "submittedAt": at(2 * i + 1)
+                }))
+                .expect("review")
+            })
+            .collect();
+        let kept = super::conversation(comments, reviews);
+        let real = kept.iter().filter(|e| !e.is_bare_review()).count();
+        assert_eq!(real, super::MAX_CONVERSATION);
+        // The oldest kept real comment starts the window; older bare ones go.
+        assert_eq!((kept[0].body.as_str(), kept.len()), ("c20", 200));
     }
 
     #[test]
