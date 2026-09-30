@@ -297,6 +297,7 @@ fn pull_request_dialogs_open_from_keys_and_hand_focus_back(cx: &mut gpui::TestAp
                     checks: Default::default(),
                     review_requested: false,
                     is_mine: false,
+                    updated_at: String::new(),
                 }],
                 Some(7),
             );
@@ -384,6 +385,7 @@ fn stack_pull_request(number: u64, head: &str, base: &str) -> crate::github::Pul
         checks: Default::default(),
         review_requested: false,
         is_mine: false,
+        updated_at: String::new(),
     }
 }
 
@@ -1863,6 +1865,7 @@ fn the_create_dialog_steps_the_base_toggles_the_push_and_guards_submit(
                         checks: Default::default(),
                         review_requested: false,
                         is_mine: false,
+                        updated_at: String::new(),
                     }],
                     None,
                 );

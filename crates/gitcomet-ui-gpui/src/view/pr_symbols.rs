@@ -45,19 +45,44 @@ pub(super) fn at_pill(theme: AppTheme, id: impl Into<ElementId>) -> AnyElement {
         .into_any_element()
 }
 
-/// The small `feat` / `fix` / … tag next to a pull request's stripped title.
+/// The small `feat` / `fix` / … tag next to a pull request's stripped title:
+/// mono, tinted by kind (feat info, fix warning, docs success, refactor purple);
+/// anything else (`deps`) stays neutral.
 pub(super) fn kind_tag(
     kind: &str,
     theme: AppTheme,
     text_size: impl Into<gpui::AbsoluteLength>,
 ) -> AnyElement {
+    let (background, foreground) = match kind {
+        "feat" => (
+            theme.colors.status.info.background,
+            theme.colors.status.info.foreground,
+        ),
+        "fix" => (
+            theme.colors.status.warning.background,
+            theme.colors.status.warning.foreground,
+        ),
+        "docs" => (
+            theme.colors.status.success.background,
+            theme.colors.status.success.foreground,
+        ),
+        "refactor" => {
+            let purple = theme::historical_outline(theme.is_dark);
+            (theme::with_alpha(purple, 0.16), purple)
+        }
+        _ => (
+            theme.colors.surface.panel,
+            theme.colors.foreground.secondary,
+        ),
+    };
     div()
         .flex_none()
         .rounded(px(3.0))
         .px_1()
-        .bg(theme.colors.surface.panel)
+        .bg(background)
+        .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
         .text_size(text_size)
-        .text_color(theme.colors.foreground.secondary)
+        .text_color(foreground)
         .child(kind.to_string())
         .into_any_element()
 }
@@ -65,6 +90,17 @@ pub(super) fn kind_tag(
 /// A small rounded pill for a review thread's status ("Open" / "Resolved" /
 /// "Outdated"), colored from the matching status token.
 pub(super) fn status_chip(label: &str, set: StatusColorSet, theme: AppTheme) -> AnyElement {
+    status_pill(label, set, theme.ui_text(10.5), FontWeight::NORMAL, theme)
+}
+
+/// [`status_chip`] at a chosen size and weight (the "Reviewing" pill).
+pub(super) fn status_pill(
+    label: &str,
+    set: StatusColorSet,
+    text_size: impl Into<gpui::AbsoluteLength>,
+    weight: FontWeight,
+    theme: AppTheme,
+) -> AnyElement {
     div()
         .flex_none()
         .rounded(px(theme.radii.pill))
@@ -73,7 +109,8 @@ pub(super) fn status_chip(label: &str, set: StatusColorSet, theme: AppTheme) -> 
         .bg(set.background)
         .text_color(set.foreground)
         .px_2()
-        .text_size(theme.ui_text(10.5))
+        .text_size(text_size)
+        .font_weight(weight)
         .child(label.to_string())
         .into_any_element()
 }

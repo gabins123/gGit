@@ -3625,7 +3625,7 @@ fn pr_chip(
 }
 
 /// "5h", "2d", "3w": a commit's age in a right-aligned column.
-fn compact_age(at_secs: i64, now: std::time::SystemTime) -> String {
+pub(in crate::view) fn compact_age(at_secs: i64, now: std::time::SystemTime) -> String {
     let now = now
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64);

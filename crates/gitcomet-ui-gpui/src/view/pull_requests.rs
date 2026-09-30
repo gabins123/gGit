@@ -2401,6 +2401,7 @@ mod tests {
             checks: Default::default(),
             review_requested,
             is_mine: false,
+            updated_at: String::new(),
         };
         let mut list = vec![pr(1, false), pr(2, false), pr(3, true), pr(4, false)];
         let drafts = FxHashMap::from_iter([(4, 2usize)]);
@@ -2424,6 +2425,7 @@ mod tests {
             checks: Default::default(),
             review_requested: false,
             is_mine: false,
+            updated_at: String::new(),
         }
     }
 
@@ -2456,6 +2458,7 @@ mod tests {
             checks: Default::default(),
             review_requested,
             is_mine: false,
+            updated_at: String::new(),
         }
     }
 

@@ -282,6 +282,8 @@ struct RawSummary {
     review_requests: Vec<RawReviewRequest>,
     #[serde(default)]
     latest_reviews: Vec<RawLatestReview>,
+    #[serde(default)]
+    updated_at: String,
 }
 
 /// A row of the open pull request list.
@@ -305,6 +307,8 @@ pub(crate) struct PullRequestSummary {
     pub(crate) review_requested: bool,
     /// The signed-in GitHub account authored this pull request.
     pub(crate) is_mine: bool,
+    /// ISO-8601 time of the last update; empty when gh didn't say.
+    pub(crate) updated_at: String,
 }
 
 impl From<RawSummary> for PullRequestSummary {
@@ -328,6 +332,7 @@ impl From<RawSummary> for PullRequestSummary {
             checks: ChecksSummary::from_entries(&raw.status_check_rollup),
             review_requested: false,
             is_mine: false,
+            updated_at: raw.updated_at,
         }
     }
 }
@@ -1738,7 +1743,7 @@ pub(crate) fn list_open(
         &repo_flag(repo),
         "--state=open",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews,updatedAt",
     ]);
     let raw: Vec<RawSummary> = parse_json(&run(command, None)?)?;
     let complete = raw.len() < LIST_LIMIT as usize;
@@ -1753,7 +1758,7 @@ pub(crate) fn list_open(
         "--state=open",
         "--search=review-requested:@me",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews,updatedAt",
     ]);
     // Run alongside the login lookup below: both are independent `gh` calls
     // on the critical path of every list load and refresh.
@@ -3198,7 +3203,8 @@ mod tests {
         }, {
             "number": 47, "title": "Draft", "author": {"login": "someone"},
             "headRefName": "wip", "baseRefName": "dev", "isDraft": true,
-            "reviewDecision": "", "statusCheckRollup": []
+            "reviewDecision": "", "statusCheckRollup": [],
+            "updatedAt": "2026-09-01T10:00:00Z"
         }]"#;
         let raw: Vec<RawSummary> = parse_json(json.as_bytes()).expect("valid list");
         let prs: Vec<PullRequestSummary> = raw.into_iter().map(Into::into).collect();
@@ -3216,6 +3222,8 @@ mod tests {
         assert!(prs[1].is_draft);
         assert_eq!(prs[1].review, None);
         assert_eq!(prs[1].checks.total(), 0);
+        assert_eq!(prs[1].updated_at, "2026-09-01T10:00:00Z");
+        assert_eq!(prs[0].updated_at, "");
     }
 
     #[test]
@@ -3907,6 +3915,7 @@ mod tests {
             checks: super::ChecksSummary::default(),
             review_requested: false,
             is_mine: false,
+            updated_at: String::new(),
         }
     }
 
