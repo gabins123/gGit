@@ -46,6 +46,8 @@ pub(in crate::view) enum FileListId {
     CommitFiles,
     WorktreeFiles,
     RangeFiles,
+    /// Review mode's Files list in the Sidebar.
+    Review,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +107,7 @@ impl FileListId {
             Self::CommitFiles => "this commit",
             Self::WorktreeFiles => "this worktree",
             Self::RangeFiles => "this comparison",
+            Self::Review => "this pull request",
         }
     }
 }

@@ -3257,12 +3257,11 @@ impl SidebarPaneView {
                 .pull_requests
                 .repo(review.repo_id)
                 .and_then(|prs| prs.stack_neighbor(review.number, -1));
-            // Up to 3,000 files: only the listed indices are kept here, and
-            // the per-file counts come from one pass over comments and
-            // threads; the rows on screen read the rest as they paint.
-            self.review_rows = (0..review.files.len())
-                .filter(|ix| review.file_listed(*ix))
-                .collect();
+            // Up to 3,000 files: the per-file counts come from one pass over
+            // comments and threads; the rows on screen read the rest as they
+            // paint. Which indices are listed, and how they lay out under
+            // Flat/Tree, come from `review_file_list_plan` below — the same
+            // plan keyboard navigation walks, built once this render.
             let mut file_counts: rustc_hash::FxHashMap<String, ReviewFileCounts> =
                 Default::default();
             for comment in &review.draft.comments {
@@ -3371,6 +3370,18 @@ impl SidebarPaneView {
                 stacked_on,
             )
         };
+        // The same plan keyboard navigation walks (`review_file_list_plan`),
+        // built once here rather than a second tree for the rows to read.
+        let (listed_indices, plan) = root
+            .update(cx, |root, cx| root.review_file_list_plan(cx))
+            .unwrap_or_else(|| {
+                (
+                    Arc::from([]),
+                    Arc::new(crate::view::rows::FileListPlan::flat(0)),
+                )
+            });
+        self.review_rows = listed_indices.to_vec();
+        let row_count = plan.row_len();
         let (
             viewed,
             total,
@@ -3383,13 +3394,20 @@ impl SidebarPaneView {
             files_missing,
         ) = counts;
         let listed = self.review_rows.len();
-        // Keep the open file in view as j/k, ]/[ and space move it.
-        if self.review_scrolled_to != Some(current)
-            && let Ok(row) = self.review_rows.binary_search(&current)
-        {
-            self.review_files_scroll
-                .scroll_to_item(row, gpui::ScrollStrategy::Nearest);
-            self.review_scrolled_to = Some(current);
+        // Keep the open file's row in view as j/k, ]/[ and space move it.
+        if self.review_scrolled_to != Some(current) {
+            let row = self
+                .review_rows
+                .iter()
+                .position(|&ix| ix == current)
+                .and_then(|position| {
+                    plan.row_ix_for_ordinal(crate::view::rows::FileOrdinal(position))
+                });
+            if let Some(row) = row {
+                self.review_files_scroll
+                    .scroll_to_item(row.0, gpui::ScrollStrategy::Nearest);
+                self.review_scrolled_to = Some(current);
+            }
         }
         let query_text = self.review_query_input.read(cx).text().to_string();
         // "18 files · 7 viewed hidden (V shows)", and the filter when set.
@@ -3459,7 +3477,7 @@ impl SidebarPaneView {
         let accent = theme.colors.status.info.foreground;
         let list = uniform_list(
             "review_file_rows",
-            listed,
+            row_count,
             cx.processor(Self::render_review_file_rows),
         )
         .flex_1()
@@ -3549,6 +3567,7 @@ impl SidebarPaneView {
             return Vec::new();
         };
         let theme = this.theme;
+        let ui_scale_percent = ui_scale::current(cx).percent;
         // Two lines of text, which grow with the UI font, and the air around.
         let scale = ui_scale::UiScale::current(cx);
         let row_height = scale.px(8.0) + (scale.ui_text(12.5) + scale.ui_text(11.0)) * 1.618;
@@ -3556,54 +3575,124 @@ impl SidebarPaneView {
         let success = theme.colors.status.success.foreground;
         let warning = theme.colors.status.warning.foreground;
         let accent = theme.colors.status.info.foreground;
-        let rows: Vec<_> = {
+        let (repo_id, dir_cursor) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return Vec::new();
             };
-            range
-                .filter_map(|row| this.review_rows.get(row).copied())
-                .filter_map(|ix| {
+            (review.repo_id, review.sidebar_dir_cursor.clone())
+        };
+        let Some((listed, plan)) = root.update(cx, |root, cx| root.review_file_list_plan(cx))
+        else {
+            return Vec::new();
+        };
+        let is_tree = plan.is_tree();
+        let rows: Vec<_> = range
+            .filter_map(|row_ix| {
+                plan.row_at(crate::view::rows::RowIx(row_ix))
+                    .map(|row| (row_ix, row))
+            })
+            .collect();
+        rows.into_iter()
+            .filter_map(|(row_ix, row)| {
+                let (ix, depth) = match row {
+                    crate::view::rows::FileListRow::Directory {
+                        key,
+                        label,
+                        depth,
+                        collapsed,
+                        chain,
+                        ..
+                    } => {
+                        let dir_selected = dir_cursor.as_deref() == Some(key.as_ref());
+                        return Some(
+                            crate::view::rows::directory_row(crate::view::rows::DirectoryRowProps {
+                                theme,
+                                ui_scale_percent,
+                                id: ("review_file_dir", row_ix).into(),
+                                label: &label,
+                                depth,
+                                collapsed,
+                                selected: dir_selected,
+                                additions: None,
+                                deletions: None,
+                                row_height,
+                                row_group: None,
+                                detail: crate::view::rows::DirectoryRowDetail::LabelOnly,
+                            })
+                            .debug_selector(move || format!("review_file_dir_{row_ix}"))
+                            .on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, e: &ClickEvent, window, cx| {
+                                    if !e.standard_click() {
+                                        return;
+                                    }
+                                    window.focus(&this.panel_focus_handle, cx);
+                                    let root = this.root_view.clone();
+                                    let key = key.clone();
+                                    let chain = chain.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = root.update(cx, |root, cx| {
+                                            root.toggle_review_file_list_dir(
+                                                repo_id, key, chain, collapsed, cx,
+                                            );
+                                        });
+                                    });
+                                }),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                    crate::view::rows::FileListRow::File { ordinal, depth } => {
+                        (*listed.get(ordinal.0)?, depth)
+                    }
+                };
+                let (path, is_viewed, updated, dismissed, is_generated, is_current) = {
+                    let root = root.read(cx);
+                    let review = root.active_review()?;
                     let path = review.files.get(ix)?.clone();
-                    let counts = this
-                        .review_file_counts
-                        .get(&path)
-                        .copied()
-                        .unwrap_or_default();
-                    Some((
-                        ix,
+                    (
+                        path.clone(),
                         review.draft.viewed.contains(&path),
                         review.changed_since_review(&path),
                         review.dismissed.contains(&path),
                         review.is_generated(&path),
-                        counts,
-                        path,
                         ix == review.file_ix,
-                    ))
-                })
-                .collect()
-        };
-        rows.into_iter()
-            .map(
-                |(ix, is_viewed, updated, dismissed, is_generated, counts, path, is_current)| {
-                    let name = path
-                        .rsplit_once('/')
-                        .map_or(path.as_str(), |(_, name)| name)
-                        .to_string();
-                    let folder = path.rsplit_once('/').map(|(folder, _)| folder.to_string());
-                    let ReviewFileCounts {
-                        comments,
-                        threads,
-                        outdated,
-                    } = counts;
+                    )
+                };
+                let counts = this
+                    .review_file_counts
+                    .get(&path)
+                    .copied()
+                    .unwrap_or_default();
+                let name = path
+                    .rsplit_once('/')
+                    .map_or(path.as_str(), |(_, name)| name)
+                    .to_string();
+                let folder = (!is_tree)
+                    .then(|| path.rsplit_once('/').map(|(folder, _)| folder.to_string()))
+                    .flatten();
+                let ReviewFileCounts {
+                    comments,
+                    threads,
+                    outdated,
+                } = counts;
+                Some(
                     div()
-                        .id(("review_file", ix))
+                        .id(("review_file", row_ix))
+                        .debug_selector(move || format!("review_file_{ix}"))
                         .h(row_height)
                         .flex()
                         .items_center()
                         .gap_2()
                         .mx_1()
-                        .px_2()
+                        .pl(if is_tree {
+                            crate::view::rows::file_row_indent_px(depth, ui_scale_percent)
+                        } else {
+                            px(8.0)
+                        })
+                        .pr_2()
                         .rounded(px(theme.radii.control))
                         .control_interaction(
                             controls::InteractionStyle::new(theme),
@@ -3730,9 +3819,9 @@ impl SidebarPaneView {
                                     .child(comments.to_string()),
                             )
                         })
-                        .into_any_element()
-                },
-            )
+                        .into_any_element(),
+                )
+            })
             .collect()
     }
 

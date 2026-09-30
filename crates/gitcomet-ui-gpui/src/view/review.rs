@@ -304,6 +304,14 @@ pub(super) struct ReviewMode {
     /// with `enter`, so their diff loads normally for the rest of the review
     /// session.
     pub(super) generated_placeholder_dismissed: std::collections::BTreeSet<String>,
+    /// The Files list's keyboard cursor in tree layout, resting on a folder
+    /// row: `j`/`k` moved onto it rather than a file. `None` means the
+    /// cursor is wherever the open file's row is, which is every other
+    /// case, flat layout included. Keyed by the row's own path, so a filter
+    /// or collapse change that reshapes the tree drops it cleanly rather
+    /// than pointing at a stale row (`review_current_row` falls back to the
+    /// open file's row when the key no longer resolves to one).
+    pub(super) sidebar_dir_cursor: Option<Arc<std::path::Path>>,
 }
 
 impl ReviewMode {
@@ -951,6 +959,7 @@ impl GitCometView {
             generated,
             show_generated: false,
             generated_placeholder_dismissed: Default::default(),
+            sidebar_dir_cursor: None,
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
@@ -1163,6 +1172,235 @@ impl GitCometView {
         0
     }
 
+    /// The review Files list's projection: which of `review.files` are
+    /// listed right now (`file_listed`, in file order) and how they lay out
+    /// under the current Flat/Tree preference. Shared by the Sidebar's rows
+    /// and by keyboard navigation (`]`/`[`, `space`, `enter` on a folder,
+    /// reveal-on-open), so both walk the same tree — never built twice.
+    pub(in crate::view) fn review_file_list_plan(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<(Arc<[usize]>, Arc<crate::view::rows::FileListPlan>)> {
+        let review = self.review.as_ref()?;
+        let repo_id = review.repo_id;
+        let listed: Arc<[usize]> = (0..review.files.len())
+            .filter(|ix| review.file_listed(*ix))
+            .collect();
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            (repo_id, review.number, &review.draft.head_oid, &*listed).hash(&mut hasher);
+            hasher.finish()
+        };
+        let files: Arc<[String]> = review.files.iter().cloned().collect();
+        let list = crate::view::rows::FileListId::Review;
+        let layout = self.details_pane.read(cx).file_list_layout_for(repo_id, list);
+        let collapsed = self
+            .details_pane
+            .read(cx)
+            .file_list_collapsed_for(repo_id, list)
+            .into_owned();
+        let listed_len = listed.len();
+        let listed_for_build = Arc::clone(&listed);
+        let plan = self
+            .review_plan_cache
+            .plan_for(key, layout, &collapsed, listed_len, move || {
+                crate::view::rows::FileTree::build(
+                    listed_for_build.iter().map(|&ix| crate::view::rows::FileTreeItem {
+                        path: std::path::Path::new(files[ix].as_str()),
+                        additions: None,
+                        deletions: None,
+                    }),
+                    crate::view::rows::CommitFileSort::default(),
+                )
+            });
+        Some((listed, plan))
+    }
+
+    /// The order review files line up in a tree, or plain file order in flat
+    /// layout: `file_passes_filters` only (the `/` filter and `L`), not
+    /// viewed/generated-hiding, so a file just marked viewed still has a
+    /// stable place to step from. `None` in flat layout — callers keep their
+    /// own raw-index stepping there, which is already tree order once there
+    /// are no folders to skip.
+    fn review_tree_order(&self, cx: &gpui::Context<Self>) -> Option<Vec<usize>> {
+        let review = self.review.as_ref()?;
+        let repo_id = review.repo_id;
+        let layout = self
+            .details_pane
+            .read(cx)
+            .file_list_layout_for(repo_id, crate::view::rows::FileListId::Review);
+        if !matches!(layout, crate::view::FileListLayout::Tree) {
+            return None;
+        }
+        let all: Vec<usize> = (0..review.files.len())
+            .filter(|ix| review.file_passes_filters(*ix))
+            .collect();
+        let tree = crate::view::rows::FileTree::build(
+            all.iter().map(|&ix| crate::view::rows::FileTreeItem {
+                path: std::path::Path::new(review.files[ix].as_str()),
+                additions: None,
+                deletions: None,
+            }),
+            crate::view::rows::CommitFileSort::default(),
+        );
+        let plan = tree.flatten(&Default::default());
+        Some(plan.ordered().iter().map(|ord| all[ord]).collect())
+    }
+
+    /// Expands any folder hiding `review.files[ix]`'s row in the Files
+    /// list's tree layout, so `]`/`[`, `space`, a thread jump or a reviewer
+    /// jump always lands on a visible row. A no-op in flat layout, or when
+    /// the file isn't part of what the list currently shows.
+    fn review_reveal_file(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.review.as_ref().map(|review| review.repo_id) else {
+            return;
+        };
+        let Some((listed, plan)) = self.review_file_list_plan(cx) else {
+            return;
+        };
+        let Some(position) = listed.iter().position(|&fi| fi == ix) else {
+            return;
+        };
+        let chains = plan.reveal(crate::view::rows::FileOrdinal(position));
+        for chain in chains {
+            let key = Arc::clone(chain.last().expect("a folded chain is never empty"));
+            self.toggle_review_file_list_dir(repo_id, key, chain, true, cx);
+        }
+    }
+
+    /// The display row the Sidebar's keyboard cursor rests on, in the
+    /// current plan: the cursor's own folder when one is set and still
+    /// resolves to a row, else the open file's row.
+    fn review_current_row(
+        &self,
+        listed: &[usize],
+        plan: &crate::view::rows::FileListPlan,
+        review: &ReviewMode,
+    ) -> Option<usize> {
+        if let Some(dir) = &review.sidebar_dir_cursor
+            && let Some(row) = Self::review_dir_row(plan, dir)
+        {
+            return Some(row);
+        }
+        let position = listed.iter().position(|&ix| ix == review.file_ix)?;
+        plan.row_ix_for_ordinal(crate::view::rows::FileOrdinal(position))
+            .map(|row| row.0)
+    }
+
+    /// The row showing the folder at `dir`, if the plan still has one.
+    fn review_dir_row(plan: &crate::view::rows::FileListPlan, dir: &std::path::Path) -> Option<usize> {
+        (0..plan.row_len()).find(|&row| {
+            matches!(
+                plan.row_at(crate::view::rows::RowIx(row)),
+                Some(crate::view::rows::FileListRow::Directory { key, .. }) if key.as_ref() == dir
+            )
+        })
+    }
+
+    /// `enter` on the Sidebar cursor's folder row: toggles it, the way a
+    /// file row's `enter` opens the file. `false` when the cursor isn't on
+    /// one, so the caller falls through to the ordinary `enter` behavior.
+    fn review_toggle_cursor_dir(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(dir) = self
+            .review
+            .as_ref()
+            .and_then(|review| review.sidebar_dir_cursor.clone())
+        else {
+            return false;
+        };
+        let Some(repo_id) = self.review.as_ref().map(|review| review.repo_id) else {
+            return false;
+        };
+        let Some((_, plan)) = self.review_file_list_plan(cx) else {
+            return false;
+        };
+        let Some(row) = Self::review_dir_row(&plan, &dir) else {
+            // The tree reshaped under it; the cursor no longer names a row.
+            if let Some(review) = self.review.as_mut() {
+                review.sidebar_dir_cursor = None;
+            }
+            return false;
+        };
+        let Some(crate::view::rows::FileListRow::Directory {
+            key,
+            chain,
+            collapsed,
+            ..
+        }) = plan.row_at(crate::view::rows::RowIx(row))
+        else {
+            return false;
+        };
+        self.toggle_review_file_list_dir(repo_id, key, chain, collapsed, cx);
+        true
+    }
+
+    /// A folder row's click or `enter` in the review Files list's tree
+    /// layout: one hop into `DetailsPaneView`'s shared collapse store, the
+    /// same one every other changed-file list's tree uses.
+    pub(in crate::view) fn toggle_review_file_list_dir(
+        &mut self,
+        repo_id: RepoId,
+        key: Arc<std::path::Path>,
+        chain: Arc<[Arc<std::path::Path>]>,
+        collapsed: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.details_pane.update(cx, |pane, cx| {
+            pane.toggle_file_list_dir(
+                repo_id,
+                crate::view::rows::FileListId::Review,
+                key,
+                chain,
+                collapsed,
+                cx,
+            );
+        });
+    }
+
+    /// `j`/`k` while the Files list has focus. In tree layout, one row at a
+    /// time, folders included: landing on a file opens it, as every `j`/`k`
+    /// press does in flat layout; landing on a folder just rests the cursor
+    /// there for `enter`. Flat layout has no folder rows, so it's exactly
+    /// `review_step_file`.
+    fn review_step_sidebar(&mut self, direction: i8, cx: &mut gpui::Context<Self>) {
+        let Some((listed, plan)) = self.review_file_list_plan(cx) else {
+            self.review_step_file(direction, cx);
+            return;
+        };
+        if !plan.is_tree() {
+            self.review_step_file(direction, cx);
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let current_row = self.review_current_row(&listed, &plan, review);
+        let row_len = plan.row_len();
+        let next_row = if direction < 0 {
+            current_row.and_then(|row| row.checked_sub(1))
+        } else {
+            current_row.map_or(Some(0), |row| (row + 1 < row_len).then_some(row + 1))
+        };
+        let Some(next_row) = next_row else {
+            return;
+        };
+        match plan.row_at(crate::view::rows::RowIx(next_row)) {
+            Some(crate::view::rows::FileListRow::Directory { key, .. }) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.sidebar_dir_cursor = Some(key);
+                }
+                cx.notify();
+            }
+            Some(crate::view::rows::FileListRow::File { ordinal, .. }) => {
+                if let Some(&ix) = listed.get(ordinal.0) {
+                    self.review_open_file(ix, cx);
+                }
+            }
+            None => {}
+        }
+    }
+
     /// Shows file `ix` of the review, fetching the pull request's commits the
     /// first time. Focus stays where it is.
     pub(super) fn review_open_file(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
@@ -1175,7 +1413,9 @@ impl GitCometView {
         review.file_ix = ix;
         review.pending_jump = None;
         review.needs_cursor = true;
+        review.sidebar_dir_cursor = None;
         let (repo_id, path) = (review.repo_id, review.files[ix].clone());
+        self.review_reveal_file(ix, cx);
         self.review_follow_head(cx);
         if self
             .pull_requests
@@ -1405,14 +1645,33 @@ impl GitCometView {
         .detach();
     }
 
+    /// `]`/`[`, and `j`/`k` in the Sidebar's flat layout: the next/previous
+    /// listed file. In tree layout it follows the tree's display order
+    /// (`review_tree_order`) rather than raw file-index order, so it moves
+    /// the way the rows actually read top to bottom, skipping folder rows
+    /// (there is no ordinal for one) automatically.
     fn review_step_file(&mut self, direction: i8, cx: &mut gpui::Context<Self>) {
-        let Some(review) = self.review.as_ref() else {
+        let Some(current) = self.review.as_ref().map(|review| review.file_ix) else {
             return;
         };
-        let next = if direction < 0 {
-            (0..review.file_ix).rev().find(|ix| review.file_listed(*ix))
-        } else {
-            (review.file_ix + 1..review.files.len()).find(|ix| review.file_listed(*ix))
+        let next = match self.review_tree_order(cx) {
+            Some(order) => {
+                let scan: Vec<usize> = match order.iter().position(|&ix| ix == current) {
+                    Some(pos) if direction < 0 => order[..pos].iter().rev().copied().collect(),
+                    Some(pos) => order[pos + 1..].to_vec(),
+                    None if direction < 0 => order.iter().rev().copied().collect(),
+                    None => order,
+                };
+                scan.into_iter()
+                    .find(|ix| self.review.as_ref().is_some_and(|review| review.file_listed(*ix)))
+            }
+            None => self.review.as_ref().and_then(|review| {
+                if direction < 0 {
+                    (0..current).rev().find(|ix| review.file_listed(*ix))
+                } else {
+                    (current + 1..review.files.len()).find(|ix| review.file_listed(*ix))
+                }
+            }),
         };
         if let Some(next) = next {
             self.review_open_file(next, cx);
@@ -1532,17 +1791,29 @@ impl GitCometView {
             },
         );
         self.review_push_viewed(cx);
+        // Worked out before the mutable borrow below: in tree layout, "next"
+        // follows the tree's display order rather than raw file index.
+        let tree_order = self.review_tree_order(cx);
         let Some(review) = self.review.as_mut() else {
             return;
         };
         let next = now_viewed
             .then(|| {
                 let from = review.file_ix;
-                (1..review.files.len())
-                    .map(|step| (from + step) % review.files.len())
-                    .find(|ix| {
-                        review.file_listed(*ix) && !review.draft.viewed.contains(&review.files[*ix])
-                    })
+                let is_next_unviewed = |review: &ReviewMode, ix: &usize| {
+                    review.file_listed(*ix) && !review.draft.viewed.contains(&review.files[*ix])
+                };
+                match &tree_order {
+                    Some(order) if !order.is_empty() => {
+                        let pos = order.iter().position(|&ix| ix == from).unwrap_or(0);
+                        (1..order.len())
+                            .map(|step| order[(pos + step) % order.len()])
+                            .find(|ix| is_next_unviewed(review, ix))
+                    }
+                    _ => (1..review.files.len())
+                        .map(|step| (from + step) % review.files.len())
+                        .find(|ix| is_next_unviewed(review, ix)),
+                }
             })
             .flatten();
         self.save_review(cx);
@@ -1921,6 +2192,7 @@ impl GitCometView {
             generated: Default::default(),
             show_generated: false,
             generated_placeholder_dismissed: Default::default(),
+            sidebar_dir_cursor: None,
         });
         self.main_pane.update(cx, |pane, _| pane.review_active = true);
         self.notify_pull_request_panes(cx);
@@ -3212,6 +3484,17 @@ impl GitCometView {
                 self.sidebar_pane
                     .update(cx, |pane, cx| pane.reset_review_query(cx))
             }
+            (Some(FocusPanel::Sidebar), "`", false) => {
+                if let Some(repo_id) = self.review.as_ref().map(|review| review.repo_id) {
+                    self.details_pane.update(cx, |pane, cx| {
+                        pane.toggle_file_list_layout(
+                            repo_id,
+                            crate::view::rows::FileListId::Review,
+                            cx,
+                        )
+                    });
+                }
+            }
             (_, "]", false) => self.review_step_file(1, cx),
             (_, "[", false) => self.review_step_file(-1, cx),
             // After the jump the range is gone; collapsing it back onto the
@@ -3266,9 +3549,12 @@ impl GitCometView {
             }
             (_, "space", false) => {}
             (Some(FocusPanel::Sidebar), _, false) if direction != 0 => {
-                self.review_step_file(direction, cx)
+                self.review_step_sidebar(direction, cx)
             }
             (Some(FocusPanel::Sidebar), "enter", false) => {
+                if self.review_toggle_cursor_dir(cx) {
+                    return Some(true);
+                }
                 let dismissed_placeholder = self
                     .active_review()
                     .is_some_and(ReviewMode::generated_placeholder_active);
@@ -3834,6 +4120,7 @@ mod tests {
             generated: Default::default(),
             show_generated: false,
             generated_placeholder_dismissed: Default::default(),
+            sidebar_dir_cursor: None,
         };
         review.draft.head_oid = "h1".into();
         review

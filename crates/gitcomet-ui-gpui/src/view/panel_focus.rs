@@ -481,7 +481,8 @@ impl GitCometView {
                     ("G", "show generated"),
                     ("L", "changed since"),
                     ("C", "commits"),
-                    ("enter", "diff"),
+                    ("enter", "diff/folder"),
+                    ("`", "tree/flat"),
                     ("S", "submit"),
                     ("q", "leave"),
                 ],
@@ -616,7 +617,10 @@ impl GitCometView {
         if self.active_review().is_some() {
             return match panel {
                 FocusPanel::Sidebar => &[
-                    ("j / k", "Next / previous file"),
+                    (
+                        "j / k",
+                        "Next / previous row; in tree layout, folder rows included",
+                    ),
                     (
                         "space",
                         "Mark viewed (on GitHub too), then the next unviewed file",
@@ -639,7 +643,11 @@ impl GitCometView {
                         "Pick all changes, since last review, or a commit range",
                     ),
                     ("R", "Retry the files that failed to list"),
-                    ("enter", "Go to the diff"),
+                    (
+                        "enter",
+                        "Go to the diff; on a folder row (tree layout), toggle it open / closed",
+                    ),
+                    ("`", "Tree or flat file list"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
                 ],

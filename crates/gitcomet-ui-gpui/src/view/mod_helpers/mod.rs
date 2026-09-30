@@ -1185,6 +1185,9 @@ pub struct GitCometView {
     /// The pull request being reviewed; see `review.rs`.
     pub(super) review: Option<super::review::ReviewMode>,
     pub(super) commit_scope_picker: Option<super::review::CommitScopePicker>,
+    /// The review Files list's flat/tree plan, keyed on the review and what
+    /// it currently lists; see `review_file_list_plan`.
+    pub(super) review_plan_cache: crate::view::rows::FileListPlanCache,
     /// A first Shift+D / Shift+M on this branch, waiting for the second.
     pub(super) armed_branch_key: Option<(String, super::branch_sidebar::BranchMenuTarget)>,
     pub(super) _focus_lost_subscription: gpui::Subscription,

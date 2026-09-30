@@ -1632,6 +1632,7 @@ impl GitCometView {
             armed_branch_key: None,
             review: None,
             commit_scope_picker: None,
+            review_plan_cache: Default::default(),
             _focus_lost_subscription: focus_lost_subscription,
             sidebar_width_design: initial_sidebar_width_design,
             details_width_design: initial_details_width_design,
