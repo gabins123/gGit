@@ -79,6 +79,9 @@ impl MarkdownRemoteImageAccess {
 pub(in crate::view) struct MarkdownPreviewSharedHighlightsText {
     pub(in crate::view) text: SharedString,
     pub(in crate::view) highlights: Arc<[(Range<usize>, gpui::HighlightStyle)]>,
+    /// Painted ranges set in another family (inline code in the editor font)
+    /// while the rest of the text keeps the body font.
+    font_overrides: Vec<(Range<usize>, SharedString)>,
     pub(in crate::view) inner: Option<gpui::StyledText>,
 }
 
@@ -90,8 +93,29 @@ impl MarkdownPreviewSharedHighlightsText {
         Self {
             text,
             highlights,
+            font_overrides: Vec::new(),
             inner: None,
         }
+    }
+
+    /// Set `ranges` of the text in `family`; adjacent ranges join, since gpui
+    /// wants the overrides disjoint.
+    pub(in crate::view) fn font_family_ranges(
+        mut self,
+        ranges: impl IntoIterator<Item = Range<usize>>,
+        family: SharedString,
+    ) -> Self {
+        for range in ranges {
+            let range = range.start.min(self.text.len())..range.end.min(self.text.len());
+            if range.is_empty() {
+                continue;
+            }
+            match self.font_overrides.last_mut() {
+                Some((last, _)) if last.end == range.start => last.end = range.end,
+                _ => self.font_overrides.push((range, family.clone())),
+            }
+        }
+        self
     }
 }
 
@@ -115,7 +139,8 @@ impl gpui::Element for MarkdownPreviewSharedHighlightsText {
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
         let mut inner = gpui::StyledText::new(self.text.clone())
-            .with_default_highlights(&window.text_style(), self.highlights.iter().cloned());
+            .with_default_highlights(&window.text_style(), self.highlights.iter().cloned())
+            .with_font_family_overrides(self.font_overrides.iter().cloned());
         let layout = inner.request_layout(id, inspector_id, window, cx);
         self.inner = Some(inner);
         layout
@@ -643,6 +668,19 @@ pub(in crate::view) fn markdown_preview_highlighted_text(
     highlights: Arc<[(Range<usize>, gpui::HighlightStyle)]>,
 ) -> impl IntoElement {
     MarkdownPreviewSharedHighlightsText::new(text, highlights)
+}
+
+/// [`markdown_preview_highlighted_text`] with `code_ranges` (painted-text
+/// coordinates) set in `family`: inline code in the editor font inside
+/// proportional prose, where the flowing renderer has no view to do it.
+pub(in crate::view) fn markdown_preview_highlighted_text_with_code_font(
+    text: SharedString,
+    highlights: Arc<[(Range<usize>, gpui::HighlightStyle)]>,
+    code_ranges: impl IntoIterator<Item = Range<usize>>,
+    family: SharedString,
+) -> impl IntoElement {
+    MarkdownPreviewSharedHighlightsText::new(text, highlights)
+        .font_family_ranges(code_ranges, family)
 }
 
 /// A task-list checkbox, shared with the flowing renderer; `box_size` is the
@@ -1415,5 +1453,27 @@ pub(in crate::view) fn markdown_preview_row_background(
                 _ => None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod code_font_tests {
+    use super::*;
+
+    #[test]
+    fn code_ranges_are_the_only_runs_set_in_the_editor_font() {
+        let text =
+            MarkdownPreviewSharedHighlightsText::new("run cargo test now".into(), Arc::from([]))
+                .font_family_ranges([4..9, 9..14, 50..60, 3..3], "Mono".into());
+        // Adjacent ranges join; an out-of-range or empty one is dropped, so the
+        // prose around inline code keeps the body font.
+        assert_eq!(text.font_overrides, [(4..14, SharedString::from("Mono"))]);
+    }
+
+    #[test]
+    fn text_without_code_ranges_has_no_font_override() {
+        let text = MarkdownPreviewSharedHighlightsText::new("plain".into(), Arc::from([]))
+            .font_family_ranges(std::iter::empty(), "Mono".into());
+        assert!(text.font_overrides.is_empty());
     }
 }

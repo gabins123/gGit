@@ -152,16 +152,20 @@ pub(super) fn bubble_count(count: usize, theme: AppTheme, size: Pixels) -> AnyEl
 /// "N line comments, on a.rs and b.rs" — a review entry's footer, once its
 /// inline comments are matched to their review threads by REST review id
 /// (`ConversationEntry::review_id` against `ReviewThread::pull_request_review_id`).
+/// The text is one line that gives way with an ellipsis; the `]` Comments hint
+/// after it never does.
 pub(super) fn review_line_comments_footer(
     count: usize,
     paths: &[String],
     theme: AppTheme,
-    size: Pixels,
+    ui_scale: crate::ui_scale::UiScale,
 ) -> AnyElement {
+    let size = ui_scale.px(12.0);
     div()
         .flex()
         .items_center()
         .gap_2()
+        .min_w(px(0.0))
         .text_size(theme.ui_text(12.0))
         .text_color(theme.colors.foreground.secondary)
         .child(svg_icon(
@@ -169,22 +173,58 @@ pub(super) fn review_line_comments_footer(
             theme.colors.foreground.secondary,
             size,
         ))
-        .child(format!(
+        .child(div().flex_1().min_w(px(0.0)).truncate().child(format!(
             "{count} line comment{}, on {}",
             if count == 1 { "" } else { "s" },
-            join_file_list(paths)
-        ))
+            footer_file_list(paths)
+        )))
+        // `]` opens the Comments tab, where these threads live.
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .ml_1()
+                .child(crate::view::components::shortcut_keys("]", theme, ui_scale))
+                .child("Comments"),
+        )
         .into_any_element()
 }
 
-/// "a.rs", "a.rs and b.rs", or "a.rs, b.rs and c.rs" — the plain-English join
-/// GitHub itself uses for a short file list.
-fn join_file_list(paths: &[String]) -> String {
-    match paths {
+/// The file names (not paths) of a review's line comments: "a.rs",
+/// "a.rs and b.rs", or "a.rs, b.rs and N more" past two.
+fn footer_file_list(paths: &[String]) -> String {
+    let names: Vec<&str> = paths
+        .iter()
+        .map(|path| path.rsplit('/').next().unwrap_or(path))
+        .collect();
+    match names.as_slice() {
         [] => String::new(),
-        [only] => only.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [only] => (*only).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        [first, second, rest @ ..] => format!("{first}, {second} and {} more", rest.len()),
     }
+}
+
+/// "Description truncated · `o` opens it on GitHub": the closing line of a card
+/// whose text was cut at its cap. `what` names the cut text.
+pub(super) fn truncated_note(
+    what: &str,
+    theme: AppTheme,
+    ui_scale: crate::ui_scale::UiScale,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .pt_2()
+        .text_size(theme.ui_text(11.5))
+        .text_color(theme.colors.foreground.secondary)
+        .child(format!("{what} truncated ·"))
+        .child(crate::view::components::shortcut_keys("o", theme, ui_scale))
+        .child("opens it on GitHub")
+        .into_any_element()
 }
 
 /// Maps a reviewer's status to the same icons `review` draws, when one
@@ -389,19 +429,24 @@ pub(super) fn title(title: &str) -> (Option<&'static str>, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_file_list, title};
+    use super::{footer_file_list, title};
 
     #[test]
-    fn join_file_list_reads_as_plain_english() {
-        assert_eq!(join_file_list(&[]), "");
-        assert_eq!(join_file_list(&["a.rs".to_string()]), "a.rs");
+    fn footer_lists_file_names_not_paths_and_at_most_two() {
+        let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(footer_file_list(&[]), "");
+        assert_eq!(footer_file_list(&paths(&["a.rs"])), "a.rs");
         assert_eq!(
-            join_file_list(&["a.rs".to_string(), "b.rs".to_string()]),
-            "a.rs and b.rs"
+            footer_file_list(&paths(&["Assets/Game/a.cs", "Assets/Retention/b.cs"])),
+            "a.cs and b.cs"
         );
         assert_eq!(
-            join_file_list(&["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()]),
-            "a.rs, b.rs and c.rs"
+            footer_file_list(&paths(&["x/a.rs", "y/b.rs", "z/c.rs"])),
+            "a.rs, b.rs and 1 more"
+        );
+        assert_eq!(
+            footer_file_list(&paths(&["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"])),
+            "a.rs, b.rs and 3 more"
         );
     }
 

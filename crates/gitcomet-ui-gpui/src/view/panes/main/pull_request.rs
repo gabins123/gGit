@@ -9,7 +9,8 @@ use crate::view::markdown_preview::{
     MarkdownInlineSpan, MarkdownInlineStyle, MarkdownPreviewDocument, MarkdownPreviewRowKind,
 };
 use crate::view::pull_requests::{
-    MAX_PR_VISIBLE_THREADS, PrContentTab, PrLoad, visible_pr_thread_indexes,
+    MAX_PR_VISIBLE_THREADS, PrContentTab, PrLoad, visible_pr_entry_indexes,
+    visible_pr_thread_indexes,
 };
 use gpui::Div;
 use rustc_hash::FxHashMap;
@@ -17,6 +18,11 @@ use rustc_hash::FxHashMap;
 /// Readable-column cap for the Conversation and Comments bodies, matching the
 /// design canvas.
 const PR_CONTENT_MAX_WIDTH_PX: f32 = 780.0;
+/// The canvas's padding around the Conversation (18px) and Comments (16px)
+/// columns, which also keeps the first card off the header.
+const PR_CONTENT_PAD_X_PX: f32 = 28.0;
+const PR_CONVERSATION_PAD_Y_PX: f32 = 18.0;
+const PR_COMMENTS_PAD_Y_PX: f32 = 16.0;
 /// Avatar size for a top-level conversation entry / thread comment.
 const MAIN_AVATAR_DIAMETER_PX: f32 = 28.0;
 const MAIN_AVATAR_FONT_PX: f32 = 10.0;
@@ -78,7 +84,7 @@ impl PrMarkdownCache {
 /// after the last entry.
 fn pr_pushed_commit_groups<'a>(
     commits: &'a [PullRequestCommit],
-    entries: &[ConversationEntry],
+    entries: &[&ConversationEntry],
 ) -> Vec<Vec<&'a PullRequestCommit>> {
     let mut sorted: Vec<&PullRequestCommit> = commits.iter().collect();
     sorted.sort_by(|a, b| a.committed_at.cmp(&b.committed_at));
@@ -210,6 +216,45 @@ fn pr_card(theme: AppTheme, current: bool) -> Div {
     }
 }
 
+/// Which child of the `pr_content_scroll` container holds the selected entry
+/// or thread (child 0 when nothing is selected). Conversation: the opening-post
+/// card is child 0, then each visible entry, each preceded by a "pushed" card
+/// when commits landed before it. Comments: the filter-chips row is child 0,
+/// then a header per file and a row or card per thread.
+pub(in crate::view) fn pr_content_child_index(
+    tab: PrContentTab,
+    detail: &PullRequestDetail,
+    threads: &PrLoad<Arc<Vec<ReviewThread>>>,
+    selected_entry: Option<usize>,
+    selected_thread: Option<usize>,
+    show_hidden: bool,
+) -> usize {
+    match tab {
+        PrContentTab::Conversation => {
+            let visible = visible_pr_entry_indexes(
+                &detail.conversation,
+                threads.ready().map(|threads| threads.as_slice()),
+            );
+            let entries: Vec<&ConversationEntry> =
+                visible.iter().map(|&ix| &detail.conversation[ix]).collect();
+            selected_entry
+                .and_then(|ix| visible.iter().position(|item| *item == ix))
+                .map_or(0, |position| {
+                    position
+                        + 1
+                        + pr_pushed_commit_groups(&detail.commits, &entries)
+                            .iter()
+                            .take(position + 1)
+                            .filter(|group| !group.is_empty())
+                            .count()
+                })
+        }
+        PrContentTab::Comments => selected_thread
+            .and_then(|ix| pr_thread_scroll_index(threads, show_hidden, ix))
+            .map_or(0, |index| index + 1),
+    }
+}
+
 impl MainPaneView {
     pub(super) fn pull_request_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         let theme = self.theme;
@@ -253,23 +298,14 @@ impl MainPaneView {
         };
         let scroll_key = (detail.number, tab, selection);
         if self.pull_request_scroll_key != Some(scroll_key) {
-            let target = match tab {
-                // Index 0 is the opening-post card; entries follow from there,
-                // each preceded by a "pushed" card when commits landed first.
-                PrContentTab::Conversation => selected_entry.map_or(0, |ix| {
-                    ix + 1
-                        + pr_pushed_commit_groups(&detail.commits, &detail.conversation)
-                            .iter()
-                            .take(ix + 1)
-                            .filter(|group| !group.is_empty())
-                            .count()
-                }),
-                // Index 0 is the filter-chips row; threads/headers follow.
-                PrContentTab::Comments => selected_thread
-                    .and_then(|ix| pr_thread_scroll_index(&threads, show_hidden, ix))
-                    .map(|index| index + 1)
-                    .unwrap_or(0),
-            };
+            let target = pr_content_child_index(
+                tab,
+                &detail,
+                &threads,
+                selected_entry,
+                selected_thread,
+                show_hidden,
+            );
             self.pull_request_scroll.scroll_to_item(target);
             self.pull_request_scroll_key = Some(scroll_key);
         }
@@ -493,17 +529,23 @@ impl MainPaneView {
             .min_h(px(0.0))
             .max_w(px(PR_CONTENT_MAX_WIDTH_PX))
             .gap_3()
-            .px_3()
-            .py_3()
+            .px(ui_scale.px(PR_CONTENT_PAD_X_PX))
+            .py(ui_scale.px(PR_CONVERSATION_PAD_Y_PX))
             .overflow_y_scroll()
             .track_scroll(&self.pull_request_scroll);
 
         body = body.child(self.pr_description_card(detail, cx));
 
-        let push_groups = pr_pushed_commit_groups(&detail.commits, &detail.conversation);
-        for (ix, entry) in detail.conversation.iter().enumerate() {
-            if !push_groups[ix].is_empty() {
-                body = body.child(pr_pushed_event(&push_groups[ix], theme, ui_scale));
+        let visible = visible_pr_entry_indexes(
+            &detail.conversation,
+            threads.ready().map(|threads| threads.as_slice()),
+        );
+        let entries: Vec<&ConversationEntry> =
+            visible.iter().map(|&ix| &detail.conversation[ix]).collect();
+        let push_groups = pr_pushed_commit_groups(&detail.commits, &entries);
+        for (position, (&ix, entry)) in visible.iter().zip(&entries).enumerate() {
+            if !push_groups[position].is_empty() {
+                body = body.child(pr_pushed_event(&push_groups[position], theme, ui_scale));
             }
             body = body.child(self.pr_conversation_entry(
                 detail.number,
@@ -620,7 +662,16 @@ impl MainPaneView {
                                     .child("Description"),
                             ),
                     )
-                    .child(div().px_4().py_3().child(body_element)),
+                    .child(div().px_4().py_3().child(body_element).when(
+                        detail.body_truncated,
+                        |body| {
+                            body.child(crate::view::pr_symbols::truncated_note(
+                                "Description",
+                                theme,
+                                ui_scale,
+                            ))
+                        },
+                    )),
             )
             .into_any_element()
     }
@@ -714,12 +765,20 @@ impl MainPaneView {
             .min_w(px(0.0))
             .child(header);
         if !entry.body.is_empty() {
-            card = card.child(div().px_4().py_3().child(self.pr_markdown(
+            let markdown = self.pr_markdown(
                 number,
                 PrMarkdownKey::Entry(entry.id.clone()),
                 &entry.body,
                 cx,
-            )));
+            );
+            card = card.child(div().px_4().py_3().child(markdown).when(
+                entry.body_truncated,
+                |body| {
+                    body.child(crate::view::pr_symbols::truncated_note(
+                        "Comment", theme, ui_scale,
+                    ))
+                },
+            ));
         }
         // The review's own inline comments, matched by the REST review id
         // `view` filled in on `review_id` and each thread's own
@@ -738,12 +797,9 @@ impl MainPaneView {
                     matching.iter().map(|thread| thread.path.clone()).collect();
                 paths.sort();
                 paths.dedup();
-                card = card.child(div().px_4().pb_3().child(
+                card = card.child(div().px_4().pb_3().min_w(px(0.0)).child(
                     crate::view::pr_symbols::review_line_comments_footer(
-                        count,
-                        &paths,
-                        theme,
-                        ui_scale.px(12.0),
+                        count, &paths, theme, ui_scale,
                     ),
                 ));
             }
@@ -824,8 +880,8 @@ impl MainPaneView {
             .min_h(px(0.0))
             .max_w(px(PR_CONTENT_MAX_WIDTH_PX))
             .gap_2()
-            .px_3()
-            .py_3()
+            .px(ui_scale.px(PR_CONTENT_PAD_X_PX))
+            .py(ui_scale.px(PR_COMMENTS_PAD_Y_PX))
             .overflow_y_scroll()
             .track_scroll(&self.pull_request_scroll);
 
@@ -989,7 +1045,8 @@ impl MainPaneView {
             )
         });
         let excerpt = first.map_or(String::new(), |comment| comment.body.clone());
-        let reply_count = thread.comments.len().saturating_sub(1);
+        // Every comment, root included; a thread nobody answered shows none.
+        let comment_count = thread.comments.len();
 
         let root = self.root_view.clone();
         div()
@@ -1019,11 +1076,13 @@ impl MainPaneView {
                     .text_size(theme.ui_text(12.5))
                     .child(excerpt),
             )
-            .child(crate::view::pr_symbols::bubble_count(
-                reply_count,
-                theme,
-                ui_scale.px(12.0),
-            ))
+            .when(comment_count > 1, |row| {
+                row.child(crate::view::pr_symbols::bubble_count(
+                    comment_count,
+                    theme,
+                    ui_scale.px(12.0),
+                ))
+            })
             .child(crate::view::pr_symbols::status_chip(
                 status_label,
                 status_set,
@@ -1064,6 +1123,7 @@ impl MainPaneView {
         let ui_scale = crate::ui_scale::UiScale::current(cx);
         let now = std::time::SystemTime::now();
         let gutter = ui_scale.px(40.0);
+        let sign_width = ui_scale.px(14.0);
         let diff_context = diff_hunk_tail(&thread.diff_hunk, 3);
         let diff_strip = (!diff_context.is_empty()).then(|| {
             div()
@@ -1074,6 +1134,11 @@ impl MainPaneView {
                 .border_b_1()
                 .border_color(theme.colors.stroke.subtle)
                 .children(diff_context.into_iter().map(|line| {
+                    let sign = match line.kind {
+                        DiffHunkLineKind::Added => "+",
+                        DiffHunkLineKind::Removed => "-",
+                        DiffHunkLineKind::Context => " ",
+                    };
                     let (foreground, background) = match line.kind {
                         DiffHunkLineKind::Added => (
                             theme.colors.diff.added.foreground,
@@ -1100,6 +1165,13 @@ impl MainPaneView {
                                     line.line_number
                                         .map_or(String::new(), |number| number.to_string()),
                                 ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(sign_width)
+                                .text_color(foreground)
+                                .child(sign),
                         )
                         .child(
                             div()
@@ -1168,7 +1240,12 @@ impl MainPaneView {
                     .min_w(px(0.0))
                     .gap_1()
                     .child(meta)
-                    .child(self.pr_markdown(number, key, &comment.body, cx)),
+                    .child(self.pr_markdown(number, key, &comment.body, cx))
+                    .when(comment.body_truncated, |column| {
+                        column.child(crate::view::pr_symbols::truncated_note(
+                            "Comment", theme, ui_scale,
+                        ))
+                    }),
             );
             body_col = body_col.child(row);
         }
@@ -1268,19 +1345,39 @@ impl MainPaneView {
     }
 }
 
-/// "<login> pushed N commits · time", or "Pushed N commits · time" when the
-/// group's first (oldest) commit has no author GitHub could report.
+/// "<author> pushed N commits · time" when every commit in the push has the
+/// same author; "Pushed N commits · time" when it has none or several, since
+/// one name would then misattribute the push.
 fn pr_pushed_headline(commits: &[&PullRequestCommit], when: &str) -> String {
     let count = commits.len();
     let plural = if count == 1 { "" } else { "s" };
-    match commits
-        .first()
-        .and_then(|commit| commit.author.as_deref())
-        .filter(|author| !author.is_empty())
-    {
+    let author = commits.first().and_then(|first| {
+        let first = first
+            .author
+            .as_deref()
+            .filter(|author| !author.is_empty())?;
+        commits
+            .iter()
+            .all(|commit| commit.author.as_deref() == Some(first))
+            .then_some(first)
+    });
+    match author {
         Some(author) => format!("{author} pushed {count} commit{plural} · {when}"),
         None => format!("Pushed {count} commit{plural} · {when}"),
     }
+}
+
+/// Most commits a "Pushed N commits" event lists; the rest are in Details.
+const MAX_PUSH_COMMITS_LISTED: usize = 5;
+
+/// The commits of a push (oldest first) to list, which are its newest `limit`,
+/// and how many older ones are left out.
+fn pr_push_listing<'a, 'b>(
+    commits: &'b [&'a PullRequestCommit],
+    limit: usize,
+) -> (&'b [&'a PullRequestCommit], usize) {
+    let hidden = commits.len().saturating_sub(limit);
+    (&commits[hidden..], hidden)
 }
 
 /// A "Pushed N commits" timeline event: a commit-dot marker, when it
@@ -1298,6 +1395,7 @@ fn pr_pushed_event(
         .map(|commit| pr_relative_time(&commit.committed_at, now))
         .unwrap_or_default();
     let headline = pr_pushed_headline(commits, &when);
+    let (listed, hidden) = pr_push_listing(commits, MAX_PUSH_COMMITS_LISTED);
     let dot = ui_scale.px(6.0);
     div()
         .flex()
@@ -1327,7 +1425,7 @@ fn pr_pushed_event(
                 .flex_col()
                 .gap_1()
                 .pl(px(28.0))
-                .children(commits.iter().map(|commit| {
+                .children(listed.iter().map(|commit| {
                     let short = commit.oid.get(..7).unwrap_or(&commit.oid);
                     div()
                         .flex()
@@ -1349,7 +1447,15 @@ fn pr_pushed_event(
                                 .text_color(theme.colors.foreground.primary)
                                 .child(commit.headline.clone()),
                         )
-                })),
+                }))
+                .when(hidden > 0, |list| {
+                    list.child(
+                        div()
+                            .text_size(theme.ui_text(12.0))
+                            .text_color(theme.colors.foreground.secondary)
+                            .child(format!("and {hidden} more · see Commits in Details")),
+                    )
+                }),
         )
         .into_any_element()
 }
@@ -1457,8 +1563,10 @@ mod tests {
             verb: "commented",
             at: at.into(),
             body: String::new(),
+            body_truncated: false,
             review_id: None,
         });
+        let entries: Vec<&ConversationEntry> = entries.iter().collect();
         let groups = pr_pushed_commit_groups(&commits, &entries);
         let group_oids: Vec<Vec<&str>> = groups
             .iter()
@@ -1535,26 +1643,67 @@ mod tests {
     }
 
     #[test]
-    fn pushed_headline_names_the_first_commits_author_and_falls_back_without_one() {
-        let named = PullRequestCommit {
-            oid: "a".repeat(40),
-            headline: "First".into(),
-            committed_at: "2026-01-01T00:00:00Z".into(),
-            author: Some("alexk".into()),
-        };
-        let anonymous = PullRequestCommit {
-            oid: "b".repeat(40),
-            headline: "Second".into(),
-            committed_at: "2026-01-01T00:00:01Z".into(),
-            author: None,
-        };
+    fn a_push_lists_its_newest_five_commits_and_counts_the_rest() {
+        let commits: Vec<PullRequestCommit> = (0..8)
+            .map(|n| PullRequestCommit {
+                oid: format!("{n:040}"),
+                headline: format!("commit {n}"),
+                committed_at: format!("2026-01-01T00:00:{n:02}Z"),
+                author: None,
+            })
+            .collect();
+        let refs: Vec<&PullRequestCommit> = commits.iter().collect();
+        let (listed, hidden) = pr_push_listing(&refs, MAX_PUSH_COMMITS_LISTED);
+        assert_eq!(hidden, 3);
+        // The newest five, still oldest first.
         assert_eq!(
-            pr_pushed_headline(&[&named, &anonymous], "5 hours ago"),
+            listed
+                .iter()
+                .map(|commit| commit.headline.as_str())
+                .collect::<Vec<_>>(),
+            ["commit 3", "commit 4", "commit 5", "commit 6", "commit 7"]
+        );
+        // A push at or under the limit lists everything.
+        let (listed, hidden) = pr_push_listing(&refs[..5], MAX_PUSH_COMMITS_LISTED);
+        assert_eq!((listed.len(), hidden), (5, 0));
+        let (listed, hidden) = pr_push_listing(&refs[..1], MAX_PUSH_COMMITS_LISTED);
+        assert_eq!((listed.len(), hidden), (1, 0));
+    }
+
+    #[test]
+    fn pushed_headline_names_a_single_author_and_nobody_otherwise() {
+        let commit = |author: Option<&str>| PullRequestCommit {
+            oid: "a".repeat(40),
+            headline: "h".into(),
+            committed_at: "2026-01-01T00:00:00Z".into(),
+            author: author.map(str::to_owned),
+        };
+        let (alexk, alexk_again, other, anonymous) = (
+            commit(Some("alexk")),
+            commit(Some("alexk")),
+            commit(Some("sam")),
+            commit(None),
+        );
+        assert_eq!(
+            pr_pushed_headline(&[&alexk, &alexk_again], "5 hours ago"),
             "alexk pushed 2 commits · 5 hours ago"
         );
-        // The *first* (oldest) commit's author names the push, not the last's.
         assert_eq!(
-            pr_pushed_headline(&[&anonymous, &named], "5 hours ago"),
+            pr_pushed_headline(&[&alexk], "just now"),
+            "alexk pushed 1 commit · just now"
+        );
+        // More than one distinct author: no name, in either order.
+        assert_eq!(
+            pr_pushed_headline(&[&alexk, &other], "5 hours ago"),
+            "Pushed 2 commits · 5 hours ago"
+        );
+        assert_eq!(
+            pr_pushed_headline(&[&other, &alexk], "5 hours ago"),
+            "Pushed 2 commits · 5 hours ago"
+        );
+        // A commit without an author makes the attribution unsure too.
+        assert_eq!(
+            pr_pushed_headline(&[&alexk, &anonymous], "5 hours ago"),
             "Pushed 2 commits · 5 hours ago"
         );
         assert_eq!(

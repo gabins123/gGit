@@ -781,6 +781,7 @@ fn review_mode_walks_files_keeps_comments_and_leaves_with_q(cx: &mut gpui::TestA
                     number: 7,
                     title: "Keyboard nav".into(),
                     body: String::new(),
+                    body_truncated: false,
                     url: String::new(),
                     author: "someone".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
@@ -943,6 +944,7 @@ fn seed_three_file_pull_request(cx: &mut gpui::VisualTestContext, view: &View) {
                     number: 7,
                     title: "Keyboard nav".into(),
                     body: String::new(),
+                    body_truncated: false,
                     url: String::new(),
                     author: "someone".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
@@ -1540,6 +1542,7 @@ fn viewed_marks_follow_github_and_outdated_threads_take_replies(cx: &mut gpui::T
         comments: vec![ThreadComment {
             author: "octo".into(),
             body: "Old point\nmore".into(),
+            body_truncated: false,
             at: String::new(),
         }],
     };
@@ -2130,6 +2133,7 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
                     verb: "commented",
                     at: "2025-01-01T00:00:00Z".into(),
                     body: "First".into(),
+                    body_truncated: false,
                     review_id: None,
                 },
                 ConversationEntry {
@@ -2138,6 +2142,7 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
                     verb: "approved",
                     at: "2025-01-02T00:00:00Z".into(),
                     body: "Second".into(),
+                    body_truncated: false,
                     review_id: None,
                 },
             ];
@@ -2155,6 +2160,7 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
                 comments: vec![ThreadComment {
                     author: "alice".into(),
                     body: "**Review this**".into(),
+                    body_truncated: false,
                     at: String::new(),
                 }],
             };
@@ -2258,6 +2264,155 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
         Some(1)
     );
     assert_eq!(review_target(cx), Some(target));
+}
+
+fn pr_scroll_handle(cx: &mut gpui::VisualTestContext, view: &View) -> gpui::ScrollHandle {
+    cx.update(|_window, app| {
+        view.read(app)
+            .main_pane
+            .read(app)
+            .pull_request_scroll
+            .clone()
+    })
+}
+
+fn pr_content_selection(
+    cx: &mut gpui::VisualTestContext,
+    view: &View,
+) -> (Option<usize>, Option<usize>) {
+    cx.update(|_window, app| {
+        let prs = view.read(app).active_pull_requests().unwrap();
+        (prs.selected_entry, prs.selected_thread)
+    })
+}
+
+/// A description far taller than the window, and one short comment after it.
+fn seed_long_description(cx: &mut gpui::VisualTestContext, view: &View) {
+    use crate::github::ConversationEntry;
+    seed_three_file_pull_request(cx, view);
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            let mut detail =
+                (**this.active_pull_requests().unwrap().detail.ready().unwrap()).clone();
+            detail.body = (0..400)
+                .map(|n| format!("Paragraph {n} of a very long pull request description."))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            detail.conversation = vec![ConversationEntry {
+                id: "only".into(),
+                author: "alice".into(),
+                verb: "commented",
+                at: "2025-01-01T00:00:00Z".into(),
+                body: "Short".into(),
+                body_truncated: false,
+                review_id: None,
+            }];
+            this.seed_pull_request_detail_for_test(REPO, detail, "c".repeat(40));
+        })
+    });
+    draw_and_drain_test_window(cx);
+}
+
+#[gpui::test]
+fn a_tall_description_scrolls_with_j_k_and_the_page_keys(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_long_description(cx, &view);
+    press(cx, "1 enter");
+    assert_eq!(focused(cx, &view), Some(History));
+    let scroll = pr_scroll_handle(cx, &view);
+    let max = scroll.max_offset().y;
+    assert!(max > gpui::px(0.0), "the fixture must overflow the window");
+    assert_eq!(scroll.offset().y, gpui::px(0.0));
+
+    // Nothing selected, the description taller than the window: `j` scrolls
+    // it instead of jumping to the comment beneath.
+    press(cx, "j");
+    let after_j = scroll.offset().y;
+    assert!(after_j < gpui::px(0.0), "j scrolls the tall description");
+    assert_eq!(pr_content_selection(cx, &view), (None, None));
+    press(cx, "down");
+    assert!(scroll.offset().y < after_j, "the arrow key scrolls too");
+    press(cx, "k");
+    assert_eq!(
+        scroll.offset().y,
+        after_j,
+        "k scrolls back up by the same step"
+    );
+
+    press(cx, "pagedown");
+    let after_page = scroll.offset().y;
+    assert!(after_page < after_j);
+    press(cx, "pageup");
+    assert_eq!(scroll.offset().y, after_j);
+
+    press(cx, "ctrl-d");
+    assert!(scroll.offset().y < after_j, "ctrl-d is a half page down");
+    press(cx, "ctrl-u");
+    assert_eq!(scroll.offset().y, after_j, "ctrl-u is a half page up");
+
+    press(cx, "end");
+    assert_eq!(scroll.offset().y, -max);
+    press(cx, "home");
+    assert_eq!(scroll.offset().y, gpui::px(0.0));
+
+    // Once the description's end is showing, `j` goes on to the entry after it.
+    press(cx, "end");
+    press(cx, "j");
+    assert_eq!(pr_content_selection(cx, &view), (Some(0), None));
+}
+
+#[gpui::test]
+fn comments_open_with_the_first_thread_selected_and_scroll_with_page_keys(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::github::{ReviewSide, ReviewThread, ThreadComment};
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    seed_three_file_pull_request(cx, &view);
+    cx.update(|_window, app| {
+        view.update(app, |this, _| {
+            let thread = |root_id, line| ReviewThread {
+                root_id,
+                path: "a.rs".into(),
+                side: ReviewSide::Right,
+                line: Some(line),
+                original_line: Some(line),
+                is_resolved: false,
+                is_outdated: false,
+                pull_request_review_id: None,
+                diff_hunk: String::new(),
+                comments: vec![ThreadComment {
+                    author: "alice".into(),
+                    body: "Look at this".into(),
+                    body_truncated: false,
+                    at: String::new(),
+                }],
+            };
+            this.seed_pull_request_threads_for_test(
+                REPO,
+                (1..=60).map(|n| thread(n, n as u32)).collect(),
+            );
+        })
+    });
+    draw_and_drain_test_window(cx);
+    press(cx, "1 enter");
+    assert_eq!(pr_content_selection(cx, &view), (None, None));
+    press(cx, "]");
+    // The tab opens with one card expanded, as in the design.
+    assert_eq!(pr_content_selection(cx, &view), (None, Some(0)));
+
+    let scroll = pr_scroll_handle(cx, &view);
+    assert!(scroll.max_offset().y > gpui::px(0.0));
+    press(cx, "pagedown");
+    assert!(scroll.offset().y < gpui::px(0.0));
+    press(cx, "end");
+    assert_eq!(scroll.offset().y, -scroll.max_offset().y);
+    press(cx, "home");
+    assert_eq!(scroll.offset().y, gpui::px(0.0));
+    // A short thread is not taller than the window: `j` moves to the next one.
+    press(cx, "j");
+    assert_eq!(pr_content_selection(cx, &view), (None, Some(1)));
 }
 
 #[gpui::test]

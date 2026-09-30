@@ -185,6 +185,26 @@ impl RepoPullRequests {
             .unwrap_or_default()
     }
 
+    pub(super) fn visible_entry_indexes(&self) -> Vec<usize> {
+        self.detail
+            .ready()
+            .map(|detail| {
+                visible_pr_entry_indexes(
+                    &detail.conversation,
+                    self.threads.ready().map(|threads| threads.as_slice()),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Comments opens with its first visible thread expanded, rather than
+    /// with every thread collapsed.
+    pub(super) fn select_first_thread_if_none(&mut self) {
+        if self.content_tab == PrContentTab::Comments && self.selected_thread.is_none() {
+            self.selected_thread = self.visible_thread_indexes().first().copied();
+        }
+    }
+
     /// The merge dialog's note for a pull request on a plain base-branch
     /// chain (not one of GitHub's own native stacks, where the stack merge
     /// plan is shown instead): where the merge actually lands, or that
@@ -351,6 +371,64 @@ pub(super) fn apply_stack_order(list: &mut Vec<PullRequestSummary>, stacks: &[gi
         }
     }
     *list = ordered;
+}
+
+/// A scroll request for panel 2's Conversation/Comments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrContentScroll {
+    /// `j`/`k`: a short step while the selected item runs past the window,
+    /// otherwise to the next/previous item. Positive is downward.
+    Step(i8),
+    /// `pagedown`/`pageup`/`ctrl-d`/`ctrl-u`.
+    HalfPage(i8),
+    /// `home`.
+    Top,
+    /// `end`.
+    Bottom,
+}
+
+/// How far one scroll request moves the view, given the window's height.
+fn pr_scroll_distance(scroll: PrContentScroll, viewport_height: gpui::Pixels) -> gpui::Pixels {
+    match scroll {
+        PrContentScroll::HalfPage(_) => viewport_height * 0.5,
+        _ => (viewport_height * 0.2).max(gpui::px(40.0)),
+    }
+}
+
+/// Whether an item runs past the window in `direction`: `top` and `bottom` are
+/// its edges relative to the window's (negative `top` = above it, positive
+/// `bottom` = below it). A pixel of slack keeps rounding from trapping `j`.
+fn pr_item_extends_past(top: gpui::Pixels, bottom: gpui::Pixels, direction: i8) -> bool {
+    let slack = gpui::px(1.0);
+    if direction > 0 {
+        bottom > slack
+    } else {
+        top < -slack
+    }
+}
+
+/// Indexes into `conversation` of the entries the timeline shows: all of them,
+/// except a bare review (no summary, no verdict), which is there only for its
+/// line comments and so needs at least one loaded thread carrying its id.
+pub(super) fn visible_pr_entry_indexes(
+    conversation: &[github::ConversationEntry],
+    threads: Option<&[github::ReviewThread]>,
+) -> Vec<usize> {
+    conversation
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            !entry.is_bare_review()
+                || entry.review_id.is_some_and(|id| {
+                    threads.is_some_and(|threads| {
+                        threads
+                            .iter()
+                            .any(|thread| thread.pull_request_review_id == Some(id))
+                    })
+                })
+        })
+        .map(|(ix, _)| ix)
+        .collect()
 }
 
 pub(super) fn visible_pr_thread_indexes(
@@ -945,6 +1023,15 @@ impl GitCometView {
                     Ok(threads) => {
                         entry.selected_thread = None;
                         entry.threads = PrLoad::Ready(Arc::new(threads));
+                        entry.select_first_thread_if_none();
+                        // Which bare reviews show depends on these threads.
+                        let visible = entry.visible_entry_indexes();
+                        if entry
+                            .selected_entry
+                            .is_some_and(|ix| !visible.contains(&ix))
+                        {
+                            entry.selected_entry = None;
+                        }
                     }
                     Err(err) if matches!(&entry.threads, PrLoad::Ready(_)) => {
                         this.push_toast(
@@ -1316,7 +1403,9 @@ impl GitCometView {
         let Some(repo_id) = self.active_repo_id() else {
             return;
         };
-        self.pull_requests.repo_mut(repo_id).content_tab = tab;
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.content_tab = tab;
+        entry.select_first_thread_if_none();
         self.notify_pull_request_panes(cx);
     }
 
@@ -1371,11 +1460,7 @@ impl GitCometView {
             return;
         };
         let entry = self.pull_requests.repo_mut(repo_id);
-        if entry
-            .detail
-            .ready()
-            .is_some_and(|detail| ix < detail.conversation.len())
-        {
+        if entry.visible_entry_indexes().contains(&ix) {
             entry.selected_entry = Some(ix);
             self.notify_pull_request_panes(cx);
         }
@@ -1392,51 +1477,107 @@ impl GitCometView {
         }
     }
 
+    /// Moves the selected entry (or thread) one step and reports whether it
+    /// moved; at either end it stays put and reports `false`.
     pub(super) fn step_pull_request_content(
         &mut self,
         direction: i8,
         cx: &mut gpui::Context<Self>,
-    ) {
+    ) -> bool {
         let Some(repo_id) = self.active_repo_id() else {
-            return;
+            return false;
         };
         let entry = self.pull_requests.repo_mut(repo_id);
-        let (selection, len) = match entry.content_tab {
-            PrContentTab::Conversation => (
-                &mut entry.selected_entry,
-                entry
-                    .detail
-                    .ready()
-                    .map_or(0, |detail| detail.conversation.len()),
-            ),
-            PrContentTab::Comments => {
-                let visible = entry.visible_thread_indexes();
-                let next = match entry
-                    .selected_thread
-                    .and_then(|ix| visible.iter().position(|item| *item == ix))
-                {
-                    Some(ix) if direction < 0 => ix.checked_sub(1),
-                    Some(ix) => Some(ix + 1).filter(|ix| *ix < visible.len()),
-                    None if direction < 0 => visible.len().checked_sub(1),
-                    None => (!visible.is_empty()).then_some(0),
-                };
-                if let Some(next) = next {
-                    entry.selected_thread = Some(visible[next]);
-                    self.notify_pull_request_panes(cx);
-                }
-                return;
-            }
+        let (visible, current) = match entry.content_tab {
+            PrContentTab::Conversation => (entry.visible_entry_indexes(), entry.selected_entry),
+            PrContentTab::Comments => (entry.visible_thread_indexes(), entry.selected_thread),
         };
-        let next = match (*selection, direction < 0) {
+        let position = current.and_then(|ix| visible.iter().position(|item| *item == ix));
+        let next = match (position, direction < 0) {
             (Some(ix), true) => ix.checked_sub(1),
-            (Some(ix), false) => Some(ix + 1).filter(|ix| *ix < len),
-            (None, true) => len.checked_sub(1),
-            (None, false) => (len > 0).then_some(0),
+            (Some(ix), false) => Some(ix + 1).filter(|ix| *ix < visible.len()),
+            (None, true) => visible.len().checked_sub(1),
+            (None, false) => (!visible.is_empty()).then_some(0),
         };
-        if let Some(next) = next {
-            *selection = Some(next);
-            self.notify_pull_request_panes(cx);
+        let Some(next) = next else {
+            return false;
+        };
+        match entry.content_tab {
+            PrContentTab::Conversation => entry.selected_entry = Some(visible[next]),
+            PrContentTab::Comments => entry.selected_thread = Some(visible[next]),
         }
+        self.notify_pull_request_panes(cx);
+        true
+    }
+
+    /// What `j`/`k`, the page keys and `home`/`end` ask of panel 2's scroll.
+    pub(super) fn scroll_pull_request_content(
+        &mut self,
+        scroll: PrContentScroll,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let handle = self.main_pane.read(cx).pull_request_scroll.clone();
+        let viewport = handle.bounds();
+        let (offset, max) = (handle.offset(), handle.max_offset());
+        let scroll_to = |y: gpui::Pixels| {
+            handle.set_offset(gpui::point(offset.x, y.clamp(-max.y, gpui::px(0.0))));
+        };
+        let step = pr_scroll_distance(scroll, viewport.size.height);
+        match scroll {
+            PrContentScroll::Top => scroll_to(gpui::px(0.0)),
+            PrContentScroll::Bottom => scroll_to(-max.y),
+            PrContentScroll::HalfPage(direction) | PrContentScroll::Step(direction) => {
+                let downward = direction > 0;
+                let at_edge = if downward {
+                    offset.y <= -max.y
+                } else {
+                    offset.y >= gpui::px(0.0)
+                };
+                // A selected entry taller than the window scrolls first, and only
+                // moves on once its edge in this direction is showing. A page key
+                // just scrolls.
+                let extends = match scroll {
+                    PrContentScroll::Step(_) => {
+                        self.selected_pull_request_child_index().is_some_and(|ix| {
+                            handle.bounds_for_item(ix).is_some_and(|bounds| {
+                                pr_item_extends_past(
+                                    bounds.top() + offset.y - viewport.top(),
+                                    bounds.bottom() + offset.y - viewport.bottom(),
+                                    direction,
+                                )
+                            })
+                        })
+                    }
+                    _ => true,
+                };
+                if extends && !at_edge {
+                    scroll_to(offset.y - step * f32::from(direction));
+                } else if matches!(scroll, PrContentScroll::Step(_))
+                    && !self.step_pull_request_content(direction, cx)
+                    && !at_edge
+                {
+                    // No entry left in this direction: the rest of the page
+                    // (the description above the first entry, the checks
+                    // line after the last) is still there to scroll to.
+                    scroll_to(offset.y - step * f32::from(direction));
+                }
+            }
+        }
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// The scroll container's child holding the selected entry or thread.
+    fn selected_pull_request_child_index(&self) -> Option<usize> {
+        let prs = self.active_pull_requests()?;
+        let detail = prs.detail.ready()?;
+        Some(super::panes::main::pr_content_child_index(
+            prs.content_tab,
+            detail,
+            &prs.threads,
+            prs.selected_entry,
+            prs.selected_thread,
+            prs.show_hidden_threads,
+        ))
     }
 
     pub(super) fn toggle_pull_request_hidden_threads(&mut self, cx: &mut gpui::Context<Self>) {
@@ -1451,6 +1592,7 @@ impl GitCometView {
         {
             entry.selected_thread = None;
         }
+        entry.select_first_thread_if_none();
         self.notify_pull_request_panes(cx);
     }
 
@@ -2380,5 +2522,96 @@ mod tests {
         assert_eq!(entry.stack_neighbor(2, -1), Some(1));
         assert_eq!(entry.stack_neighbor(3, -1), Some(1));
         assert_eq!(entry.stack_neighbor(1, 1), Some(2));
+    }
+
+    fn bare_review(id: u64, review_id: Option<u64>) -> github::ConversationEntry {
+        github::ConversationEntry {
+            id: format!("r{id}"),
+            author: "gabins123".into(),
+            verb: "reviewed",
+            at: String::new(),
+            body: String::new(),
+            body_truncated: false,
+            review_id,
+        }
+    }
+
+    fn thread_of_review(review_id: Option<u64>) -> github::ReviewThread {
+        github::ReviewThread {
+            root_id: 1,
+            path: "a.rs".into(),
+            side: github::ReviewSide::Right,
+            line: Some(1),
+            original_line: Some(1),
+            is_resolved: false,
+            is_outdated: false,
+            comments: vec![],
+            pull_request_review_id: review_id,
+            diff_hunk: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_bare_review_shows_only_with_loaded_line_comments() {
+        let commented = github::ConversationEntry {
+            verb: "commented",
+            ..bare_review(0, None)
+        };
+        let with_body = github::ConversationEntry {
+            body: "Summary".into(),
+            ..bare_review(1, Some(11))
+        };
+        let approved = github::ConversationEntry {
+            verb: "approved",
+            ..bare_review(2, Some(12))
+        };
+        let conversation = [
+            commented,
+            with_body,
+            approved,
+            bare_review(3, Some(13)),
+            bare_review(4, Some(14)),
+            bare_review(5, None),
+        ];
+        let threads = [thread_of_review(Some(13)), thread_of_review(None)];
+        // Entries with a body, a verdict or a plain comment always show; a bare
+        // review shows when a thread carries its id...
+        assert_eq!(
+            visible_pr_entry_indexes(&conversation, Some(&threads)),
+            [0, 1, 2, 3]
+        );
+        // ...and stays out until the threads have loaded (or if they never do).
+        assert_eq!(visible_pr_entry_indexes(&conversation, None), [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_tall_item_scrolls_before_the_selection_moves_on() {
+        // An item from 10px above the window's top to 300px below its bottom.
+        let (top, bottom) = (gpui::px(-10.0), gpui::px(300.0));
+        assert!(pr_item_extends_past(top, bottom, 1));
+        assert!(pr_item_extends_past(top, bottom, -1));
+        // Fully inside, or within a pixel of an edge: nothing left to scroll.
+        assert!(!pr_item_extends_past(gpui::px(5.0), gpui::px(-20.0), 1));
+        assert!(!pr_item_extends_past(gpui::px(5.0), gpui::px(-20.0), -1));
+        assert!(!pr_item_extends_past(gpui::px(-0.5), gpui::px(0.5), 1));
+        assert!(!pr_item_extends_past(gpui::px(-0.5), gpui::px(0.5), -1));
+    }
+
+    #[test]
+    fn page_keys_scroll_half_the_window_and_steps_a_fifth_of_it() {
+        let height = gpui::px(800.0);
+        assert_eq!(
+            pr_scroll_distance(PrContentScroll::HalfPage(1), height),
+            gpui::px(400.0)
+        );
+        assert_eq!(
+            pr_scroll_distance(PrContentScroll::Step(1), height),
+            gpui::px(160.0)
+        );
+        // A small window still moves a readable distance.
+        assert_eq!(
+            pr_scroll_distance(PrContentScroll::Step(-1), gpui::px(100.0)),
+            gpui::px(40.0)
+        );
     }
 }

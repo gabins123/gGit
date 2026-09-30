@@ -533,6 +533,7 @@ impl GitCometView {
                 FocusPanel::History if self.pull_request_content_active() => {
                     return &[
                         ("j/k", "entry"),
+                        ("pgdn/pgup", "scroll"),
                         ("</>", "stack"),
                         ("[/]", "tab"),
                         ("enter", "thread"),
@@ -761,7 +762,13 @@ impl GitCometView {
                 }
                 FocusPanel::History if self.pull_request_content_active() => {
                     return &[
-                        ("j / k", "Next / previous entry or thread"),
+                        (
+                            "j / k",
+                            "Scroll a tall entry or thread, then go to the next / previous one",
+                        ),
+                        ("pgdn / pgup", "Scroll half a page"),
+                        ("ctrl+d / u", "Scroll half a page down / up"),
+                        ("home / end", "Top / bottom"),
                         ("< / >", "Pull request below / above it in its stack"),
                         ("[ / ]", "Conversation / Comments tab"),
                         ("enter", "Review at the selected thread's line"),
@@ -1477,8 +1484,24 @@ impl GitCometView {
                 Some(true)
             }
             (Some(FocusPanel::History), "t" | "g" | "m" | "escape") if in_content => Some(true),
+            (Some(FocusPanel::History), "pagedown" | "pageup" | "home" | "end") if in_content => {
+                use super::pull_requests::PrContentScroll;
+                self.scroll_pull_request_content(
+                    match key {
+                        "pagedown" => PrContentScroll::HalfPage(1),
+                        "pageup" => PrContentScroll::HalfPage(-1),
+                        "home" => PrContentScroll::Top,
+                        _ => PrContentScroll::Bottom,
+                    },
+                    cx,
+                );
+                Some(true)
+            }
             (Some(FocusPanel::History), _) if direction != 0 && in_content => {
-                self.step_pull_request_content(direction, cx);
+                self.scroll_pull_request_content(
+                    super::pull_requests::PrContentScroll::Step(direction),
+                    cx,
+                );
                 Some(true)
             }
             (Some(FocusPanel::History), "[") if in_content => {
@@ -1579,7 +1602,12 @@ impl GitCometView {
             return self.handle_commit_scope_picker_key(keystroke, cx);
         }
         let mods = keystroke.modifiers;
-        if mods.control || mods.alt || mods.platform || mods.function {
+        // `ctrl-d`/`ctrl-u` half-page panel 2's Conversation and Comments, like
+        // `pagedown`/`pageup`; every other chord is not a panel key.
+        let half_page_chord = mods.control
+            && !(mods.alt || mods.platform || mods.function || mods.shift)
+            && matches!(keystroke.key.as_str(), "d" | "u");
+        if !half_page_chord && (mods.control || mods.alt || mods.platform || mods.function) {
             return false;
         }
         if self.codex_panel_focused(window)
@@ -1620,6 +1648,18 @@ impl GitCometView {
         let current = self
             .focused_panel(window, cx)
             .filter(|panel| *panel == FocusPanel::Diff || self.panel_available(*panel));
+        if half_page_chord {
+            let in_content =
+                current == Some(FocusPanel::History) && self.pull_request_content_active();
+            if !in_content {
+                return false;
+            }
+            self.scroll_pull_request_content(
+                super::pull_requests::PrContentScroll::HalfPage(if key == "d" { 1 } else { -1 }),
+                cx,
+            );
+            return true;
+        }
         if let Some(handled) = self.handle_review_key(current, key, mods.shift, window, cx) {
             return handled;
         }

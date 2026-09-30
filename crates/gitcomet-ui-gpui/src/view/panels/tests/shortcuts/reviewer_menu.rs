@@ -40,6 +40,7 @@ fn reviewer_pr_detail(
         number,
         title: "Title".to_string(),
         body: "Body text.".to_string(),
+        body_truncated: false,
         url: String::new(),
         author: String::new(),
         created_at: String::new(),

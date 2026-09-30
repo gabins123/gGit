@@ -4354,6 +4354,7 @@ mod tests {
             comments: vec![ThreadComment {
                 author: "octo".into(),
                 body: "?".into(),
+                body_truncated: false,
                 at: String::new(),
             }],
         };

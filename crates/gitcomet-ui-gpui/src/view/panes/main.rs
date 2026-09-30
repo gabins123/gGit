@@ -18,6 +18,7 @@ mod markdown_state;
 mod preview;
 mod pull_request;
 mod review_cursor;
+pub(in crate::view) use pull_request::pr_content_child_index;
 pub(in crate::view) use review_cursor::{ReviewCommentScope, ReviewMark, SinceLines};
 pub(in crate::view) mod submodule_summary;
 mod surface;

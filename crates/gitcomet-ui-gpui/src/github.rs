@@ -31,6 +31,9 @@ const LIST_LIMIT: u32 = 100;
 /// each body; the rest is on GitHub.
 const MAX_CONVERSATION: usize = 100;
 const MAX_CONVERSATION_BODY_CHARS: usize = 4_000;
+/// The pull request's own description gets far more room than a comment: it is
+/// the thing being reviewed, and its Markdown is cached once rendered.
+const MAX_DESCRIPTION_CHARS: usize = 32_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PrError {
@@ -1030,6 +1033,8 @@ pub(crate) struct ConversationEntry {
     /// ISO 8601, as GitHub gives it.
     pub(crate) at: String,
     pub(crate) body: String,
+    /// `body` was cut at the cap; the rest is on GitHub.
+    pub(crate) body_truncated: bool,
     /// This review's REST numeric id, when it is a review and `view` could
     /// match it to one from `repos/{repo}/pulls/{number}/reviews` (the same
     /// id review threads carry as their `pull_request_review_id`). `None` for
@@ -1038,9 +1043,37 @@ pub(crate) struct ConversationEntry {
     pub(crate) review_id: Option<u64>,
 }
 
+impl ConversationEntry {
+    /// A review with no summary and no verdict: it is on the timeline only for
+    /// the line comments it made, so it has nothing to show without any.
+    pub(crate) fn is_bare_review(&self) -> bool {
+        self.verb == "reviewed" && self.body.is_empty()
+    }
+}
+
+/// `text` trimmed and cut to at most `max` characters, at a line boundary when
+/// the cut part has one (never mid-sentence of a line it could have kept
+/// whole); the flag says whether anything was cut.
+fn cap_text(text: &str, max: usize) -> (String, bool) {
+    let text = text.trim();
+    let Some((cut, _)) = text.char_indices().nth(max) else {
+        return (text.to_string(), false);
+    };
+    let head = &text[..cut];
+    // A line boundary only counts in the last half: a huge single line after a
+    // short heading is better cut hard than dropped.
+    let head = head
+        .rfind('\n')
+        .filter(|line_end| *line_end >= head.len() / 2)
+        .map_or(head, |line_end| &head[..line_end]);
+    (head.trim_end().to_string(), true)
+}
+
 /// Comments and reviews oldest first, the newest `MAX_CONVERSATION` of them.
-/// A review that is only inline code comments has no body and adds nothing
-/// here, so it is left out; approvals and change requests always show.
+/// A review that is only inline code comments has no body and so is kept too,
+/// as a bare `reviewed` entry: whether it shows depends on its line comments
+/// having loaded (see [`ConversationEntry::is_bare_review`]). Only a pending
+/// review is left out.
 fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<ConversationEntry> {
     let comments = comments
         .into_iter()
@@ -1060,7 +1093,6 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
             "CHANGES_REQUESTED" => "requested changes",
             "DISMISSED" => "reviewed (dismissed)",
             "PENDING" => return None,
-            _ if review.body.trim().is_empty() => return None,
             _ => "reviewed",
         };
         Some((
@@ -1073,21 +1105,21 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
     });
     let mut entries: Vec<ConversationEntry> = comments
         .chain(reviews)
-        .map(|(id, author, verb, at, body)| ConversationEntry {
-            id: if id.is_empty() {
-                format!("{verb}:{}:{at}", author.login)
-            } else {
-                id
-            },
-            author: author.login,
-            verb,
-            at,
-            body: body
-                .trim()
-                .chars()
-                .take(MAX_CONVERSATION_BODY_CHARS)
-                .collect(),
-            review_id: None,
+        .map(|(id, author, verb, at, body)| {
+            let (body, body_truncated) = cap_text(&body, MAX_CONVERSATION_BODY_CHARS);
+            ConversationEntry {
+                id: if id.is_empty() {
+                    format!("{verb}:{}:{at}", author.login)
+                } else {
+                    id
+                },
+                author: author.login,
+                verb,
+                at,
+                body,
+                body_truncated,
+                review_id: None,
+            }
         })
         .collect();
     entries.sort_by(|a, b| a.at.cmp(&b.at));
@@ -1199,6 +1231,8 @@ pub(crate) struct PullRequestDetail {
     pub(crate) number: u64,
     pub(crate) title: String,
     pub(crate) body: String,
+    /// `body` was cut at its cap; the rest is on GitHub.
+    pub(crate) body_truncated: bool,
     pub(crate) url: String,
     pub(crate) author: String,
     /// ISO 8601, as GitHub gives it; empty when `gh` didn't report one.
@@ -1250,15 +1284,12 @@ impl From<RawDetail> for PullRequestDetail {
             &raw.latest_reviews,
             &raw.author.login,
         );
+        let (body, body_truncated) = cap_text(&raw.body, MAX_DESCRIPTION_CHARS);
         Self {
             number: raw.number,
             title: raw.title,
-            body: raw
-                .body
-                .trim()
-                .chars()
-                .take(MAX_CONVERSATION_BODY_CHARS)
-                .collect(),
+            body,
+            body_truncated,
             url: raw.url,
             author: raw.author.login,
             created_at: raw.created_at,
@@ -1307,8 +1338,14 @@ impl From<RawDetail> for PullRequestDetail {
                     oid: commit.oid,
                     headline: commit.message_headline.chars().take(200).collect(),
                     committed_at: commit.committed_date,
-                    author: commit.authors.into_iter().find_map(|author| {
-                        author.login.or(author.name).filter(|name| !name.is_empty())
+                    // `authors[0]` is the commit's real author; later entries are
+                    // co-authors. Its `login` is empty for an unlinked email, in
+                    // which case its `name` stands in.
+                    author: commit.authors.into_iter().next().and_then(|author| {
+                        author
+                            .login
+                            .filter(|login| !login.is_empty())
+                            .or_else(|| author.name.filter(|name| !name.is_empty()))
                     }),
                 })
                 .collect(),
@@ -1404,6 +1441,8 @@ pub(crate) struct ReplyTarget {
 pub(crate) struct ThreadComment {
     pub(crate) author: String,
     pub(crate) body: String,
+    /// `body` was cut at the cap; the rest is on GitHub.
+    pub(crate) body_truncated: bool,
     /// ISO 8601, as GitHub gives it.
     pub(crate) at: String,
 }
@@ -1471,18 +1510,17 @@ struct RawReviewComment {
 fn review_threads(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
     let mut raw = raw;
     raw.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    let comment = |raw: &RawReviewComment| ThreadComment {
-        author: raw
-            .user
-            .as_ref()
-            .map_or_else(|| "ghost".to_string(), |user| user.login.clone()),
-        body: raw
-            .body
-            .trim()
-            .chars()
-            .take(MAX_CONVERSATION_BODY_CHARS)
-            .collect(),
-        at: raw.created_at.clone(),
+    let comment = |raw: &RawReviewComment| {
+        let (body, body_truncated) = cap_text(&raw.body, MAX_CONVERSATION_BODY_CHARS);
+        ThreadComment {
+            author: raw
+                .user
+                .as_ref()
+                .map_or_else(|| "ghost".to_string(), |user| user.login.clone()),
+            body,
+            body_truncated,
+            at: raw.created_at.clone(),
+        }
     };
     let mut threads: Vec<ReviewThread> = raw
         .iter()
@@ -3292,6 +3330,16 @@ mod tests {
                     "committedDate": "2026-09-01T00:00:00Z",
                     "authors": [{"login": "alexk", "name": "Alex K"}]
                 },
+                // An unlinked email (empty `login`) stands in by `name`, and the
+                // co-author listed after it never names the push.
+                {
+                    "oid": "5".repeat(40), "messageHeadline": "co-authored",
+                    "committedDate": "2026-09-05T00:00:00Z",
+                    "authors": [
+                        {"login": "", "name": "gabins123"},
+                        {"login": "claude", "name": "Claude Opus"}
+                    ]
+                },
                 // No GitHub account: falls back to the commit's `name`.
                 {
                     "oid": "2".repeat(40), "messageHeadline": "name only",
@@ -3326,9 +3374,77 @@ mod tests {
                 ("empty authors", None),
                 ("no authors field", None),
                 ("name only", Some("Someone Else")),
+                ("co-authored", Some("gabins123")),
                 ("with login", Some("alexk")),
             ]
         );
+    }
+
+    #[test]
+    fn cap_text_cuts_at_a_line_boundary_and_says_so() {
+        // Under the cap: trimmed, untouched, not truncated.
+        assert_eq!(cap_text("  short  ", 10), ("short".to_string(), false));
+        assert_eq!(
+            cap_text("exactly 10", 10),
+            ("exactly 10".to_string(), false)
+        );
+        // Over it, with a line end in the kept part: cut there, not mid-line.
+        let text = "first line\nsecond line\nthird line is cut somewhere inside";
+        assert_eq!(
+            cap_text(text, 30),
+            ("first line\nsecond line".to_string(), true)
+        );
+        // No usable line end (a long single line): a hard cut on a char boundary.
+        let long = "é".repeat(50);
+        assert_eq!(cap_text(&long, 20), ("é".repeat(20), true));
+        // A heading followed by one huge line keeps most of that line.
+        let heading = format!("Title\n{}", "x".repeat(100));
+        let (kept, truncated) = cap_text(&heading, 50);
+        assert!(truncated);
+        assert_eq!(kept.chars().count(), 50);
+    }
+
+    #[test]
+    fn description_has_its_own_larger_cap_than_a_comment() {
+        let body = |lines: usize| {
+            (0..lines)
+                .map(|n| format!("line {n:05} of the description"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let json = serde_json::json!({
+            "number": 9, "title": "t", "url": "u",
+            "headRefName": "h", "headRefOid": "a", "baseRefName": "b", "baseRefOid": "c",
+            // ~11,000 chars: over a comment's 4,000 cap, under the description's.
+            "body": body(350),
+            "comments": [{
+                "author": {"login": "bob"}, "body": body(350),
+                "createdAt": "2026-09-02T00:00:00Z"
+            }],
+        });
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.to_string().as_bytes())
+            .expect("valid detail")
+            .into();
+        assert!(!detail.body_truncated);
+        assert_eq!(detail.body, body(350));
+        // The same text as a comment is cut at 4,000 chars, on a line end.
+        let comment = &detail.conversation[0];
+        assert!(comment.body_truncated);
+        assert!(comment.body.chars().count() <= MAX_CONVERSATION_BODY_CHARS);
+        assert!(comment.body.ends_with("of the description"));
+
+        // Past the description cap, it too is cut and flagged.
+        let json = serde_json::json!({
+            "number": 9, "title": "t", "url": "u",
+            "headRefName": "h", "headRefOid": "a", "baseRefName": "b", "baseRefOid": "c",
+            "body": body(2_000),
+        });
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.to_string().as_bytes())
+            .expect("valid detail")
+            .into();
+        assert!(detail.body_truncated);
+        assert!(detail.body.chars().count() <= MAX_DESCRIPTION_CHARS);
+        assert!(detail.body.ends_with("of the description"));
     }
 
     #[test]
@@ -3480,7 +3596,9 @@ mod tests {
                 ("lint", CheckState::Passing),
             ]
         );
-        // Oldest first; the hidden comment and the body-less inline review drop out.
+        // Oldest first; the hidden comment and the pending review drop out. The
+        // body-less inline review stays (as a bare review) for the UI to show
+        // once it knows the review's line comments.
         let conversation: Vec<_> = detail
             .conversation
             .iter()
@@ -3489,11 +3607,19 @@ mod tests {
         assert_eq!(
             conversation,
             [
+                ("cid", "reviewed", ""),
                 ("dee", "reviewed", "First"),
                 ("bob", "commented", "Second"),
                 ("amy", "approved", ""),
             ]
         );
+        let bare: Vec<_> = detail
+            .conversation
+            .iter()
+            .map(ConversationEntry::is_bare_review)
+            .collect();
+        // A verdict without a body (amy's approval) is not bare.
+        assert_eq!(bare, [true, false, false, false]);
     }
 
     #[test]
@@ -3505,6 +3631,7 @@ mod tests {
                 verb: "reviewed",
                 at: "2026-09-01T00:00:00Z".into(),
                 body: "First".into(),
+                body_truncated: false,
                 review_id: None,
             },
             ConversationEntry {
@@ -3513,6 +3640,7 @@ mod tests {
                 verb: "commented",
                 at: "2026-09-02T00:00:00Z".into(),
                 body: "Second".into(),
+                body_truncated: false,
                 review_id: None,
             },
             ConversationEntry {
@@ -3521,6 +3649,7 @@ mod tests {
                 verb: "approved",
                 at: "2026-09-04T00:00:00Z".into(),
                 body: String::new(),
+                body_truncated: false,
                 review_id: None,
             },
         ];
@@ -3559,6 +3688,7 @@ mod tests {
             verb: "reviewed",
             at: "2026-09-01T00:00:00Z".into(),
             body: "First".into(),
+            body_truncated: false,
             review_id: None,
         }];
         match_conversation_review_ids(&mut conversation, &[]);
