@@ -72,9 +72,25 @@ pub fn initials_paint_origin_y(
 /// directly on its row canvas.
 pub fn author_avatar(theme: AppTheme, scale: impl Into<UiScale>, name: &str) -> Div {
     let scale = scale.into();
+    author_avatar_sized(
+        theme,
+        scale.px(AVATAR_DIAMETER_PX),
+        scale.px(AVATAR_FONT_PX),
+        name,
+    )
+}
+
+/// Same tinted-circle-plus-initials design as [`author_avatar`], at a caller-chosen
+/// diameter/font size rather than the fixed [`AVATAR_DIAMETER_PX`] design size.
+/// Callers still scale both arguments through [`UiScale`] themselves so avatars
+/// zoom with the rest of the UI.
+pub fn author_avatar_sized(
+    theme: AppTheme,
+    diameter: Pixels,
+    font_size: Pixels,
+    name: &str,
+) -> Div {
     let color = author_color(theme, name);
-    let diameter = scale.px(AVATAR_DIAMETER_PX);
-    let font_size = scale.px(AVATAR_FONT_PX);
     let initials: gpui::SharedString = author_initials(name).into();
     div()
         .flex_none()

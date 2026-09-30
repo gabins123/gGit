@@ -26,8 +26,8 @@ pub use crate::kit::interaction::{
     control_open_background,
 };
 pub use avatar::{
-    AVATAR_DIAMETER_PX, AVATAR_FONT_PX, author_avatar, author_color, author_initials,
-    initials_paint_origin_y,
+    AVATAR_DIAMETER_PX, AVATAR_FONT_PX, author_avatar, author_avatar_sized, author_color,
+    author_initials, initials_paint_origin_y,
 };
 pub use button::{Button, ButtonStyle, inline_icon_button};
 pub use commit_link_menu::{CommitLinkMenu, LinkTarget, MessageLink};

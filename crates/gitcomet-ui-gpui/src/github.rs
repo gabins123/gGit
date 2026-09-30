@@ -882,6 +882,17 @@ struct RawReview {
     submitted_at: Option<String>,
 }
 
+/// `gh pr view --json commits`' `authors` entry: `{login, name, email, id}`;
+/// only the display fields are read here.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCommitAuthor {
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawPullRequestCommit {
@@ -891,6 +902,8 @@ struct RawPullRequestCommit {
     message_headline: String,
     #[serde(default)]
     committed_date: String,
+    #[serde(default)]
+    authors: Vec<RawCommitAuthor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -898,6 +911,9 @@ pub(crate) struct PullRequestCommit {
     pub(crate) oid: String,
     pub(crate) headline: String,
     pub(crate) committed_at: String,
+    /// The first author GitHub lists for this commit (its login, or its name
+    /// when it has no GitHub account); `None` when gh reports neither.
+    pub(crate) author: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1014,6 +1030,12 @@ pub(crate) struct ConversationEntry {
     /// ISO 8601, as GitHub gives it.
     pub(crate) at: String,
     pub(crate) body: String,
+    /// This review's REST numeric id, when it is a review and `view` could
+    /// match it to one from `repos/{repo}/pulls/{number}/reviews` (the same
+    /// id review threads carry as their `pull_request_review_id`). `None` for
+    /// a plain comment, an unmatched review, or when that secondary lookup
+    /// failed.
+    pub(crate) review_id: Option<u64>,
 }
 
 /// Comments and reviews oldest first, the newest `MAX_CONVERSATION` of them.
@@ -1065,12 +1087,62 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
                 .chars()
                 .take(MAX_CONVERSATION_BODY_CHARS)
                 .collect(),
+            review_id: None,
         })
         .collect();
     entries.sort_by(|a, b| a.at.cmp(&b.at));
     let skip = entries.len().saturating_sub(MAX_CONVERSATION);
     entries.drain(..skip);
     entries
+}
+
+/// Fills in `review_id` on every review entry of `conversation` that matches
+/// one of `rest_reviews` by author and submit time (both sourced from the
+/// same underlying review, so identical strings) — the REST id review threads
+/// carry as their `pull_request_review_id`, letting the UI count and list a
+/// review's own inline comments. `gh pr view --json reviews`' own `id` is a
+/// GraphQL node id, not this REST numeric one, hence the separate lookup.
+fn match_conversation_review_ids(
+    conversation: &mut [ConversationEntry],
+    rest_reviews: &[RawRestReview],
+) {
+    for entry in conversation.iter_mut() {
+        if entry.verb == "commented" {
+            continue;
+        }
+        entry.review_id = rest_reviews
+            .iter()
+            .find(|rest| {
+                rest.submitted_at.as_deref() == Some(entry.at.as_str())
+                    && rest
+                        .user
+                        .as_ref()
+                        .is_some_and(|user| user.login.eq_ignore_ascii_case(&entry.author))
+            })
+            .and_then(|rest| rest.id);
+    }
+}
+
+/// The pull request's reviews as GitHub's REST API lists them, every page —
+/// used only to learn each review's REST numeric id (see
+/// [`match_conversation_review_ids`]); best-effort, like
+/// [`review_thread_statuses`].
+fn review_rest_ids(workdir: &Path, repo: &str, number: u64) -> Result<Vec<RawRestReview>, PrError> {
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "--hostname=github.com",
+        &format!("repos/{repo}/pulls/{number}/reviews?per_page=100"),
+        "--paginate",
+        "--slurp",
+    ]);
+    let pages: Vec<Vec<RawRestReview>> = parse_json(&run(command, None)?)?;
+    Ok(pages.into_iter().flatten().collect())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1083,6 +1155,8 @@ struct RawDetail {
     url: String,
     #[serde(default)]
     author: Author,
+    #[serde(default)]
+    created_at: String,
     head_ref_name: String,
     head_ref_oid: String,
     base_ref_name: String,
@@ -1127,6 +1201,8 @@ pub(crate) struct PullRequestDetail {
     pub(crate) body: String,
     pub(crate) url: String,
     pub(crate) author: String,
+    /// ISO 8601, as GitHub gives it; empty when `gh` didn't report one.
+    pub(crate) created_at: String,
     pub(crate) head: String,
     pub(crate) head_oid: String,
     pub(crate) base: String,
@@ -1185,6 +1261,7 @@ impl From<RawDetail> for PullRequestDetail {
                 .collect(),
             url: raw.url,
             author: raw.author.login,
+            created_at: raw.created_at,
             head: raw.head_ref_name,
             head_oid: raw.head_ref_oid,
             base: raw.base_ref_name,
@@ -1230,6 +1307,9 @@ impl From<RawDetail> for PullRequestDetail {
                     oid: commit.oid,
                     headline: commit.message_headline.chars().take(200).collect(),
                     committed_at: commit.committed_date,
+                    author: commit.authors.into_iter().find_map(|author| {
+                        author.login.or(author.name).filter(|name| !name.is_empty())
+                    }),
                 })
                 .collect(),
         }
@@ -1346,6 +1426,13 @@ pub(crate) struct ReviewThread {
     /// GitHub's authoritative changed-line status.
     pub(crate) is_outdated: bool,
     pub(crate) comments: Vec<ThreadComment>,
+    /// The root comment's REST review id (`pull_request_review_id`), matching
+    /// a [`ConversationEntry::review_id`] `view` filled in — `None` for a
+    /// comment made outside of a review.
+    pub(crate) pull_request_review_id: Option<u64>,
+    /// The root comment's unified-diff hunk, ending at the commented line;
+    /// untrusted plain text, empty when GitHub didn't send one.
+    pub(crate) diff_hunk: String,
 }
 
 impl ReviewThread {
@@ -1373,6 +1460,10 @@ struct RawReviewComment {
     user: Option<Author>,
     #[serde(default)]
     created_at: String,
+    #[serde(default)]
+    pull_request_review_id: Option<u64>,
+    #[serde(default)]
+    diff_hunk: String,
 }
 
 /// Review comments as threads: each first comment with the replies to it,
@@ -1406,6 +1497,8 @@ fn review_threads(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
             // Filled authoritatively by the GraphQL thread query; retain the
             // REST heuristic until then for callers that only parse REST.
             is_outdated: root.line.is_none() && root.original_line.is_some(),
+            pull_request_review_id: root.pull_request_review_id,
+            diff_hunk: root.diff_hunk.clone(),
             comments: vec![comment(root)],
         })
         .collect();
@@ -1666,13 +1759,23 @@ pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullReques
         "view",
         &number.to_string(),
         &repo_flag(repo),
-        "--json=number,title,body,url,author,headRefName,headRefOid,baseRefName,baseRefOid,\
-         isDraft,isCrossRepository,state,reviewDecision,mergeable,additions,deletions,\
-         changedFiles,files,\
+        "--json=number,title,body,url,author,createdAt,headRefName,headRefOid,baseRefName,\
+         baseRefOid,isDraft,isCrossRepository,state,reviewDecision,mergeable,additions,\
+         deletions,changedFiles,files,\
           statusCheckRollup,comments,reviews,reviewRequests,latestReviews,commits",
     ]);
     let raw: RawDetail = parse_json(&run(command, None)?)?;
-    Ok(raw.into())
+    let mut detail: PullRequestDetail = raw.into();
+    // Best-effort, like `review_thread_statuses`: a review simply keeps
+    // `review_id: None` (no "N line comments" footer) if this secondary
+    // lookup fails.
+    match review_rest_ids(workdir, repo, number) {
+        Ok(rest_reviews) => match_conversation_review_ids(&mut detail.conversation, &rest_reviews),
+        Err(err) => {
+            eprintln!("Couldn't match reviews to their REST ids for {repo}#{number}: {err}")
+        }
+    }
+    Ok(detail)
 }
 
 /// One page of the pull request's files, as GitHub's REST API lists them:
@@ -2058,6 +2161,12 @@ impl LastReview {
 
 #[derive(Deserialize)]
 struct RawRestReview {
+    /// GitHub REST's own numeric review id — distinct from `gh pr view
+    /// --json reviews`' GraphQL node id — matched to a [`ConversationEntry`]
+    /// by [`match_conversation_review_ids`] and to a [`ReviewThread`] by its
+    /// `pull_request_review_id`.
+    #[serde(default)]
+    id: Option<u64>,
     #[serde(default)]
     user: Option<Author>,
     #[serde(default)]
@@ -2910,6 +3019,40 @@ mod tests {
     }
 
     #[test]
+    fn review_threads_carry_the_roots_review_id_and_diff_hunk() {
+        let raw: Vec<super::RawReviewComment> = serde_json::from_str(
+            r#"[
+                {
+                    "id": 1, "path": "a.rs", "line": 12, "original_line": 12, "body": "root",
+                    "pull_request_review_id": 555,
+                    "diff_hunk": "@@ -10,3 +10,3 @@\n context\n-old\n+new"
+                },
+                {
+                    "id": 2, "in_reply_to_id": 1, "path": "a.rs", "line": 12,
+                    "original_line": 12, "body": "reply"
+                },
+                {"id": 3, "path": "b.rs", "line": 4, "original_line": 4, "body": "no review"}
+            ]"#,
+        )
+        .expect("REST comments");
+        let threads = super::review_threads(raw);
+        let with_review = threads.iter().find(|thread| thread.root_id == 1).unwrap();
+        assert_eq!(with_review.pull_request_review_id, Some(555));
+        assert_eq!(
+            with_review.diff_hunk,
+            "@@ -10,3 +10,3 @@\n context\n-old\n+new"
+        );
+        // A reply's own `pull_request_review_id`/`diff_hunk` never overwrite
+        // the thread's, which are the root comment's only.
+        assert_eq!(with_review.comments.len(), 2);
+
+        // Absent on the wire (a comment made outside of a review): stays `None`/empty.
+        let without_review = threads.iter().find(|thread| thread.root_id == 3).unwrap();
+        assert_eq!(without_review.pull_request_review_id, None);
+        assert_eq!(without_review.diff_hunk, "");
+    }
+
+    #[test]
     fn graphql_thread_statuses_match_rest_roots_and_override_the_rest_heuristic() {
         let raw: Vec<super::RawReviewComment> = serde_json::from_str(
             r#"[
@@ -3137,6 +3280,70 @@ mod tests {
     }
 
     #[test]
+    fn detail_json_maps_created_at_and_the_pushers_commit_authors() {
+        let json = serde_json::json!({
+            "number": 9, "title": "t", "url": "u", "author": {"login": "alexk"},
+            "createdAt": "2026-09-01T00:00:00Z",
+            "headRefName": "h", "headRefOid": "a", "baseRefName": "b", "baseRefOid": "c",
+            "commits": [
+                // A GitHub account: `login` wins over `name`.
+                {
+                    "oid": "1".repeat(40), "messageHeadline": "with login",
+                    "committedDate": "2026-09-01T00:00:00Z",
+                    "authors": [{"login": "alexk", "name": "Alex K"}]
+                },
+                // No GitHub account: falls back to the commit's `name`.
+                {
+                    "oid": "2".repeat(40), "messageHeadline": "name only",
+                    "committedDate": "2026-09-02T00:00:00Z",
+                    "authors": [{"name": "Someone Else"}]
+                },
+                // `authors` entirely absent.
+                {
+                    "oid": "3".repeat(40), "messageHeadline": "no authors field",
+                    "committedDate": "2026-09-03T00:00:00Z"
+                },
+                // `authors` present but empty.
+                {
+                    "oid": "4".repeat(40), "messageHeadline": "empty authors",
+                    "committedDate": "2026-09-04T00:00:00Z",
+                    "authors": []
+                }
+            ]
+        });
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.to_string().as_bytes())
+            .expect("valid detail")
+            .into();
+        assert_eq!(detail.created_at, "2026-09-01T00:00:00Z");
+        let authors: Vec<(&str, Option<&str>)> = detail
+            .commits
+            .iter()
+            .map(|commit| (commit.headline.as_str(), commit.author.as_deref()))
+            .collect();
+        assert_eq!(
+            authors,
+            [
+                ("empty authors", None),
+                ("no authors field", None),
+                ("name only", Some("Someone Else")),
+                ("with login", Some("alexk")),
+            ]
+        );
+    }
+
+    #[test]
+    fn detail_json_defaults_created_at_when_gh_omits_it() {
+        let json = serde_json::json!({
+            "number": 9, "title": "t", "url": "u",
+            "headRefName": "h", "headRefOid": "a", "baseRefName": "b", "baseRefOid": "c",
+        });
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.to_string().as_bytes())
+            .expect("valid detail")
+            .into();
+        assert_eq!(detail.created_at, "");
+    }
+
+    #[test]
     fn commit_range_starts_at_oldest_parent_and_lists_touched_paths() {
         let dir = tempfile::tempdir().expect("temporary repository");
         let git = |args: &[&str]| {
@@ -3287,6 +3494,75 @@ mod tests {
                 ("amy", "approved", ""),
             ]
         );
+    }
+
+    #[test]
+    fn conversation_review_ids_match_by_author_and_submit_time_only() {
+        let mut conversation = vec![
+            ConversationEntry {
+                id: "c1".into(),
+                author: "dee".into(),
+                verb: "reviewed",
+                at: "2026-09-01T00:00:00Z".into(),
+                body: "First".into(),
+                review_id: None,
+            },
+            ConversationEntry {
+                id: "c2".into(),
+                author: "bob".into(),
+                verb: "commented",
+                at: "2026-09-02T00:00:00Z".into(),
+                body: "Second".into(),
+                review_id: None,
+            },
+            ConversationEntry {
+                id: "c3".into(),
+                author: "amy".into(),
+                verb: "approved",
+                at: "2026-09-04T00:00:00Z".into(),
+                body: String::new(),
+                review_id: None,
+            },
+        ];
+        // gh pr view --json reviews' own `id` is a GraphQL node id (never
+        // parsed here); only these REST fields are matched on.
+        let rest_reviews: Vec<RawRestReview> = serde_json::from_str(
+            r#"[
+                {"id": 900, "user": {"login": "Dee"}, "state": "COMMENTED", "submitted_at": "2026-09-01T00:00:00Z"},
+                {"id": 901, "user": {"login": "amy"}, "state": "APPROVED", "submitted_at": "2026-09-04T00:00:00Z"},
+                {"user": {"login": "ghost"}, "state": "COMMENTED", "submitted_at": "2026-09-05T00:00:00Z"}
+            ]"#,
+        )
+        .expect("REST reviews");
+        match_conversation_review_ids(&mut conversation, &rest_reviews);
+        let ids: Vec<(&str, Option<u64>)> = conversation
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.review_id))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                // Case-insensitive login match against "Dee".
+                ("c1", Some(900)),
+                // A plain comment is never a review; never matched.
+                ("c2", None),
+                ("c3", Some(901)),
+            ]
+        );
+    }
+
+    #[test]
+    fn conversation_review_ids_stay_none_when_no_rest_review_matches() {
+        let mut conversation = vec![ConversationEntry {
+            id: "c1".into(),
+            author: "dee".into(),
+            verb: "reviewed",
+            at: "2026-09-01T00:00:00Z".into(),
+            body: "First".into(),
+            review_id: None,
+        }];
+        match_conversation_review_ids(&mut conversation, &[]);
+        assert_eq!(conversation[0].review_id, None);
     }
 
     #[test]

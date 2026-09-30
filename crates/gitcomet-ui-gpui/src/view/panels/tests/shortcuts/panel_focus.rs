@@ -783,6 +783,7 @@ fn review_mode_walks_files_keeps_comments_and_leaves_with_q(cx: &mut gpui::TestA
                     body: String::new(),
                     url: String::new(),
                     author: "someone".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
                     head: "feat".into(),
                     head_oid: "a".repeat(40),
                     base: "main".into(),
@@ -944,6 +945,7 @@ fn seed_three_file_pull_request(cx: &mut gpui::VisualTestContext, view: &View) {
                     body: String::new(),
                     url: String::new(),
                     author: "someone".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
                     head: "feat".into(),
                     head_oid: "a".repeat(40),
                     base: "main".into(),
@@ -966,16 +968,19 @@ fn seed_three_file_pull_request(cx: &mut gpui::VisualTestContext, view: &View) {
                             oid: "a".repeat(40),
                             headline: "Third".into(),
                             committed_at: "2026-01-03T00:00:00Z".into(),
+                            author: None,
                         },
                         crate::github::PullRequestCommit {
                             oid: "d".repeat(40),
                             headline: "Second".into(),
                             committed_at: "2026-01-02T00:00:00Z".into(),
+                            author: None,
                         },
                         crate::github::PullRequestCommit {
                             oid: "e".repeat(40),
                             headline: "First".into(),
                             committed_at: "2026-01-01T00:00:00Z".into(),
+                            author: None,
                         },
                     ],
                 },
@@ -1530,6 +1535,8 @@ fn viewed_marks_follow_github_and_outdated_threads_take_replies(cx: &mut gpui::T
         original_line: Some(12),
         is_resolved: false,
         is_outdated: true,
+        pull_request_review_id: None,
+        diff_hunk: String::new(),
         comments: vec![ThreadComment {
             author: "octo".into(),
             body: "Old point\nmore".into(),
@@ -2123,6 +2130,7 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
                     verb: "commented",
                     at: "2025-01-01T00:00:00Z".into(),
                     body: "First".into(),
+                    review_id: None,
                 },
                 ConversationEntry {
                     id: "second".into(),
@@ -2130,6 +2138,7 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
                     verb: "approved",
                     at: "2025-01-02T00:00:00Z".into(),
                     body: "Second".into(),
+                    review_id: None,
                 },
             ];
             this.seed_pull_request_detail_for_test(REPO, detail, "c".repeat(40));
@@ -2141,6 +2150,8 @@ fn pull_request_keys_navigate_conversation_and_threads(cx: &mut gpui::TestAppCon
                 original_line: Some(12),
                 is_resolved: resolved,
                 is_outdated: outdated,
+                pull_request_review_id: None,
+                diff_hunk: String::new(),
                 comments: vec![ThreadComment {
                     author: "alice".into(),
                     body: "**Review this**".into(),

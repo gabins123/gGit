@@ -42,6 +42,7 @@ fn reviewer_pr_detail(
         body: "Body text.".to_string(),
         url: String::new(),
         author: String::new(),
+        created_at: String::new(),
         head: "feature".to_string(),
         head_oid: head_oid.to_string(),
         base: "main".to_string(),
