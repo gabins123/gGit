@@ -96,10 +96,6 @@ pub(in super::super) struct DetailsPaneView {
     /// Keyboard focus for the pane as a whole (`4`, `h`/`l`), for the commit
     /// views that have no status section to focus.
     pub(in super::super) panel_focus_handle: FocusHandle,
-    /// The pull request view's files, checks and conversation.
-    pull_request_list: gpui::ListState,
-    /// The pull request that list last showed, and its selected file.
-    pull_request_rows: Option<(Arc<crate::github::PullRequestDetail>, Option<usize>)>,
 
     pub(in super::super) untracked_scroll: UniformListScrollHandle,
     pub(in super::super) unstaged_scroll: UniformListScrollHandle,
@@ -110,6 +106,8 @@ pub(in super::super) struct DetailsPaneView {
     pub(in super::super) worktree_files_scroll: UniformListScrollHandle,
     pub(in super::super) commit_message_scroll: ScrollHandle,
     pub(in super::super) commit_scroll: ScrollHandle,
+    pr_details_scroll: ScrollHandle,
+    pr_details_scroll_key: Option<(u64, Option<usize>)>,
 
     pub(in super::super) commit_message_input: Entity<components::TextInput>,
     pub(in super::super) commit_details_message_input: Entity<components::TextInput>,
@@ -549,8 +547,6 @@ impl DetailsPaneView {
             status_section_resize: None,
             status_section_focus_handles: std::array::from_fn(|_| cx.focus_handle()),
             panel_focus_handle: cx.focus_handle().tab_index(0).tab_stop(false),
-            pull_request_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(400.0)),
-            pull_request_rows: None,
             untracked_scroll: UniformListScrollHandle::default(),
             unstaged_scroll: UniformListScrollHandle::default(),
             staged_scroll: UniformListScrollHandle::default(),
@@ -560,6 +556,8 @@ impl DetailsPaneView {
             worktree_files_scroll: UniformListScrollHandle::default(),
             commit_message_scroll,
             commit_scroll: ScrollHandle::new(),
+            pr_details_scroll: ScrollHandle::new(),
+            pr_details_scroll_key: None,
             commit_message_input,
             commit_details_message_input,
             commit_details_message_link_menu,
@@ -2486,21 +2484,26 @@ impl DetailsPaneView {
             let last_review = {
                 use super::super::pull_requests::PrLoad;
                 use super::super::review::SinceReview;
+                let Some(prs) = root.pull_requests.repo(review.repo_id) else {
+                    return div().into_any_element();
+                };
                 // GitHub text: plain, and only its first few lines.
-                let body = review
+                let body = prs
                     .last_review
                     .ready()
                     .and_then(Option::as_ref)
                     .map(|last| last.body.lines().take(3).collect::<Vec<_>>().join("\n"))
                     .filter(|body| !body.trim().is_empty());
-                let line = match &review.last_review {
+                let line = match &prs.last_review {
                     PrLoad::Idle => None,
                     PrLoad::Loading => Some("Loading your last review…".to_string()),
                     PrLoad::Failed(err) => Some(format!("Couldn't load your last review: {err}")),
                     PrLoad::Ready(None) => {
                         Some("You haven't reviewed this pull request before.".to_string())
                     }
-                    PrLoad::Ready(Some(_)) => review.last_review_line(std::time::SystemTime::now()),
+                    PrLoad::Ready(Some(last)) => {
+                        Some(review.last_review_line(last, std::time::SystemTime::now()))
+                    }
                 };
                 let gone = review.since_review == Some(SinceReview::Gone);
                 (line, body, gone)
@@ -2848,20 +2851,7 @@ impl DetailsPaneView {
             .into_any_element()
     }
 
-    /// `J`/`K`: scrolls the pull request view most of a page.
-    pub(in crate::view) fn scroll_pull_request_details(
-        &mut self,
-        direction: i8,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        let list = &self.pull_request_list;
-        let page = list.viewport_bounds().size.height * 0.8;
-        list.scroll_by(page * f32::from(direction));
-        cx.notify();
-    }
-
-    /// The selected pull request: its state, branches, files, checks and
-    /// conversation.
+    /// Facts for the selected pull request.
     fn pull_request_details_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         use super::super::pull_requests::PrLoad;
 
@@ -2870,18 +2860,38 @@ impl DetailsPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (detail, number, selected_file, fetching, listing, files_error) = {
+        let (
+            detail,
+            number,
+            listing,
+            files_error,
+            commit_selection,
+            last_review,
+            stack_members,
+            generated_count,
+        ) = {
             let root = root.read(cx);
             let Some(prs) = root.active_pull_requests() else {
                 return div().into_any_element();
             };
+            let selected = prs.selected.unwrap_or_default();
+            let stack_members = prs.stack_position(selected).map(|(stack, _)| {
+                let list = prs.list.ready().cloned().unwrap_or_default();
+                stack
+                    .members
+                    .iter()
+                    .filter_map(|number| list.iter().find(|pr| pr.number == *number).cloned())
+                    .collect::<Vec<_>>()
+            });
             (
                 prs.detail.clone(),
-                prs.selected.unwrap_or_default(),
-                prs.selected_file,
-                prs.diff_asked && matches!(prs.diff_base, PrLoad::Loading),
+                selected,
                 prs.files_listing(),
                 prs.files_error.clone(),
+                prs.commit_selection,
+                prs.last_review.clone(),
+                stack_members,
+                prs.generated_files.ready().map(|generated| generated.len()),
             )
         };
         let detail = match detail {
@@ -2902,23 +2912,12 @@ impl DetailsPaneView {
 
         let line = |text: String| {
             div()
-                .px_3()
                 .text_size(theme.ui_text(12.0))
                 .text_color(secondary)
                 .child(text)
         };
-        let state = if detail.is_draft {
-            "Draft".to_string()
-        } else {
-            match detail.state.as_str() {
-                "MERGED" => "Merged".to_string(),
-                "CLOSED" => "Closed".to_string(),
-                _ => "Open".to_string(),
-            }
-        };
-        let review = detail
-            .review
-            .map_or("No review yet", |review| review.label());
+        let icon_size = crate::ui_scale::UiScale::current(cx).px(16.0);
+        let (kind, title) = super::super::pr_symbols::title(&detail.title);
         let mergeable = match detail.mergeable {
             Some(true) => "No conflicts",
             Some(false) => "Has conflicts",
@@ -2926,7 +2925,7 @@ impl DetailsPaneView {
         };
         let checks = detail.checks;
         let checks_line = if checks.total() == 0 {
-            "No checks".to_string()
+            "No checks".to_owned()
         } else {
             format!(
                 "Checks: {} passing, {} failing, {} pending",
@@ -2934,270 +2933,381 @@ impl DetailsPaneView {
             )
         };
 
-        // A file row: its text and the air around it.
-        let scale = crate::ui_scale::UiScale::current(cx);
-        let row_height = scale.px(6.0) + scale.ui_text(12.0) * 1.618;
-        self.sync_pull_request_list(&detail, selected_file, row_height);
-        let listing_line = if listing {
-            Some(format!(
-                "Listing files… {} of {}",
-                detail.files.len(),
-                detail.changed_files
-            ))
-        } else {
-            files_error.map(|err| format!("Some files couldn't be listed ({err}). R retries."))
-        };
-        let list = self.pull_request_list.clone();
-
-        div()
+        let mut panel = div()
+            .id("pr_details")
             .flex()
             .flex_col()
             .size_full()
             .min_h(px(0.0))
-            .gap_1()
+            .gap_2()
+            .px_3()
             .py_2()
+            .overflow_y_scroll()
+            .track_scroll(&self.pr_details_scroll)
             .child(
                 div()
-                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_size(theme.ui_text(15.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("{} #{}", detail.title, detail.number)),
+                    .child(
+                        super::super::pr_symbols::state(&detail.state, detail.is_draft, theme)
+                            .render(
+                                format!("pr_detail_{}_state", detail.number),
+                                theme,
+                                icon_size,
+                            ),
+                    )
+                    .when_some(kind, |header, kind| {
+                        header.child(super::super::pr_symbols::kind_tag(
+                            kind,
+                            theme,
+                            theme.ui_text(11.0),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(if detail.is_draft && detail.state == "OPEN" {
+                                secondary
+                            } else {
+                                theme.colors.foreground.primary
+                            })
+                            .child(format!("{title} #{}", detail.number)),
+                    )
+                    .when_some(detail.review, |header, review| {
+                        header.child(super::super::pr_symbols::review(review, theme).render(
+                            format!("pr_detail_{}_review", detail.number),
+                            theme,
+                            icon_size,
+                        ))
+                    })
+                    .when_some(
+                        super::super::pr_symbols::checks(detail.checks, theme),
+                        |header, checks| {
+                            header.child(checks.render(
+                                format!("pr_detail_{}_checks", detail.number),
+                                theme,
+                                icon_size,
+                            ))
+                        },
+                    ),
             )
-            .child(line(format!("{state} · {review} · {mergeable}")))
+            .child(line(mergeable.to_owned()))
             .child(line(format!(
                 "{} wants to merge {} into {}",
                 detail.author, detail.head, detail.base
             )))
-            .child(line(checks_line))
-            .when(detail.too_large_for_app(), |panel| {
-                panel.child(line(format!(
-                    "GitHub lists only the first {} of its {} files, so it's reviewed there: o opens it.",
-                    crate::github::MAX_LISTED_FILES,
-                    detail.changed_files
-                )))
-            })
-            .when_some(listing_line, |panel, text| panel.child(line(text)))
-            .child(
+            .child(line(checks_line));
+        for run in detail
+            .check_runs
+            .iter()
+            .filter(|run| run.state != crate::github::CheckState::Passing)
+        {
+            let status = match run.state {
+                crate::github::CheckState::Failing => "Failing",
+                crate::github::CheckState::Pending => "Pending",
+                crate::github::CheckState::Passing => unreachable!(),
+            };
+            panel = panel.child(line(format!("  {status}: {}", run.name)));
+        }
+        let generated_suffix = generated_count
+            .filter(|count| *count > 0)
+            .map(|count| format!(" ({count} generated)"))
+            .unwrap_or_default();
+        panel = panel.child(line(format!(
+            "{} files{generated_suffix} · +{} −{}",
+            detail.changed_files, detail.additions, detail.deletions
+        )));
+        if detail.too_large_for_app() {
+            panel = panel.child(line(format!(
+                "GitHub lists only the first {} of its {} files; o opens it there.",
+                crate::github::MAX_LISTED_FILES,
+                detail.changed_files
+            )));
+        }
+        if listing {
+            panel = panel.child(line(format!(
+                "Listing files… {} of {}",
+                detail.files.len(),
+                detail.changed_files
+            )));
+        } else if let Some(ref err) = files_error {
+            panel = panel.child(line(format!(
+                "Some files couldn't be listed ({err}). R retries."
+            )));
+        }
+        panel = panel.child(
+            div()
+                .pt_2()
+                .text_size(theme.ui_text(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Reviewers"),
+        );
+        if detail.reviewers.is_empty() {
+            panel = panel.child(line("No reviewers yet".to_owned()));
+        } else {
+            for reviewer in &detail.reviewers {
+                let status_icon = match super::super::pr_symbols::reviewer_status(
+                    reviewer.status,
+                    theme,
+                ) {
+                    Ok(symbol) => symbol.render(
+                        format!("pr_reviewer_{}_status", reviewer.login),
+                        theme,
+                        icon_size,
+                    ),
+                    Err(text) => div().text_color(secondary).child(text).into_any_element(),
+                };
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(theme.ui_text(12.0))
+                        .child(status_icon)
+                        .child(format!("{} · {}", reviewer.login, reviewer.status.label())),
+                );
+            }
+        }
+        if let Some(members) = stack_members.filter(|members| !members.is_empty()) {
+            panel = panel.child(
                 div()
-                    .px_3()
                     .pt_2()
                     .text_size(theme.ui_text(12.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!(
-                        "Changed files ({})  +{} −{}",
-                        detail.changed_files, detail.additions, detail.deletions
-                    )),
-            )
-            // Only the rows in sight are laid out: a pull request can list
-            // thousands of files.
-            .child(
-                div()
-                    .id("pull_request_files")
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .child(
-                        gpui::list(
-                            list.clone(),
-                            cx.processor(|this, ix, _window, cx| {
-                                this.render_pull_request_item(ix, cx)
-                            }),
-                        )
-                        .size_full(),
-                    )
-                    .child(
-                        components::Scrollbar::new("pull_request_files_scrollbar", list)
-                            .auto_hide()
-                            .render(theme),
-                    ),
-            )
-            .child(line(if fetching {
-                "Fetching the pull request's commits…".to_string()
-            } else {
-                "enter diff · space checkout · r review · M merge · J/K scroll".to_string()
-            }))
-            .into_any_element()
-    }
-
-    /// Keeps the list's items in step with the pull request shown: pages of
-    /// files append under the scroll without moving it, another pull request
-    /// starts at the top, and `j`/`k` keep the selected file in sight.
-    fn sync_pull_request_list(
-        &mut self,
-        detail: &Arc<crate::github::PullRequestDetail>,
-        selected_file: Option<usize>,
-        row_height: Pixels,
-    ) {
-        let list = &self.pull_request_list;
-        let count = pull_request_item_count(detail);
-        let previous = self
-            .pull_request_rows
-            .replace((Arc::clone(detail), selected_file));
-        let moved = previous
-            .as_ref()
-            .is_some_and(|(_, was)| *was != selected_file);
-        // Every item counts as a file row until it's drawn, so a file far
-        // past the rows drawn so far can be scrolled to, and the scrollbar
-        // spans them all.
-        let reveal = match previous {
-            Some((shown, _)) if Arc::ptr_eq(&shown, detail) => false,
-            // More files, or a reload: the scroll stays where it is.
-            Some((shown, _)) if shown.number == detail.number => {
-                let top = list.logical_scroll_top();
-                list.reset_with_uniform_height(count, row_height);
-                list.scroll_to(top);
-                false
-            }
-            _ => {
-                list.reset_with_uniform_height(count, row_height);
-                true
-            }
-        };
-        if (reveal || moved)
-            && let Some(ix) = selected_file
-        {
-            list.scroll_to_reveal_item(ix);
+                    .child("Stack"),
+            );
+            panel = panel.children(pull_request_stack_rows(
+                &members, number, theme, icon_size,
+            ));
         }
-    }
-
-    /// One item of the pull request list: its files, then its checks and its
-    /// conversation, each under a title.
-    fn render_pull_request_item(&mut self, ix: usize, cx: &mut gpui::Context<Self>) -> AnyElement {
-        let theme = self.theme;
-        let secondary = theme.colors.foreground.secondary;
-        let Some((detail, selected_file)) = self.pull_request_rows.clone() else {
-            return div().into_any_element();
-        };
-        let section_title = |text: String| {
+        panel = panel.child(
             div()
-                .px_3()
-                .pt_3()
-                .pb_1()
+                .pt_2()
                 .text_size(theme.ui_text(12.0))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(text)
-                .into_any_element()
-        };
-        if let Some(file) = detail.files.get(ix) {
-            return div()
-                .id(SharedString::from(format!("pull_request_file_{ix}")))
-                .flex()
-                .items_center()
-                .gap_2()
-                .mx_1()
+                .child("Commits"),
+        );
+        let root_for_all = self.root_view.clone();
+        panel = panel.child(
+            div()
+                .id("pr_all_commits")
                 .px_2()
-                .py(px(3.0))
+                .py_1()
                 .rounded(px(theme.radii.control))
-                .control_interaction(
-                    controls::InteractionStyle::new(theme),
-                    controls::InteractionState::default().selected(
-                        selected_file == Some(ix),
-                        theme.colors.interaction.selected_background,
-                    ),
-                )
+                .bg(if commit_selection.cursor.is_none() {
+                    theme.colors.interaction.selected_background
+                } else {
+                    theme.colors.surface.panel
+                })
+                .child("All commits")
+                .cursor_pointer()
                 .on_activate(
                     false,
-                    controls::ControlActivation::Composite,
-                    cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        window.focus(&this.panel_focus_handle, cx);
-                        // The root repaints this pane; it can't while we're mid-update.
-                        let root = this.root_view.clone();
+                    crate::kit::interaction::ControlActivation::Composite,
+                    cx.listener(move |_this, _: &ClickEvent, window, cx| {
+                        window.focus(&_this.panel_focus_handle, cx);
+                        let root = root_for_all.clone();
                         cx.defer(move |cx| {
-                            let _ = root
-                                .update(cx, |root, cx| root.open_pull_request_diff(Some(ix), cx));
+                            let _ = root.update(cx, |root, cx| {
+                                root.select_pull_request_commit(None, cx);
+                            });
                         });
                     }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_size(theme.ui_text(12.0))
-                        .child(file.path.clone()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(theme.ui_text(11.0))
-                        .text_color(theme.colors.status.success.foreground)
-                        .child(format!("+{}", file.additions)),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(theme.ui_text(11.0))
-                        .text_color(theme.colors.status.danger.foreground)
-                        .child(format!("−{}", file.deletions)),
-                )
-                .into_any_element();
+                ),
+        );
+        let reviewed_ix = last_review
+            .ready()
+            .and_then(Option::as_ref)
+            .and_then(|last| {
+                detail
+                    .commits
+                    .iter()
+                    .position(|commit| commit.oid == last.commit_id)
+            });
+        let commits_truncated = detail
+            .commits
+            .first()
+            .is_some_and(|commit| commit.oid != detail.head_oid);
+        if commits_truncated {
+            panel = panel.child(line(
+                "Only the first 250 commits are listed; newer commits are on GitHub.".to_string(),
+            ));
         }
-        let mut ix = ix - detail.files.len();
-        if !detail.check_runs.is_empty() {
-            if ix == 0 {
-                return section_title(format!("Checks ({})", detail.check_runs.len()));
-            }
-            if let Some(run) = detail.check_runs.get(ix - 1) {
-                use crate::github::CheckState;
-                let (mark, color) = match run.state {
-                    CheckState::Failing => ("✗", theme.colors.status.danger.foreground),
-                    CheckState::Pending => ("•", theme.colors.status.warning.foreground),
-                    CheckState::Passing => ("✓", theme.colors.status.success.foreground),
-                };
-                return div()
-                    .px_3()
-                    .flex()
-                    .gap_2()
-                    .text_size(theme.ui_text(12.0))
-                    .child(div().flex_none().text_color(color).child(mark))
-                    .child(div().min_w(px(0.0)).truncate().child(run.name.clone()))
-                    .into_any_element();
-            }
-            ix -= detail.check_runs.len() + 1;
+        if let Some(last) = last_review.ready().and_then(Option::as_ref)
+            && reviewed_ix.is_none()
+            && !last.commit_id.is_empty()
+        {
+            panel = panel.child(line(
+                if commits_truncated {
+                    "Your last review's commit is outside the first 250 listed commits."
+                } else {
+                    "Your last review's commit is gone."
+                }
+                .to_string(),
+            ));
         }
-        if detail.conversation.is_empty() {
-            return div().into_any_element();
-        }
-        if ix == 0 {
-            return section_title(format!("Conversation ({})", detail.conversation.len()));
-        }
-        let Some(entry) = detail.conversation.get(ix - 1) else {
-            return div().into_any_element();
-        };
-        // GitHub text from anyone who can comment: plain text only.
-        div()
-            .px_3()
-            .py_1()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
+        let selected_range = commit_selection.range(detail.commits.len());
+        let now = std::time::SystemTime::now();
+        for (ix, commit) in detail.commits.iter().enumerate() {
+            let age = commit
+                .committed_at
+                .parse::<jiff::Timestamp>()
+                .ok()
+                .map(|at| super::super::date_time::format_relative_time(at.as_second(), now))
+                .unwrap_or_else(|| "date unknown".to_string());
+            let dot = if reviewed_ix.is_some_and(|reviewed| ix < reviewed) {
+                "● "
+            } else {
+                ""
+            };
+            let short = commit.oid.get(..7).unwrap_or(&commit.oid);
+            let selected = selected_range.is_some_and(|(first, last)| (first..=last).contains(&ix));
+            let root_for_commit = self.root_view.clone();
+            panel = panel.child(
                 div()
-                    .text_size(theme.ui_text(11.0))
-                    .text_color(secondary)
-                    .child(format!(
-                        "{} {} · {}",
-                        entry.author,
-                        entry.verb,
-                        entry.at.get(..10).unwrap_or(&entry.at)
-                    )),
-            )
-            .when(!entry.body.is_empty(), |row| {
-                row.child(
-                    div()
-                        .text_size(theme.ui_text(12.0))
-                        .child(entry.body.clone()),
-                )
-            })
+                    .id(SharedString::from(format!("pr_commit_{ix}")))
+                    .px_2()
+                    .py_1()
+                    .rounded(px(theme.radii.control))
+                    .bg(if selected {
+                        theme.colors.interaction.selected_background
+                    } else {
+                        theme.colors.surface.panel
+                    })
+                    .text_size(theme.ui_text(12.0))
+                    .child(format!("{dot}{short}  {} · {age}", commit.headline))
+                    .cursor_pointer()
+                    .on_activate(
+                        false,
+                        crate::kit::interaction::ControlActivation::Composite,
+                        cx.listener(move |_this, _: &ClickEvent, window, cx| {
+                            window.focus(&_this.panel_focus_handle, cx);
+                            let root = root_for_commit.clone();
+                            cx.defer(move |cx| {
+                                let _ = root.update(cx, |root, cx| {
+                                    root.select_pull_request_commit(Some(ix), cx);
+                                });
+                            });
+                        }),
+                    ),
+            );
+            if reviewed_ix == Some(ix) {
+                panel = panel.child(line("Your last review".to_string()));
+            }
+        }
+        let scroll_key = (detail.number, commit_selection.cursor);
+        if self.pr_details_scroll_key != Some(scroll_key) {
+            let target = commit_selection.cursor.map_or(0, |ix| {
+                let checks = detail
+                    .check_runs
+                    .iter()
+                    .filter(|run| run.state != crate::github::CheckState::Passing)
+                    .count();
+                let notices =
+                    usize::from(detail.too_large_for_app())
+                        + usize::from(listing || files_error.is_some())
+                        + usize::from(commits_truncated)
+                        + usize::from(last_review.ready().and_then(Option::as_ref).is_some_and(
+                            |last| reviewed_ix.is_none() && !last.commit_id.is_empty(),
+                        ));
+                8 + checks
+                    + notices
+                    + detail.reviewers.len().max(1)
+                    + ix
+                    + usize::from(reviewed_ix.is_some_and(|reviewed| reviewed < ix))
+            });
+            self.pr_details_scroll.scroll_to_item(target);
+            self.pr_details_scroll_key = Some(scroll_key);
+        }
+        panel
+            .child(line(
+                "space checkout · r review · M merge · o GitHub".to_owned(),
+            ))
             .into_any_element()
     }
 }
 
-/// The pull request list's items: files, then checks and conversation, each
-/// with a title when there are any.
-fn pull_request_item_count(detail: &crate::github::PullRequestDetail) -> usize {
-    let section = |len: usize| if len == 0 { 0 } else { len + 1 };
-    detail.files.len() + section(detail.check_runs.len()) + section(detail.conversation.len())
+/// The Stack section's rows: every pull request in the stack, base at the
+/// bottom like GitHub's own stack map, each with its state, review and
+/// checks symbols; `current` is highlighted.
+fn pull_request_stack_rows(
+    members: &[crate::github::PullRequestSummary],
+    current: u64,
+    theme: AppTheme,
+    icon_size: Pixels,
+) -> Vec<AnyElement> {
+    let secondary = theme.colors.foreground.secondary;
+    let total = members.len();
+    // Depth from the stack's base (0 = bottom), following real base/head
+    // parent links (`stack_depth`) rather than this list's own order, which
+    // a tree (two children on the same pull request) can put out of a line.
+    let numbers: Vec<u64> = members.iter().map(|member| member.number).collect();
+    members
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(ix, member)| {
+            let position = crate::github::stack_depth(&numbers, member.number, members)
+                .unwrap_or(ix);
+            let highlighted = member.number == current;
+            let (_, member_title) = super::super::pr_symbols::title(&member.title);
+            let mut row = div()
+                .id(SharedString::from(format!("pr_stack_{}", member.number)))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .py(px(1.0))
+                .rounded(px(theme.radii.control))
+                .text_size(theme.ui_text(12.0))
+                .when(highlighted, |row| {
+                    row.bg(theme.colors.interaction.selected_background)
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(secondary)
+                        .child(format!("{}/{total}", position + 1)),
+                )
+                .child(
+                    super::super::pr_symbols::state("OPEN", member.is_draft, theme).render(
+                        format!("pr_stack_{}_state", member.number),
+                        theme,
+                        icon_size,
+                    ),
+                );
+            if let Some(review) = member.review {
+                row = row.child(super::super::pr_symbols::review(review, theme).render(
+                    format!("pr_stack_{}_review", member.number),
+                    theme,
+                    icon_size,
+                ));
+            }
+            if let Some(checks) = super::super::pr_symbols::checks(member.checks, theme) {
+                row = row.child(checks.render(
+                    format!("pr_stack_{}_checks", member.number),
+                    theme,
+                    icon_size,
+                ));
+            }
+            row.child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(if highlighted {
+                        theme.colors.foreground.primary
+                    } else {
+                        secondary
+                    })
+                    .child(format!("{member_title} #{}", member.number)),
+            )
+            .into_any_element()
+        })
+        .collect()
 }
 
 impl Render for DetailsPaneView {

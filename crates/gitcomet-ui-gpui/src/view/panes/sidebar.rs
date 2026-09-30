@@ -11,7 +11,7 @@ use gitcomet_core::domain::{FileEntry, FileEntryKind, LogScope};
 use gitcomet_state::model::{Loadable, SidebarDataRequest, SidebarMode};
 use gitcomet_state::msg::Msg;
 use palette::IntoColor;
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -3248,17 +3248,20 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (number, title, current, since, counts) = {
+        let (number, title, current, since, range_hidden, counts, stacked_on) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return div().into_any_element();
             };
-            // Up to 3,000 files: only the listed indices are kept here, and
-            // the per-file counts come from one pass over comments and
-            // threads; the rows on screen read the rest as they paint.
-            self.review_rows = (0..review.files.len())
-                .filter(|ix| review.file_listed(*ix))
-                .collect();
+            let stacked_on = root
+                .pull_requests
+                .repo(review.repo_id)
+                .and_then(|prs| prs.stack_neighbor(review.number, -1));
+            // Up to 3,000 files: the per-file counts come from one pass over
+            // comments and threads; the rows on screen read the rest as they
+            // paint. Which indices are listed, and how they lay out under
+            // Flat/Tree, come from `review_file_list_plan` below — the same
+            // plan keyboard navigation walks, built once this render.
             let mut file_counts: rustc_hash::FxHashMap<String, ReviewFileCounts> =
                 Default::default();
             for comment in &review.draft.comments {
@@ -3278,7 +3281,37 @@ impl SidebarPaneView {
             self.review_file_counts = file_counts;
             let changed = review.files_changed_since_review();
             let short = |oid: &str| oid.chars().take(7).collect::<String>();
-            let since = if let Some(base) = review.since_base() {
+            let range_hidden = review
+                .commit_range
+                .as_ref()
+                .and_then(|range| range.changes.ready())
+                .map(|changes| {
+                    review
+                        .all_files
+                        .iter()
+                        .filter(|path| !changes.files.contains(*path))
+                        .count()
+                });
+            let since = if let Some(range) = &review.commit_range {
+                Some(match &range.changes {
+                    super::super::pull_requests::PrLoad::Ready(_) => format!(
+                        "{} of {} commits · {}..{}{} · C picks range",
+                        range.selection.count,
+                        range.selection.total,
+                        short(&range.selection.oldest_oid),
+                        short(&range.selection.newest_oid),
+                        if review.historical_range() {
+                            " · line comments read-only"
+                        } else {
+                            ""
+                        }
+                    ),
+                    super::super::pull_requests::PrLoad::Failed(err) => {
+                        format!("Couldn't load selected range: {err} · C picks another")
+                    }
+                    _ => "Loading selected commit range…".to_string(),
+                })
+            } else if let Some(base) = review.since_base() {
                 Some(format!(
                     "Since your last review · {}..{} · L shows all",
                     short(base),
@@ -3297,15 +3330,16 @@ impl SidebarPaneView {
             } else {
                 None
             };
+            // Generated files don't count toward viewed progress, shown or not.
             let viewed_all = review
                 .files
                 .iter()
-                .filter(|path| review.draft.viewed.contains(*path))
+                .filter(|path| !review.is_generated(path) && review.draft.viewed.contains(*path))
                 .count();
             // Files past the first 100 still coming, and of how many; or the
             // pages that never came.
             let listing = root
-                .pull_request_files_listing(review.repo_id, review.number)
+                .review_files_listing()
                 .then(|| {
                     root.pull_requests
                         .repo(review.repo_id)
@@ -3314,14 +3348,14 @@ impl SidebarPaneView {
                         .map(|detail| detail.changed_files.min(crate::github::MAX_LISTED_FILES))
                 })
                 .flatten();
-            let files_missing = root
-                .pull_request_files_error(review.repo_id, review.number)
-                .is_some();
+            let files_missing = root.review_files_missing();
             let counts = (
                 viewed_all,
-                review.files.len(),
+                review.non_generated_file_count(),
                 review.viewed_hidden(),
                 review.show_viewed,
+                review.generated_hidden(),
+                review.show_generated,
                 !review.query.is_empty(),
                 listing,
                 files_missing,
@@ -3331,18 +3365,49 @@ impl SidebarPaneView {
                 review.title.clone(),
                 review.file_ix,
                 since,
+                range_hidden,
                 counts,
+                stacked_on,
             )
         };
-        let (viewed, total, hidden, show_viewed, filtering, listing, files_missing) = counts;
+        // The same plan keyboard navigation walks (`review_file_list_plan`),
+        // built once here rather than a second tree for the rows to read.
+        let (listed_indices, plan) = root
+            .update(cx, |root, cx| root.review_file_list_plan(cx))
+            .unwrap_or_else(|| {
+                (
+                    Arc::from([]),
+                    Arc::new(crate::view::rows::FileListPlan::flat(0)),
+                )
+            });
+        self.review_rows = listed_indices.to_vec();
+        let row_count = plan.row_len();
+        let (
+            viewed,
+            total,
+            hidden,
+            show_viewed,
+            generated_hidden,
+            show_generated,
+            filtering,
+            listing,
+            files_missing,
+        ) = counts;
         let listed = self.review_rows.len();
-        // Keep the open file in view as j/k, ]/[ and space move it.
-        if self.review_scrolled_to != Some(current)
-            && let Ok(row) = self.review_rows.binary_search(&current)
-        {
-            self.review_files_scroll
-                .scroll_to_item(row, gpui::ScrollStrategy::Nearest);
-            self.review_scrolled_to = Some(current);
+        // Keep the open file's row in view as j/k, ]/[ and space move it.
+        if self.review_scrolled_to != Some(current) {
+            let row = self
+                .review_rows
+                .iter()
+                .position(|&ix| ix == current)
+                .and_then(|position| {
+                    plan.row_ix_for_ordinal(crate::view::rows::FileOrdinal(position))
+                });
+            if let Some(row) = row {
+                self.review_files_scroll
+                    .scroll_to_item(row.0, gpui::ScrollStrategy::Nearest);
+                self.review_scrolled_to = Some(current);
+            }
         }
         let query_text = self.review_query_input.read(cx).text().to_string();
         // "18 files · 7 viewed hidden (V shows)", and the filter when set.
@@ -3350,10 +3415,21 @@ impl SidebarPaneView {
             "{listed} file{}",
             if listed == 1 { "" } else { "s" }
         )];
+        if let Some(hidden) = range_hidden {
+            state.push(format!("{hidden} outside range hidden"));
+        }
         if hidden > 0 {
             state.push(format!("{hidden} viewed hidden (V shows)"));
         } else if show_viewed {
             state.push("viewed shown (V hides)".to_string());
+        }
+        if generated_hidden > 0 {
+            state.push(format!(
+                "{generated_hidden} generated file{} hidden (Shift+G shows)",
+                if generated_hidden == 1 { "" } else { "s" }
+            ));
+        } else if show_generated {
+            state.push("generated files shown (Shift+G hides)".to_string());
         }
         if filtering {
             state.push(format!("/ {}", query_text.trim()));
@@ -3364,15 +3440,29 @@ impl SidebarPaneView {
             state.push("some files missing · R retries".to_string());
         }
         let state = state.join(" · ");
-        let empty = (listed == 0).then_some(if listing.is_some() && !filtering {
-            "Still listing the pull request's files."
-        } else if hidden > 0 && !filtering {
-            "All files viewed. V shows them."
-        } else if filtering {
-            "No file matches the filter. Esc clears it."
-        } else {
-            "No files to show. L shows all of them."
-        });
+        let empty = (listed == 0).then_some(
+            if since
+                .as_deref()
+                .is_some_and(|line| line.starts_with("Loading selected"))
+            {
+                "Loading the selected commit range…"
+            } else if since
+                .as_deref()
+                .is_some_and(|line| line.starts_with("Couldn't load selected"))
+            {
+                "Couldn't load this range. C picks another scope."
+            } else if range_hidden.is_some() && total == 0 {
+                "No files in this commit range. C picks another scope."
+            } else if listing.is_some() && !filtering {
+                "Still listing the pull request's files."
+            } else if hidden > 0 && !filtering {
+                "All files viewed. V shows them."
+            } else if filtering {
+                "No file matches the filter. Esc clears it."
+            } else {
+                "No files to show. L shows all of them."
+            },
+        );
         let query_bar = (self.review_query_open || filtering).then(|| {
             div()
                 .mx_2()
@@ -3387,7 +3477,7 @@ impl SidebarPaneView {
         let accent = theme.colors.status.info.foreground;
         let list = uniform_list(
             "review_file_rows",
-            listed,
+            row_count,
             cx.processor(Self::render_review_file_rows),
         )
         .flex_1()
@@ -3412,7 +3502,12 @@ impl SidebarPaneView {
                         div()
                             .text_size(theme.ui_text(12.0))
                             .text_color(secondary)
-                            .child(format!("Reviewing #{number} · {viewed} of {total} viewed")),
+                            .child(match stacked_on {
+                                Some(base) => format!(
+                                    "Reviewing #{number} · stacked on #{base} · {viewed} of {total} viewed"
+                                ),
+                                None => format!("Reviewing #{number} · {viewed} of {total} viewed"),
+                            }),
                     )
                     .child(
                         div()
@@ -3472,6 +3567,7 @@ impl SidebarPaneView {
             return Vec::new();
         };
         let theme = this.theme;
+        let ui_scale_percent = ui_scale::current(cx).percent;
         // Two lines of text, which grow with the UI font, and the air around.
         let scale = ui_scale::UiScale::current(cx);
         let row_height = scale.px(8.0) + (scale.ui_text(12.5) + scale.ui_text(11.0)) * 1.618;
@@ -3479,53 +3575,124 @@ impl SidebarPaneView {
         let success = theme.colors.status.success.foreground;
         let warning = theme.colors.status.warning.foreground;
         let accent = theme.colors.status.info.foreground;
-        let rows: Vec<_> = {
+        let (repo_id, dir_cursor) = {
             let root = root.read(cx);
             let Some(review) = root.active_review() else {
                 return Vec::new();
             };
-            range
-                .filter_map(|row| this.review_rows.get(row).copied())
-                .filter_map(|ix| {
+            (review.repo_id, review.sidebar_dir_cursor.clone())
+        };
+        let Some((listed, plan)) = root.update(cx, |root, cx| root.review_file_list_plan(cx))
+        else {
+            return Vec::new();
+        };
+        let is_tree = plan.is_tree();
+        let rows: Vec<_> = range
+            .filter_map(|row_ix| {
+                plan.row_at(crate::view::rows::RowIx(row_ix))
+                    .map(|row| (row_ix, row))
+            })
+            .collect();
+        rows.into_iter()
+            .filter_map(|(row_ix, row)| {
+                let (ix, depth) = match row {
+                    crate::view::rows::FileListRow::Directory {
+                        key,
+                        label,
+                        depth,
+                        collapsed,
+                        chain,
+                        ..
+                    } => {
+                        let dir_selected = dir_cursor.as_deref() == Some(key.as_ref());
+                        return Some(
+                            crate::view::rows::directory_row(crate::view::rows::DirectoryRowProps {
+                                theme,
+                                ui_scale_percent,
+                                id: ("review_file_dir", row_ix).into(),
+                                label: &label,
+                                depth,
+                                collapsed,
+                                selected: dir_selected,
+                                additions: None,
+                                deletions: None,
+                                row_height,
+                                row_group: None,
+                                detail: crate::view::rows::DirectoryRowDetail::LabelOnly,
+                            })
+                            .debug_selector(move || format!("review_file_dir_{row_ix}"))
+                            .on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, e: &ClickEvent, window, cx| {
+                                    if !e.standard_click() {
+                                        return;
+                                    }
+                                    window.focus(&this.panel_focus_handle, cx);
+                                    let root = this.root_view.clone();
+                                    let key = key.clone();
+                                    let chain = chain.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = root.update(cx, |root, cx| {
+                                            root.toggle_review_file_list_dir(
+                                                repo_id, key, chain, collapsed, cx,
+                                            );
+                                        });
+                                    });
+                                }),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                    crate::view::rows::FileListRow::File { ordinal, depth } => {
+                        (*listed.get(ordinal.0)?, depth)
+                    }
+                };
+                let (path, is_viewed, updated, dismissed, is_generated, is_current) = {
+                    let root = root.read(cx);
+                    let review = root.active_review()?;
                     let path = review.files.get(ix)?.clone();
-                    let counts = this
-                        .review_file_counts
-                        .get(&path)
-                        .copied()
-                        .unwrap_or_default();
-                    Some((
-                        ix,
+                    (
+                        path.clone(),
                         review.draft.viewed.contains(&path),
                         review.changed_since_review(&path),
                         review.dismissed.contains(&path),
-                        counts,
-                        path,
+                        review.is_generated(&path),
                         ix == review.file_ix,
-                    ))
-                })
-                .collect()
-        };
-        rows.into_iter()
-            .map(
-                |(ix, is_viewed, updated, dismissed, counts, path, is_current)| {
-                    let name = path
-                        .rsplit_once('/')
-                        .map_or(path.as_str(), |(_, name)| name)
-                        .to_string();
-                    let folder = path.rsplit_once('/').map(|(folder, _)| folder.to_string());
-                    let ReviewFileCounts {
-                        comments,
-                        threads,
-                        outdated,
-                    } = counts;
+                    )
+                };
+                let counts = this
+                    .review_file_counts
+                    .get(&path)
+                    .copied()
+                    .unwrap_or_default();
+                let name = path
+                    .rsplit_once('/')
+                    .map_or(path.as_str(), |(_, name)| name)
+                    .to_string();
+                let folder = (!is_tree)
+                    .then(|| path.rsplit_once('/').map(|(folder, _)| folder.to_string()))
+                    .flatten();
+                let ReviewFileCounts {
+                    comments,
+                    threads,
+                    outdated,
+                } = counts;
+                Some(
                     div()
-                        .id(("review_file", ix))
+                        .id(("review_file", row_ix))
+                        .debug_selector(move || format!("review_file_{ix}"))
                         .h(row_height)
                         .flex()
                         .items_center()
                         .gap_2()
                         .mx_1()
-                        .px_2()
+                        .pl(if is_tree {
+                            crate::view::rows::file_row_indent_px(depth, ui_scale_percent)
+                        } else {
+                            px(8.0)
+                        })
+                        .pr_2()
                         .rounded(px(theme.radii.control))
                         .control_interaction(
                             controls::InteractionStyle::new(theme),
@@ -3587,6 +3754,15 @@ impl SidebarPaneView {
                                     )
                                 }),
                         )
+                        .when(is_generated, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .text_color(secondary)
+                                    .child("generated"),
+                            )
+                        })
                         .when(updated, |row| {
                             row.child(
                                 div()
@@ -3643,9 +3819,9 @@ impl SidebarPaneView {
                                     .child(comments.to_string()),
                             )
                         })
-                        .into_any_element()
-                },
-            )
+                        .into_any_element(),
+                )
+            })
             .collect()
     }
 
@@ -3661,13 +3837,14 @@ impl SidebarPaneView {
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
-        let (has_github, list, selected) = {
+        let (has_github, list, selected, stacks) = {
             let root = root.read(cx);
             let prs = root.active_pull_requests();
             (
                 root.github_target().is_some(),
                 prs.map(|prs| prs.list.clone()).unwrap_or_default(),
                 prs.and_then(|prs| prs.selected),
+                prs.map(|prs| prs.stacks.clone()).unwrap_or_default(),
             )
         };
         if has_github && matches!(list, PrLoad::Idle) {
@@ -3705,7 +3882,7 @@ impl SidebarPaneView {
                 "No open pull requests",
                 "n opens one from the checked-out branch.".to_string(),
             ),
-            PrLoad::Ready(list) => self.pull_request_rows(theme, &list, selected, cx),
+            PrLoad::Ready(list) => self.pull_request_rows(theme, &list, selected, &stacks, cx),
         }
     }
 
@@ -3714,11 +3891,25 @@ impl SidebarPaneView {
         theme: AppTheme,
         list: &[crate::github::PullRequestSummary],
         selected: Option<u64>,
+        stacks: &[crate::github::PullRequestStack],
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
-        use crate::github::ReviewDecision;
-
+        // Depth from the stack's base (0 = bottom) and stack size, for the
+        // indented "2/3" rows. Depth follows real base/head parent links
+        // (`stack_depth`), not the flattened member order, which a tree
+        // (two children on the same pull request) can put out of a line.
+        let stack_position: FxHashMap<u64, (usize, usize)> = stacks
+            .iter()
+            .flat_map(|stack| {
+                let total = stack.members.len();
+                stack.members.iter().filter_map(move |number| {
+                    crate::github::stack_depth(&stack.members, *number, list)
+                        .map(|depth| (*number, (depth, total)))
+                })
+            })
+            .collect();
         let secondary = theme.colors.foreground.secondary;
+        let icon_size = crate::ui_scale::UiScale::current(cx).px(14.0);
         let drafts = self
             .root_view
             .upgrade()
@@ -3728,10 +3919,8 @@ impl SidebarPaneView {
                     .map(|prs| prs.drafts.clone())
             })
             .unwrap_or_default();
-        let ranks: Vec<u8> = list
-            .iter()
-            .map(|pr| super::super::pull_requests::inbox_rank(pr, &drafts))
-            .collect();
+        let ranks: Vec<u8> =
+            super::super::pull_requests::stack_adjusted_ranks(list, &drafts, stacks);
         // Section titles only once something is waiting on you.
         let sectioned = ranks.iter().any(|rank| *rank < 2);
         let header = div()
@@ -3760,43 +3949,40 @@ impl SidebarPaneView {
 
         let row = |pr: &crate::github::PullRequestSummary| {
             let number = pr.number;
-            let mut badges: Vec<(String, gpui::Rgba)> = Vec::new();
-            if let Some(pending) = drafts.get(&number) {
-                badges.push((
-                    format!("{pending} drafted"),
-                    theme.colors.status.warning.foreground,
+            let stack_depth = stack_position.get(&number).map(|(ix, _)| *ix).unwrap_or(0);
+            let stack_pos = stack_position.get(&number).copied();
+            let (kind, title) = super::super::pr_symbols::title(&pr.title);
+            let mut symbols = Vec::new();
+            if let Some(review) = pr.review {
+                symbols.push(super::super::pr_symbols::review(review, theme).render(
+                    format!("pr_{number}_review"),
+                    theme,
+                    icon_size,
                 ));
             }
-            if pr.is_draft {
-                badges.push(("Draft".to_string(), secondary));
+            if let Some(checks) = super::super::pr_symbols::checks(pr.checks, theme) {
+                symbols.push(checks.render(format!("pr_{number}_checks"), theme, icon_size));
             }
-            if let Some(review) = pr.review {
-                let color = match review {
-                    ReviewDecision::Approved => theme.colors.status.success.foreground,
-                    ReviewDecision::ChangesRequested => theme.colors.status.danger.foreground,
-                    ReviewDecision::ReviewRequired => theme.colors.status.warning.foreground,
-                };
-                badges.push((review.label().to_string(), color));
+            if let Some(pending) = drafts.get(&number) {
+                symbols.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(super::super::pr_symbols::pending(*pending, theme).render(
+                            format!("pr_{number}_pending"),
+                            theme,
+                            icon_size,
+                        ))
+                        .child(pending.to_string())
+                        .into_any_element(),
+                );
             }
-            let checks = pr.checks;
-            if checks.total() > 0 {
-                let (label, color) = if checks.failing > 0 {
-                    (
-                        format!("{} failing", checks.failing),
-                        theme.colors.status.danger.foreground,
-                    )
-                } else if checks.pending > 0 {
-                    (
-                        format!("{} pending", checks.pending),
-                        theme.colors.status.warning.foreground,
-                    )
-                } else {
-                    (
-                        format!("{} passing", checks.passing),
-                        theme.colors.status.success.foreground,
-                    )
-                };
-                badges.push((label, color));
+            if pr.review_requested {
+                symbols.push(super::super::pr_symbols::at_pill(
+                    theme,
+                    SharedString::from(format!("pr_{number}_at")),
+                ));
             }
             div()
                 .id(SharedString::from(format!("pull_request_row_{number}")))
@@ -3804,6 +3990,7 @@ impl SidebarPaneView {
                 .flex_col()
                 .gap(px(2.0))
                 .mx_1()
+                .ml(px(2.0 + stack_depth as f32 * 14.0))
                 .px_2()
                 .py_1()
                 .rounded(px(theme.radii.control))
@@ -3829,9 +4016,62 @@ impl SidebarPaneView {
                 )
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .text_size(theme.ui_text(13.0))
-                        .truncate()
-                        .child(pr.title.clone()),
+                        .when(stack_depth > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(secondary)
+                                    .child("└"),
+                            )
+                        })
+                        .child(
+                            super::super::pr_symbols::state("OPEN", pr.is_draft, theme).render(
+                                format!("pr_{number}_state"),
+                                theme,
+                                icon_size,
+                            ),
+                        )
+                        .when_some(stack_pos, |row, (ix, total)| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .rounded(px(3.0))
+                                    .px_1()
+                                    .bg(theme.colors.surface.panel)
+                                    .text_size(theme.ui_text(10.0))
+                                    .text_color(secondary)
+                                    .child(format!("{}/{total}", ix + 1)),
+                            )
+                        })
+                        .when(pr.is_mine, |row| {
+                            row.child(super::super::pr_symbols::person(theme).render(
+                                format!("pr_{number}_mine"),
+                                theme,
+                                icon_size,
+                            ))
+                        })
+                        .when_some(kind, |row, kind| {
+                            row.child(super::super::pr_symbols::kind_tag(
+                                kind,
+                                theme,
+                                theme.ui_text(10.0),
+                            ))
+                        })
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_color(if pr.is_draft {
+                                    secondary
+                                } else {
+                                    theme.colors.foreground.primary
+                                })
+                                .child(title.to_owned()),
+                        ),
                 )
                 .child(
                     div()
@@ -3839,13 +4079,11 @@ impl SidebarPaneView {
                         .gap_2()
                         .text_size(theme.ui_text(11.0))
                         .text_color(secondary)
-                        .child(div().truncate().child(format!(
+                        .child(div().flex_1().min_w(px(0.0)).truncate().child(format!(
                             "#{number} · {} · {} → {}",
                             pr.author, pr.head, pr.base
                         )))
-                        .children(badges.into_iter().map(|(label, color)| {
-                            div().flex_none().text_color(color).child(label)
-                        })),
+                        .children(symbols),
                 )
                 .into_any_element()
         };
@@ -3861,12 +4099,21 @@ impl SidebarPaneView {
                 let count = ranks.iter().filter(|other| **other == rank).count();
                 rows.push(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .px_3()
                         .pt_2()
                         .pb_1()
                         .text_size(theme.ui_text(11.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(secondary)
+                        .when(rank == 0, |header| {
+                            header.child(super::super::pr_symbols::at_pill(
+                                theme,
+                                "pr_section_at_pill",
+                            ))
+                        })
                         .child(format!("{title} · {count}"))
                         .into_any_element(),
                 );

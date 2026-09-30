@@ -134,6 +134,12 @@ index 1111111..2222222 100644
                 (anchor.side, anchor.line, anchor.start),
                 (ReviewSide::Right, 6, None)
             );
+            pane.review_comment_scope = crate::view::panes::main::ReviewCommentScope::Historical;
+            assert!(
+                pane.review_selection_anchor(path)
+                    .unwrap_err()
+                    .contains("current head")
+            );
 
             // t/T: step between thread lines, either side.
             let threads = [(ReviewSide::Right, 9), (ReviewSide::Left, 6)];
@@ -191,6 +197,130 @@ line six"
 
             pane.review_active = false;
             assert_eq!(pane.review_mark_side(7), None);
+        });
+    });
+}
+
+#[gpui::test]
+fn review_markdown_block_cursor_moves_by_block_and_maps_back_to_a_source_line(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    // A heading, then two paragraphs; only the second changed.
+    let old_text = "# Title\n\nfirst\n\nsecond before\n";
+    let new_text = "# Title\n\nfirst\n\nsecond after\n";
+    let preview = crate::view::markdown_preview::build_markdown_diff_preview(old_text, new_text)
+        .expect("fixture markdown should parse");
+    let blocks = preview.inline_blocks.clone();
+    assert!(
+        blocks.len() >= 3,
+        "fixture should parse into a heading and two paragraph blocks: {blocks:?}"
+    );
+    let block_rows: Vec<usize> = blocks.iter().map(|block| block.row_range().start).collect();
+    // Independently derived from the same document, so this doesn't just
+    // restate `markdown_preview_cursor_source_line`'s own arithmetic.
+    let expected_line = |row_ix: usize| preview.inline.rows[row_ix].source_line_range.start as u32 + 1;
+    let expected_side = |row_ix: usize| {
+        if preview.inline_old.get(row_ix).copied().unwrap_or(false) {
+            ReviewSide::Left
+        } else {
+            ReviewSide::Right
+        }
+    };
+    let last_row = *block_rows.last().unwrap();
+    let (last_line, last_side) = (expected_line(last_row), expected_side(last_row));
+
+    cx.update(|_window, app| {
+        let main_pane = view.read(app).main_pane.clone();
+        main_pane.update(app, |pane, cx| {
+            pane.diff_markdown.preview =
+                gitcomet_state::model::Loadable::Ready(Arc::new(preview));
+            pane.diff_view = DiffViewMode::Inline;
+            pane.rendered_preview_modes
+                .set(RenderedPreviewKind::Markdown, RenderedPreviewMode::Rendered);
+
+            // With nothing focused, the first `j` goes to the first block, not
+            // the first *changed* block; each `j` after lands on the next
+            // block's row, not the next diff line.
+            for &row in &block_rows {
+                assert!(pane.review_move_markdown_block_cursor(1, cx));
+                assert_eq!(pane.diff_selection_range, Some((row, row)));
+            }
+            let (side, line) = pane
+                .markdown_preview_cursor_source_line()
+                .expect("the last block has a source line");
+            assert_eq!((side, line), (last_side, last_line));
+
+            // Stops at the last block.
+            assert!(!pane.review_move_markdown_block_cursor(1, cx));
+            assert_eq!(pane.diff_selection_range, Some((last_row, last_row)));
+
+            // `k` steps back by block too, not by row.
+            for &row in block_rows[..block_rows.len() - 1].iter().rev() {
+                assert!(pane.review_move_markdown_block_cursor(-1, cx));
+                assert_eq!(pane.diff_selection_range, Some((row, row)));
+            }
+            assert_eq!(
+                pane.diff_selection_range,
+                Some((block_rows[0], block_rows[0]))
+            );
+            // Stops at the first block.
+            assert!(!pane.review_move_markdown_block_cursor(-1, cx));
+        });
+    });
+}
+
+#[gpui::test]
+fn review_markdown_cursor_in_split_view_falls_back_to_the_old_side_for_a_deleted_block(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    // A heading and a kept paragraph, then a paragraph removed entirely
+    // (present only on the old side) — split view aligns it with padding on
+    // the new side at the same row.
+    let old_text = "# Title\n\nkept\n\ndeleted paragraph\n";
+    let new_text = "# Title\n\nkept\n";
+    let preview = crate::view::markdown_preview::build_markdown_diff_preview(old_text, new_text)
+        .expect("fixture markdown should parse");
+
+    let deleted_row_ix = preview
+        .old
+        .rows
+        .iter()
+        .position(|row| row.text.as_ref() == "deleted paragraph")
+        .expect("the deleted paragraph should have a row on the old side");
+    let expected_line = preview.old.rows[deleted_row_ix].source_line_range.start as u32 + 1;
+    assert!(
+        preview
+            .new
+            .rows
+            .get(deleted_row_ix)
+            .is_none_or(|row| row.is_alignment_padding()),
+        "split view aligns the deleted block with padding on the new side, not a real row"
+    );
+
+    cx.update(|_window, app| {
+        let main_pane = view.read(app).main_pane.clone();
+        main_pane.update(app, |pane, _| {
+            pane.diff_view = DiffViewMode::Split;
+            pane.diff_markdown.preview =
+                gitcomet_state::model::Loadable::Ready(Arc::new(preview));
+            pane.diff_selection_anchor = Some(deleted_row_ix);
+            pane.diff_selection_range = Some((deleted_row_ix, deleted_row_ix));
+
+            let (side, line) = pane
+                .markdown_preview_cursor_source_line()
+                .expect("the deleted block has a source line on the old side");
+            assert_eq!(side, ReviewSide::Left);
+            assert_eq!(line, expected_line);
         });
     });
 }

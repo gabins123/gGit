@@ -92,6 +92,7 @@ dekobon-tree-sitter-groovy = "0.3.0"
 fontdb = "0.24.0"
 futures = "0.3.34"
 gix = { version = "0.88.0", default-features = false, features = ["max-performance-safe", "comfort", "basic", "status", "blame", "sha1"] }
+glob = "0.3.4"
 gpui = { package = "gpui-ce", git = "https://github.com/Havunen/gpui-ce.git", rev = "dd2493af9c5acfbcdee8a625570d566d9247296b" }
 gpui_platform = { package = "gpui_ce_platform", git = "https://github.com/Havunen/gpui-ce.git", rev = "dd2493af9c5acfbcdee8a625570d566d9247296b", features = ["font-kit"] }
 image = "0.25.10"
@@ -304,6 +305,13 @@ opt-level = 1
 
 [profile.test.package."*"]
 opt-level = 1
+
+# The UI crate dominates test build time. At opt-level 0 its test binary rebuilds
+# in ~32s instead of ~72s after an edit, while the 4.3k tests run in ~145s
+# instead of ~121s (Windows, 12 cores), so both edit-test loops and full runs
+# come out ahead. ci-test makes the same choice.
+[profile.test.package.gitcomet-ui-gpui]
+opt-level = 0
 
 # CI avoids generating and packaging debugger symbols on ephemeral runners.
 # Keep algorithm/dependency optimization; the large UI crate favors fast builds.

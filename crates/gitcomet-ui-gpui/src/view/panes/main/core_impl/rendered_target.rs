@@ -40,6 +40,33 @@ impl MainPaneView {
         }
     }
 
+    /// Whether the diff pane's body is (or would be) the image diff: an image
+    /// is loaded for the target, and — for an SVG specifically, which also
+    /// has a Code view — the toggle currently says Rendered. An image has no
+    /// collapsed form, so this does not consult `diff_content_mode`.
+    pub(in crate::view) fn wants_image_diff(&self) -> bool {
+        let has_image = self
+            .rendered_file_image_diff_loadable()
+            .is_some_and(|file| !matches!(file, Loadable::NotLoaded));
+        has_image
+            && (!matches!(
+                crate::view::diff_target_rendered_preview_kind(self.rendered_diff_target()),
+                Some(RenderedPreviewKind::Svg)
+            ) || self.rendered_preview_modes.get(RenderedPreviewKind::Svg)
+                == RenderedPreviewMode::Rendered)
+    }
+
+    /// Whether Swipe and Onion skin can actually paint right now: both need
+    /// the image diff's two sides decoded to raw frames. The rare
+    /// SVG-render-failure fallback only has a file path for `gpui::img`, so
+    /// those modes are unavailable and the view (and Alt+V/`,`/`.`) fall back
+    /// to Side by side instead of leaving the picked mode unusable — or
+    /// silently changing a divider/opacity nothing is drawing.
+    pub(in crate::view) fn image_diff_overlay_modes_available(&self) -> bool {
+        self.file_image_diff_cache_old_svg_path.is_none()
+            && self.file_image_diff_cache_new_svg_path.is_none()
+    }
+
     pub(in crate::view) fn rendered_file_diff_rev(&self) -> u64 {
         self.active_inline_submodule_diff()
             .map(|inline| inline.diff_file_rev)

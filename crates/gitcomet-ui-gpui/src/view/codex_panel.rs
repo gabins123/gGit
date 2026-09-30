@@ -8,7 +8,22 @@
 
 use super::*;
 use crate::codex::{self, CodexError, CodexRequest};
+use crate::reviewer;
 use gitcomet_core::services::CancellationToken;
+
+/// How a run's answer is read back, decided by what asked for it.
+/// [`super::reviewer_menu`]'s `b` and `r` actions ask Codex for small JSON
+/// structures instead of prose; everything else keeps today's plain text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ResultShape {
+    PlainText,
+    /// `b` (brief me): a JSON array of [`reviewer::BriefRow`].
+    BriefRows,
+    /// `r` (review against the rules): a JSON object of checklist verdicts
+    /// and line findings (the findings become suggestions, same as today's
+    /// `ReviewSuggestions` destination).
+    RuleReview,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodexAction {
@@ -66,24 +81,89 @@ struct CodexRun {
     answer: String,
     cancel: CancellationToken,
     seq: u64,
+    shape: ResultShape,
+    /// Parsed from `answer` when `shape` is `BriefRows`; empty (and the raw
+    /// `answer` shown instead) when Codex's JSON didn't parse.
+    rows: Vec<reviewer::BriefRow>,
+    /// Parsed from `answer` when `shape` is `RuleReview` and it parsed.
+    /// Left empty (with the raw answer shown instead) on malformed JSON —
+    /// never cleared just because parsing failed.
+    verdicts: Vec<reviewer::ChecklistVerdict>,
+    /// A `RuleReview` answer's line findings, shown as jumpable rows here
+    /// (in review mode, `enter` also lands on them) regardless of whether
+    /// they were also turned into suggestions.
+    findings: Vec<reviewer::RuleFinding>,
+    /// The pull request and head (or, on a commit range, its range head)
+    /// `rows`/`findings`' line numbers are anchored to — set only for a
+    /// reviewer-menu dispatch (Brief/Review), the only ones that ever
+    /// produce a jumpable row; `None` for the plain menu. `enter` on a row
+    /// refuses the jump rather than landing on whatever review happens to be
+    /// open once this no longer matches it.
+    dispatched_for: Option<(u64, String)>,
+}
+
+/// What actually runs a request: `codex::run`, or in test builds a stub that
+/// refuses (`default_runner`), so no test can start the real binary. Not a
+/// test seam in practice: gpui's deterministic test scheduler refuses to let
+/// a test drive `dispatch_codex`'s `smol::unblock` background task to
+/// completion at all (any waker firing from that thread is treated as
+/// nondeterminism, whatever the task actually does) — which is exactly why
+/// no test in this crate ever calls `cx.run_until_parked()` after
+/// dispatching. Tests instead check the synchronous part of a dispatch:
+/// `codex_run_title_for_test`, `last_dispatch_instructions_for_test`,
+/// `last_dispatch_destination_for_test`, and (for the reviewer menu)
+/// `reviewer_scope_material_for_test`.
+pub(super) type CodexRunner =
+    Arc<dyn Fn(CodexRequest, &CancellationToken) -> Result<String, CodexError> + Send + Sync>;
+
+#[cfg(not(test))]
+fn default_runner() -> CodexRunner {
+    Arc::new(codex::run)
+}
+
+/// Test builds never start the real `codex`: a test that did drive a dispatch
+/// to completion would spend the developer's Codex account.
+#[cfg(test)]
+fn default_runner() -> CodexRunner {
+    // Named, never called: keeps the real runner compiled and used in test builds.
+    let _real_runner = codex::run;
+    Arc::new(|_, _| Err(CodexError::Failed("codex is disabled in tests".into())))
 }
 
 pub(super) struct CodexPanel {
     pub(super) focus_handle: FocusHandle,
     result_input: Entity<components::TextInput>,
     result_scroll: ScrollHandle,
-    ask_input: Entity<components::TextInput>,
+    pub(super) ask_input: Entity<components::TextInput>,
     _ask_subscription: gpui::Subscription,
+    _ask_blur_subscription: gpui::Subscription,
     _result_subscription: gpui::Subscription,
     runs: FxHashMap<RepoId, CodexRun>,
     pub(super) open: bool,
     /// The run whose answer the result box currently holds.
     shown: Option<(RepoId, u64)>,
     next_seq: u64,
+    /// `j`/`k` over `rows`/`findings`, when the shown run has any.
+    rows_cursor: usize,
+    runner: CodexRunner,
+    /// The last dispatch's instructions, captured synchronously (before
+    /// `gather`/`runner` ever run) for tests that need to check `.reviewer`
+    /// text landed in the trusted instructions rather than the material —
+    /// without letting a real `gather` run inside a `#[gpui::test]` (a real
+    /// git subprocess is exactly the non-deterministic background activity
+    /// the test scheduler refuses to let a test drive to completion).
+    #[cfg(test)]
+    last_instructions_for_test: Option<String>,
+    /// The last dispatch's destination, captured the same way, so a test can
+    /// check a run was routed to the Panel rather than `ReviewSuggestions`
+    /// without driving the background run to completion.
+    #[cfg(test)]
+    last_destination_for_test: Option<CodexDestination>,
 }
 
 /// What a run needs, captured on the main thread before it leaves it.
-enum Material {
+#[derive(Debug, PartialEq)]
+pub(super) enum Material {
     Ready(String),
     StagedDiff,
     LocalChanges,
@@ -102,10 +182,48 @@ enum Material {
         base: String,
         head: String,
     },
+    /// One file's diff between two commits: a reviewer scope's "File" level.
+    FileDiff {
+        base: String,
+        head: String,
+        path: String,
+    },
+    /// A reviewer scope's "Lines" level: just the hunk of `path`'s diff that
+    /// covers new-file lines `lo..=hi`, falling back to the whole file's
+    /// diff if no hunk overlaps (the selection moved since).
+    FileDiffHunk {
+        base: String,
+        head: String,
+        path: String,
+        lo: u32,
+        hi: u32,
+    },
     RepoOverview,
+    /// `inner`'s material, with `prefix` (already gathered, e.g. a pull
+    /// request's own description) ahead of it. Lets a reviewer action add
+    /// untrusted PR text to any other material without a dedicated variant
+    /// per combination.
+    WithPrefix {
+        prefix: String,
+        inner: Box<Material>,
+    },
+    /// A reviewer scope's File, Commits or Pr diff: `path` names a single
+    /// file (File scope) or is `None` for the whole tree (Commits, Pr), with
+    /// `generated` files excluded from the git command itself (a pathspec,
+    /// not a text filter, so a huge excluded lockfile can't eat the read
+    /// budget before the size check runs) — moot when `path` is one of
+    /// `generated`, since a File scope never excludes the one file it's on.
+    /// The same 100-file / 20k-line limit a whole pull request gets applies
+    /// to what's actually assembled here, not the PR as a whole.
+    ReviewerScopeDiff {
+        base: String,
+        head: String,
+        path: Option<String>,
+        generated: std::collections::BTreeSet<String>,
+    },
 }
 
-fn is_object_id(value: &str) -> bool {
+pub(super) fn is_object_id(value: &str) -> bool {
     (4..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -113,7 +231,15 @@ fn is_object_id(value: &str) -> bool {
 const READ_LIMIT: u64 = codex::MAX_CONTEXT_BYTES as u64 + 1;
 
 /// git's stdout, stopped at `READ_LIMIT` so a huge diff is never held whole.
-fn git_output(workdir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+pub(super) fn git_output(workdir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    git_output_and_cut(workdir, args).map(|(text, _cut)| text)
+}
+
+/// Like [`git_output`], but also says whether the output was cut at
+/// `READ_LIMIT`: a caller that needs to tell "big" from "silently truncated"
+/// (the reviewer scope size check) needs to know this, rather than treating
+/// a cut answer as if it were the whole diff.
+fn git_output_and_cut(workdir: &std::path::Path, args: &[&str]) -> Result<(String, bool), String> {
     use std::io::Read as _;
     let mut child = gitcomet_core::process::git_command()
         .current_dir(workdir)
@@ -136,7 +262,7 @@ fn git_output(workdir: &std::path::Path, args: &[&str]) -> Result<String, String
     if !cut && !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
+    Ok((String::from_utf8_lossy(&stdout).into_owned(), cut))
 }
 
 /// A working-tree file for Codex. A symlink is described, never followed:
@@ -158,7 +284,7 @@ fn read_worktree_file(path: &std::path::Path) -> Result<String, String> {
 }
 
 /// Runs on a background thread: git and gh reads only.
-fn gather(workdir: &std::path::Path, material: Material) -> Result<String, String> {
+pub(super) fn gather(workdir: &std::path::Path, material: Material) -> Result<String, String> {
     match material {
         Material::Ready(text) => Ok(text),
         Material::StagedDiff => {
@@ -229,11 +355,98 @@ fn gather(workdir: &std::path::Path, material: Material) -> Result<String, Strin
                 ],
             )
         }
+        Material::FileDiff { base, head, path } => {
+            if !is_object_id(&base) || !is_object_id(&head) {
+                return Err("The reviewed commits aren't known yet.".to_string());
+            }
+            git_output(
+                workdir,
+                &[
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    &format!("{base}..{head}"),
+                    "--",
+                    &path,
+                ],
+            )
+        }
+        Material::FileDiffHunk {
+            base,
+            head,
+            path,
+            lo,
+            hi,
+        } => {
+            let text = gather(
+                workdir,
+                Material::FileDiff {
+                    base,
+                    head,
+                    path,
+                },
+            )?;
+            Ok(reviewer::extract_hunk_for_lines(&text, lo, hi).unwrap_or(text))
+        }
         Material::RepoOverview => {
             // The log first: a long file list is what gets cut.
             let log = git_output(workdir, &["log", "--oneline", "-30", "--no-color"])?;
             let files = git_output(workdir, &["ls-files"])?;
             Ok(format!("Recent commits:\n{log}\nFiles:\n{files}"))
+        }
+        Material::WithPrefix { prefix, inner } => {
+            let rest = gather(workdir, *inner)?;
+            Ok(format!("{prefix}\n\n{rest}"))
+        }
+        Material::ReviewerScopeDiff {
+            base,
+            head,
+            path,
+            generated,
+        } => {
+            if !is_object_id(&base) || !is_object_id(&head) {
+                return Err("The reviewed commits aren't known yet.".to_string());
+            }
+            let range = format!("{base}..{head}");
+            let mut args: Vec<&str> = vec!["diff", "--no-color", "--no-ext-diff", &range, "--"];
+            // Generated files are excluded as a pathspec, before git ever
+            // writes their (possibly huge, e.g. a lockfile) bytes out — a
+            // text-level filter after the fact would let one eat the whole
+            // read budget first. Moot for a File scope: it names its one
+            // file directly, generated or not.
+            let excludes: Vec<String> = match &path {
+                Some(path) => {
+                    args.push(path);
+                    Vec::new()
+                }
+                None => {
+                    args.push(".");
+                    generated
+                        .iter()
+                        .map(|path| format!(":(exclude,literal){path}"))
+                        .collect()
+                }
+            };
+            for exclude in &excludes {
+                args.push(exclude);
+            }
+            let (text, cut) = git_output_and_cut(workdir, &args)?;
+            if cut {
+                return Err(
+                    "This is too large for Codex to review here; narrow the scope.".to_string(),
+                );
+            }
+            // The pathspec above is the primary exclusion (before the read
+            // cap can be spent on a generated file's own bytes); this is a
+            // belt-and-suspenders pass in case a path pathspec syntax can't
+            // exactly express (a rename, say) let one through.
+            let text = reviewer::filter_generated_sections(&text, &generated, path.as_deref());
+            if reviewer::diff_too_large(&text) {
+                return Err(
+                    "This is too large for Codex to review here; narrow the scope.".to_string(),
+                );
+            }
+            Ok(text)
         }
     }
 }
@@ -293,12 +506,39 @@ impl GitCometView {
                 let enter = input.update(cx, |input, _| input.take_enter_pressed());
                 let escape = input.update(cx, |input, _| input.take_escape_pressed());
                 if enter {
-                    this.start_codex(CodexAction::Ask, CodexDestination::Panel, window, cx);
-                } else if escape && let Some(panel) = this.codex.as_ref() {
-                    let handle = panel.focus_handle.clone();
-                    window.focus(&handle, cx);
+                    // The reviewer menu's own `q` (Ask), asked to type a
+                    // question first, lands here too: it runs the reviewer
+                    // Ask at the scope it was opened with, not the plain
+                    // repo-overview one — but only while it still matches
+                    // what's on screen; `clear_pending_reviewer_ask_if_stale`
+                    // clears it as soon as it doesn't, and this is the
+                    // fallback for the moment in between.
+                    this.clear_pending_reviewer_ask_if_stale();
+                    if let Some((_, _, scope)) = this.pending_reviewer_ask.take() {
+                        this.dispatch_reviewer_action(
+                            super::reviewer_menu::ReviewerActionKind::Ask,
+                            scope,
+                            window,
+                            cx,
+                        );
+                    } else {
+                        this.start_codex(CodexAction::Ask, CodexDestination::Panel, window, cx);
+                    }
+                } else if escape {
+                    this.pending_reviewer_ask = None;
+                    if let Some(panel) = this.codex.as_ref() {
+                        let handle = panel.focus_handle.clone();
+                        window.focus(&handle, cx);
+                    }
                 }
             });
+            // Clicking away from the box (rather than Enter or Escape) must
+            // drop a pending reviewer Ask too, so it never lingers to fire
+            // against whatever is on screen next time the box gets Enter.
+            let ask_blur_subscription =
+                cx.on_blur(&ask_input.read(cx).focus_handle(), window, |this, _window, _cx| {
+                    this.pending_reviewer_ask = None;
+                });
             let focus_handle = cx.focus_handle().tab_index(0).tab_stop(false);
             let result_subscription = cx.observe_in(&result_input, window, {
                 let focus_handle = focus_handle.clone();
@@ -314,11 +554,18 @@ impl GitCometView {
                 result_scroll,
                 ask_input,
                 _ask_subscription: ask_subscription,
+                _ask_blur_subscription: ask_blur_subscription,
                 _result_subscription: result_subscription,
                 runs: FxHashMap::default(),
                 open: false,
                 shown: None,
                 next_seq: 0,
+                rows_cursor: 0,
+                runner: default_runner(),
+                #[cfg(test)]
+                last_instructions_for_test: None,
+                #[cfg(test)]
+                last_destination_for_test: None,
             });
         }
         self.codex.as_mut().expect("created above")
@@ -361,6 +608,11 @@ impl GitCometView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if action == CodexAction::Ask {
+            // The plain menu's own Ask, not the reviewer's: a scope left
+            // pending from `i q` must not resurface on a later plain Ask.
+            self.pending_reviewer_ask = None;
+        }
         let Some(repo) = self.active_repo() else {
             return;
         };
@@ -485,6 +737,47 @@ impl GitCometView {
             _ => action.title().to_string(),
         };
 
+        self.dispatch_codex(
+            repo_id,
+            workdir,
+            title,
+            instructions,
+            material,
+            destination,
+            ResultShape::PlainText,
+            // The plain menu never produces a `b`/`r` jumpable row.
+            None,
+            action == CodexAction::CommitMessage,
+            action == CodexAction::Ask,
+            window,
+            cx,
+        );
+    }
+
+    /// Starts a run and tracks it, for any caller that has already worked
+    /// out its own title, instructions and material — the classic menu
+    /// (`start_codex`, above) and the reviewer menu
+    /// (`super::reviewer_menu`) both funnel through here, so there is one
+    /// place that owns a repository's run slot and its background thread.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_codex(
+        &mut self,
+        repo_id: RepoId,
+        workdir: std::path::PathBuf,
+        title: String,
+        instructions: String,
+        material: Material,
+        destination: CodexDestination,
+        shape: ResultShape,
+        // The pull request and head (or range head) this run's rows would
+        // jump into, for `handle_codex_panel_key`'s `enter` to check against
+        // before it jumps — see `CodexRun::dispatched_for`.
+        dispatched_for: Option<(u64, String)>,
+        fills_commit_message: bool,
+        clear_ask_input: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let panel = self.codex_panel(window, cx);
         if let Some(previous) = panel.runs.get(&repo_id) {
             // One run at a time per repository.
@@ -501,24 +794,36 @@ impl GitCometView {
                 answer: String::new(),
                 cancel: cancel.clone(),
                 seq,
+                shape,
+                rows: Vec::new(),
+                verdicts: Vec::new(),
+                findings: Vec::new(),
+                dispatched_for,
             },
         );
         panel.open = true;
         // The box holds this run's answer or nothing, never a stale one.
         panel.shown = None;
+        panel.rows_cursor = 0;
         panel
             .result_input
             .update(cx, |input, cx| input.set_text("", cx));
-        if action == CodexAction::Ask {
+        if clear_ask_input {
             panel
                 .ask_input
                 .update(cx, |input, cx| input.set_text("", cx));
         }
 
+        #[cfg(test)]
+        {
+            panel.last_instructions_for_test = Some(instructions.clone());
+            panel.last_destination_for_test = Some(destination);
+        }
+        let runner = panel.runner.clone();
         // A run takes minutes; it gets its own thread, not a pool worker.
         let task = cx.background_spawn(smol::unblock(move || {
             let material = gather(&workdir, material).map_err(CodexError::Failed)?;
-            codex::run(
+            runner(
                 CodexRequest {
                     instructions,
                     material,
@@ -529,7 +834,7 @@ impl GitCometView {
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
-                this.finish_codex(repo_id, seq, action, destination, result, cx);
+                this.finish_codex(repo_id, seq, fills_commit_message, destination, result, cx);
             });
         })
         .detach();
@@ -540,7 +845,7 @@ impl GitCometView {
         &mut self,
         repo_id: RepoId,
         seq: u64,
-        action: CodexAction,
+        fills_commit_message: bool,
         destination: CodexDestination,
         result: Result<String, CodexError>,
         cx: &mut gpui::Context<Self>,
@@ -557,7 +862,27 @@ impl GitCometView {
             Ok(answer) => {
                 run.state = RunState::Done;
                 run.answer = answer.clone();
-                if action == CodexAction::CommitMessage && repo_id_is_active(self, repo_id) {
+                let shape = run.shape;
+                // Malformed JSON leaves `rows`/`verdicts`/`findings` empty:
+                // the plain-text box then shows the raw answer instead, and
+                // (for `RuleReview`) any suggestions already on the review
+                // are left alone rather than wiped by an empty re-parse.
+                let rule_review = match shape {
+                    ResultShape::PlainText => None,
+                    ResultShape::BriefRows => {
+                        run.rows = reviewer::parse_brief_json(&answer);
+                        None
+                    }
+                    ResultShape::RuleReview => {
+                        let parsed = reviewer::parse_rule_review_json(&answer);
+                        if let Some(result) = &parsed {
+                            run.verdicts = result.verdicts.clone();
+                            run.findings = result.findings.clone();
+                        }
+                        Some(parsed)
+                    }
+                };
+                if fills_commit_message && repo_id_is_active(self, repo_id) {
                     // The user's own text is never replaced.
                     let input = self.details_pane.read(cx).commit_message_input.clone();
                     if input.read(cx).text().trim().is_empty() {
@@ -571,7 +896,36 @@ impl GitCometView {
                         });
                     }
                     CodexDestination::ReviewSuggestions(review_repo, number, generation) => {
-                        self.add_review_suggestions(review_repo, number, generation, &answer, cx);
+                        match rule_review {
+                            // A rule review's findings are one field of its
+                            // JSON object, not the whole answer: re-shape
+                            // them into the plain array
+                            // `add_review_suggestions` expects.
+                            Some(Some(result)) => {
+                                let findings_answer =
+                                    serde_json::to_string(&result.findings).unwrap_or_default();
+                                self.add_review_suggestions(
+                                    review_repo,
+                                    number,
+                                    generation,
+                                    &findings_answer,
+                                    cx,
+                                );
+                            }
+                            Some(None) => {
+                                self.push_toast(
+                                    components::ToastKind::Warning,
+                                    "Couldn't read Codex's review; it's in the Codex panel."
+                                        .to_string(),
+                                    cx,
+                                );
+                            }
+                            None => {
+                                self.add_review_suggestions(
+                                    review_repo, number, generation, &answer, cx,
+                                );
+                            }
+                        }
                     }
                     CodexDestination::Panel => {}
                 }
@@ -592,11 +946,61 @@ impl GitCometView {
         let Some(repo_id) = self.active_repo_id() else {
             return false;
         };
-        let Some(panel) = self.codex.as_ref() else {
+        let Some(panel) = self.codex.as_mut() else {
             return false;
         };
         let text = panel.result_input.read(cx).text().to_string();
+        // `rows` (a `b` answer) and `findings` (an `r` answer's line
+        // comments) are never both non-empty for the same run — one row
+        // source drives the cursor; `verdicts` are shown but never a jump
+        // target.
+        let rows_len = panel
+            .runs
+            .get(&repo_id)
+            .map_or(0, |run| run.rows.len().max(run.findings.len()));
         match key {
+            "j" | "k" if rows_len > 0 => {
+                let panel = self.codex.as_mut().expect("checked above");
+                if key == "j" {
+                    panel.rows_cursor = (panel.rows_cursor + 1).min(rows_len - 1);
+                } else {
+                    panel.rows_cursor = panel.rows_cursor.saturating_sub(1);
+                }
+            }
+            "enter" if rows_len > 0 => {
+                let panel = self.codex.as_ref().expect("checked above");
+                let cursor = panel.rows_cursor;
+                let run = panel.runs.get(&repo_id);
+                let dispatched_for = run.and_then(|run| run.dispatched_for.clone());
+                let target = run.and_then(|run| {
+                    if let Some(row) = run.rows.get(cursor) {
+                        row.path.clone().zip(row.line)
+                    } else {
+                        run.findings
+                            .get(cursor)
+                            .map(|finding| (finding.path.clone(), finding.line))
+                    }
+                });
+                let Some((path, line)) = target else {
+                    return true;
+                };
+                // The run's rows are anchored to the PR and head they were
+                // dispatched for; jumping once that's moved on would land on
+                // whatever review happens to be open now, at the wrong lines.
+                let current = self
+                    .active_review()
+                    .filter(|review| review.repo_id == repo_id)
+                    .map(|review| (review.number, review.range_head().to_string()));
+                if dispatched_for.is_some() && dispatched_for != current {
+                    self.push_toast(
+                        components::ToastKind::Warning,
+                        "This result is for a different pull request or head now.".to_string(),
+                        cx,
+                    );
+                    return true;
+                }
+                self.review_jump_to_line(&path, line, window, cx);
+            }
             "y" => {
                 if !text.trim().is_empty() {
                     crate::clipboard::write_text(
@@ -701,6 +1105,12 @@ impl GitCometView {
             run.map(|run| &run.state),
             Some(RunState::Failed(err)) if *err != CodexError::Cancelled
         );
+        let rows_len = run.map_or(0, |run| run.rows.len().max(run.findings.len()));
+        let hint = if rows_len > 0 {
+            "j/k row · enter jump · y copy · x close"
+        } else {
+            "y copy · u review · e edit · a ask · x close"
+        };
 
         let header = div()
             .flex()
@@ -732,18 +1142,145 @@ impl GitCometView {
                     .flex_none()
                     .text_size(theme.ui_text(11.0))
                     .text_color(theme.colors.foreground.secondary)
-                    .child("y copy · u review · e edit · a ask · x close"),
+                    .child(hint),
             );
 
-        let body = div().px_2().flex_1().min_h(px(0.0)).child(
-            components::ScrollContainer::vertical(
-                "codex_result_scroll_surface",
-                "codex_result_scrollbar",
-                panel.result_scroll.clone(),
-                scale.px(200.0),
-            )
-            .render(theme, panel.result_input.clone()),
-        );
+        let rows_cursor = panel.rows_cursor;
+        let rows_body = run.filter(|run| !run.rows.is_empty()).map(|run| {
+            let items = run.rows.iter().enumerate().map(|(ix, row)| {
+                let anchor = row
+                    .path
+                    .clone()
+                    .map(|path| format!("{path}{}", row.line.map(|line| format!(":{line}")).unwrap_or_default()));
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(scale.px(1.0))
+                    .px_2()
+                    .py(scale.px(3.0))
+                    .when(ix == rows_cursor, |d| d.bg(theme.colors.interaction.hover_background))
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(12.0))
+                            .text_color(theme.colors.foreground.primary)
+                            .child(row.text.clone()),
+                    )
+                    .children(anchor.map(|anchor| {
+                        div()
+                            .text_size(theme.ui_text(11.0))
+                            .text_color(theme.colors.foreground.secondary)
+                            .child(anchor)
+                    }))
+            });
+            div().flex().flex_col().children(items)
+        });
+        let verdicts_body = run.filter(|run| !run.verdicts.is_empty()).map(|run| {
+            let items = run.verdicts.iter().map(|verdict| {
+                let (label, color) = match verdict.verdict {
+                    reviewer::VerdictKind::Pass => ("pass", theme.colors.status.success.foreground),
+                    reviewer::VerdictKind::Flag => ("flag", theme.colors.status.danger.foreground),
+                    reviewer::VerdictKind::NotApplicable => {
+                        ("n/a", theme.colors.foreground.secondary)
+                    }
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(scale.px(1.0))
+                    .px_2()
+                    .py(scale.px(3.0))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.0))
+                                    .text_color(color)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme.ui_text(12.0))
+                                    .text_color(theme.colors.foreground.primary)
+                                    .child(verdict.rule.clone()),
+                            ),
+                    )
+                    .when(!verdict.note.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(theme.ui_text(11.0))
+                                .text_color(theme.colors.foreground.secondary)
+                                .child(verdict.note.clone()),
+                        )
+                    })
+            });
+            div().flex().flex_col().children(items)
+        });
+        // A `RuleReview` answer's findings: shown as rows, `enter`-jumpable
+        // like a `b` answer's (review mode only — outside it the row still
+        // lists, but there is nowhere for `enter` to land).
+        let findings_body = run.filter(|run| !run.findings.is_empty()).map(|run| {
+            let items = run.findings.iter().enumerate().map(|(ix, finding)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(scale.px(1.0))
+                    .px_2()
+                    .py(scale.px(3.0))
+                    .when(ix == rows_cursor, |d| d.bg(theme.colors.interaction.hover_background))
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(11.0))
+                            .text_color(theme.colors.foreground.secondary)
+                            .child(format!("{}:{}", finding.path, finding.line)),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(12.0))
+                            .text_color(theme.colors.foreground.primary)
+                            .child(finding.body.clone()),
+                    )
+            });
+            div().flex().flex_col().children(items)
+        });
+
+        let body = if let Some(rows_body) = rows_body {
+            div()
+                .id("codex_rows")
+                .px_2()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .child(rows_body)
+                .into_any_element()
+        } else if verdicts_body.is_some() || findings_body.is_some() {
+            div()
+                .id("codex_verdicts")
+                .px_2()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .children(verdicts_body)
+                .children(findings_body)
+                .into_any_element()
+        } else {
+            div()
+                .px_2()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(
+                    components::ScrollContainer::vertical(
+                        "codex_result_scroll_surface",
+                        "codex_result_scrollbar",
+                        panel.result_scroll.clone(),
+                        scale.px(200.0),
+                    )
+                    .render(theme, panel.result_input.clone()),
+                )
+                .into_any_element()
+        };
 
         let element = div()
             .id("codex_panel")
@@ -891,6 +1428,66 @@ impl GitCometView {
             )
             .into_any_element()
     }
+
+    /// The active run's title for `repo_id`, if any — for tests that dispatch
+    /// through `dispatch_codex` (directly or via the reviewer menu) and check
+    /// a run was tracked.
+    #[cfg(test)]
+    pub(super) fn codex_run_title_for_test(&self, repo_id: RepoId) -> Option<String> {
+        self.codex
+            .as_ref()?
+            .runs
+            .get(&repo_id)
+            .map(|run| run.title.clone())
+    }
+
+    /// The most recent dispatch's instructions, captured before `gather` or
+    /// the runner ever ran.
+    #[cfg(test)]
+    pub(super) fn last_dispatch_instructions_for_test(&self) -> Option<String> {
+        self.codex.as_ref()?.last_instructions_for_test.clone()
+    }
+
+    /// The most recent dispatch's destination, captured the same way.
+    #[cfg(test)]
+    pub(super) fn last_dispatch_destination_for_test(&self) -> Option<CodexDestination> {
+        self.codex.as_ref()?.last_destination_for_test
+    }
+
+    /// Seeds a finished `RuleReview` run directly, with `dispatched_for` set
+    /// as a real dispatch would: no test can drive `dispatch_codex`'s runner
+    /// to completion (see the module doc), so this is the only way to
+    /// exercise `handle_codex_panel_key`'s `enter`/`j`/`k` over `findings`.
+    #[cfg(test)]
+    pub(super) fn seed_codex_run_findings_for_test(
+        &mut self,
+        repo_id: RepoId,
+        findings: Vec<reviewer::RuleFinding>,
+        dispatched_for: Option<(u64, String)>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let panel = self.codex_panel(window, cx);
+        panel.next_seq += 1;
+        let seq = panel.next_seq;
+        panel.runs.insert(
+            repo_id,
+            CodexRun {
+                title: "Review against the rules".to_string(),
+                state: RunState::Done,
+                answer: String::new(),
+                cancel: CancellationToken::new(),
+                seq,
+                shape: ResultShape::RuleReview,
+                rows: Vec::new(),
+                verdicts: Vec::new(),
+                findings,
+                dispatched_for,
+            },
+        );
+        panel.open = true;
+    }
+
 }
 
 fn repo_id_is_active(view: &GitCometView, repo_id: RepoId) -> bool {

@@ -45,6 +45,7 @@ mod conflict_stages;
 mod diff;
 mod discard;
 mod file_browser;
+mod generated_files;
 mod git_ops;
 mod history;
 mod line_stats;
@@ -1518,6 +1519,14 @@ impl GitRepository for GixRepo {
 
     fn list_tree_files_at_commit(&self, commit_id: &CommitId) -> Result<Vec<FileEntry>> {
         self.list_tree_files_at_commit_impl(commit_id)
+    }
+
+    fn generated_file_paths_at_commit(
+        &self,
+        commit_id: &CommitId,
+        paths: &[PathBuf],
+    ) -> Result<std::collections::BTreeSet<PathBuf>> {
+        self.generated_file_paths_at_commit_impl(commit_id, paths)
     }
 
     fn submodule_diff_summary(&self, target: &DiffTarget) -> Result<SubmoduleDiffSummary> {

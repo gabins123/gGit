@@ -473,6 +473,7 @@ fn render_status_rows_for_section(
                             label: &label,
                             depth,
                             collapsed,
+                            selected: false,
                             additions: subtree_additions,
                             deletions: subtree_deletions,
                             row_height: crate::ui_scale::UiScale::current(cx)

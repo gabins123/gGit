@@ -42,7 +42,9 @@ fn model_for_sort(
         // borrow the committed-files wording.
         crate::view::rows::FileListId::Status(_)
         | crate::view::rows::FileListId::Changes
-        | crate::view::rows::FileListId::WorktreeFiles => "Sort files",
+        | crate::view::rows::FileListId::WorktreeFiles
+        // The review Files list has no sort menu of its own; never reached.
+        | crate::view::rows::FileListId::Review => "Sort files",
         crate::view::rows::FileListId::CommitFiles | crate::view::rows::FileListId::RangeFiles => {
             "Sort committed files"
         }

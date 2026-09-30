@@ -502,6 +502,41 @@ impl RenderedPreviewModes {
     }
 }
 
+/// How the image diff (`view/panels/main/diff.rs`) compares the old and new
+/// pictures. Sticky across files, like [`DiffViewMode`]; `Alt+V` cycles it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ImageDiffMode {
+    /// Old and new side by side, each in its own column. The default.
+    #[default]
+    SideBySide,
+    /// Old and new overlaid, split by a vertical divider: old left of it, new
+    /// right of it. `,`/`.` move the divider.
+    Swipe,
+    /// New drawn over old at an adjustable opacity. `,`/`.` step the opacity.
+    OnionSkin,
+}
+
+impl ImageDiffMode {
+    pub(super) const fn next(self) -> Self {
+        match self {
+            Self::SideBySide => Self::Swipe,
+            Self::Swipe => Self::OnionSkin,
+            Self::OnionSkin => Self::SideBySide,
+        }
+    }
+}
+
+/// One side's pixel and file size, for the "64 × 64 px · 2.1 KB" caption next
+/// to an image diff's A/B header.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ImageDiffSideInfo {
+    /// `None` when the format's intrinsic size could not be read (an SVG with
+    /// a missing/invalid size, or a raster header that failed to parse); the
+    /// caption then falls back to just the file size.
+    pub(super) pixel_size: Option<(u32, u32)>,
+    pub(super) byte_len: usize,
+}
+
 /// Preview mode for the conflict resolver merge-input pane.
 ///
 /// When the conflicted file supports a rendered preview (for example, SVG or
@@ -543,6 +578,9 @@ pub(super) fn diff_target_rendered_preview_kind(
     let path = match target? {
         DiffTarget::WorkingTree { path, .. } => path.as_path(),
         DiffTarget::Commit {
+            path: Some(path), ..
+        } => path.as_path(),
+        DiffTarget::CommitRange {
             path: Some(path), ..
         } => path.as_path(),
         _ => return None,
@@ -1118,6 +1156,21 @@ pub struct GitCometView {
     /// The Codex panel, created the first time it is used.
     pub(super) codex: Option<super::codex_panel::CodexPanel>,
     pub(super) codex_menu_open: bool,
+    /// The reviewer `i` menu (scope + `.reviewer`-driven actions), shown
+    /// instead of the plain Codex menu while a pull request is on screen.
+    pub(super) reviewer_menu: Option<super::reviewer_menu::ReviewerMenuState>,
+    /// `.reviewer/` configs, one per PR base commit; see `reviewer_menu.rs`.
+    pub(super) reviewer_cache: super::reviewer_menu::ReviewerCache,
+    /// Set by the reviewer menu's `q` (Ask) when the question box was empty:
+    /// the pull request and scope to run it at once a question is typed and
+    /// `Enter` pressed, so that `Enter` routes to the reviewer Ask instead of
+    /// the plain one. Keyed by repo and PR number (not just the scope) so a
+    /// stale ask from a PR that's no longer on screen is never run against
+    /// whatever is selected now; cleared as soon as any of that changes
+    /// (`reviewer_menu.rs`'s `clear_pending_reviewer_ask_if_stale`, called
+    /// from `state_apply.rs`), when a plain Ask starts, or when the ask box
+    /// loses focus — Enter still double-checks the match before using it.
+    pub(super) pending_reviewer_ask: Option<(RepoId, u64, super::reviewer_menu::ReviewScope)>,
     /// The panel `esc` returns to from the Codex panel.
     pub(super) codex_return_panel: super::panel_focus::FocusPanel,
     /// The panel that last held focus, where focus returns when the element
@@ -1131,6 +1184,10 @@ pub struct GitCometView {
     pub(super) focus_prev_render: Option<FocusHandle>,
     /// The pull request being reviewed; see `review.rs`.
     pub(super) review: Option<super::review::ReviewMode>,
+    pub(super) commit_scope_picker: Option<super::review::CommitScopePicker>,
+    /// The review Files list's flat/tree plan, keyed on the review and what
+    /// it currently lists; see `review_file_list_plan`.
+    pub(super) review_plan_cache: crate::view::rows::FileListPlanCache,
     /// A first Shift+D / Shift+M on this branch, waiting for the second.
     pub(super) armed_branch_key: Option<(String, super::branch_sidebar::BranchMenuTarget)>,
     pub(super) _focus_lost_subscription: gpui::Subscription,

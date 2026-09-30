@@ -1378,6 +1378,7 @@ impl DetailsPaneView {
                             label: &label,
                             depth,
                             collapsed,
+                            selected: false,
                             additions,
                             deletions,
                             row_height,

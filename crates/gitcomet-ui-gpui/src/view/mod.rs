@@ -161,7 +161,7 @@ pub(crate) fn is_diff_shortcut_candidate(keystroke: &gpui::Keystroke) -> bool {
             && !mods.function
             && matches!(
                 key,
-                "e" | "i" | "s" | "w" | "up" | "down" | "left" | "right"
+                "e" | "i" | "p" | "s" | "v" | "w" | "up" | "down" | "left" | "right"
             ))
         || ((mods.control || mods.platform)
             && !mods.alt
@@ -173,6 +173,11 @@ pub(crate) fn is_diff_shortcut_candidate(keystroke: &gpui::Keystroke) -> bool {
                 "1" | "2" | "3" | "a" | "c" | "e" | "s" | "d" | "h" | "u"
             ))
         || (matches!(key, "a" | "b" | "c" | "d") && no_command_modifiers)
+        // `,`/`.` move the image diff's Swipe divider or step its Onion skin
+        // opacity; `handle_diff_shortcut` gates the actual effect on an image
+        // diff being shown, same as the conflict-resolver keys above do for
+        // their own state.
+        || (matches!(key, "," | ".") && no_command_modifiers)
 }
 
 /// Whether this activation is the tail of a move/resize grab we started, and so
@@ -248,6 +253,7 @@ mod perf;
 mod permalink;
 pub(super) mod platform_open;
 mod poller;
+mod pr_symbols;
 mod preference_sync;
 mod preferences;
 mod pull_requests;
@@ -255,6 +261,7 @@ mod reflog_panel;
 mod repo_open;
 mod reveal_commit;
 mod review;
+mod reviewer_menu;
 pub(crate) mod rows;
 mod settings_window;
 pub(crate) mod shortcut_labels;

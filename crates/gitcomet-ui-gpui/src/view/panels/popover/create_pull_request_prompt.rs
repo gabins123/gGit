@@ -645,9 +645,11 @@ mod tests {
             head_owner: owner.into(),
             base: "main".into(),
             is_draft: false,
+            is_cross_repository: false,
             review: None,
             checks: Default::default(),
             review_requested: false,
+            is_mine: false,
         };
         assert!(opened_from(&pr("feature", "owner"), "feature", "owner"));
         assert!(opened_from(&pr("feature", "Me"), "me:feature", "owner"));

@@ -65,6 +65,11 @@ pub(in crate::view) struct DirectoryRowProps<'a> {
     pub(in crate::view) label: &'a SharedString,
     pub(in crate::view) depth: usize,
     pub(in crate::view) collapsed: bool,
+    /// Painted with the same selected/hover background a file row uses for
+    /// the open file — for a keyboard cursor that can rest on a folder row
+    /// (review mode's Files list). Every other caller passes `false`: they
+    /// have no such cursor, and their rendering is unchanged either way.
+    pub(in crate::view) selected: bool,
     pub(in crate::view) additions: Option<u64>,
     pub(in crate::view) deletions: Option<u64>,
     /// Already resolved, and it must equal the list's file-row height:
@@ -96,6 +101,7 @@ pub(in crate::view) fn directory_row(props: DirectoryRowProps<'_>) -> Stateful<D
         label,
         depth,
         collapsed,
+        selected,
         additions,
         deletions,
         row_height,
@@ -120,7 +126,8 @@ pub(in crate::view) fn directory_row(props: DirectoryRowProps<'_>) -> Stateful<D
         .cursor(CursorStyle::PointingHand)
         .interactive_row(
             InteractiveRowStyle::new(theme, theme.colors.surface.panel).flat(),
-            InteractiveRowState::default(),
+            InteractiveRowState::default()
+                .selected(selected, theme.colors.interaction.selected_background),
         )
         .child(
             gpui::div()

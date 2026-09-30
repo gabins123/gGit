@@ -158,6 +158,7 @@ impl MainPaneView {
 
         let mut hasher = FxHasher::default();
         state.active_repo.hash(&mut hasher);
+        std::mem::discriminant(&state.sidebar_mode).hash(&mut hasher);
 
         if let Some(repo_id) = state.active_repo
             && let Some(repo) = state.repos.iter().find(|r| r.id == repo_id)
@@ -1314,6 +1315,19 @@ impl MainPaneView {
         &self,
         approval_view: Option<Entity<MainPaneView>>,
     ) -> rows::MarkdownRemoteImageAccess {
+        // A commit-range target is how review mode and the pull request
+        // "enter" diff show a file's diff (Phase 5, pr-mode-v2): its content
+        // can come from a fork's pull request, so remote images never load
+        // automatically here, regardless of the user's general preference —
+        // the same rule `pr_markdown` already applies to the PR description
+        // and conversation.
+        if matches!(self.rendered_diff_target(), Some(DiffTarget::CommitRange { .. })) {
+            return rows::MarkdownRemoteImageAccess {
+                policy: RemoteMarkdownImagePolicy::NeverLoad,
+                approved_urls: Arc::default(),
+                approval_view,
+            };
+        }
         rows::MarkdownRemoteImageAccess {
             policy: self.remote_markdown_images.policy,
             approved_urls: Arc::clone(&self.remote_markdown_images.approved_urls),

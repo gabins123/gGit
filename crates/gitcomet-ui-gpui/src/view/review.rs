@@ -161,6 +161,61 @@ pub(super) enum ViewedSync {
     Offline,
 }
 
+/// A contiguous set of PR commits and the files changed from its oldest
+/// commit's parent to its newest commit.
+pub(super) struct CommitReviewRange {
+    pub(super) selection: super::pull_requests::SelectedCommitRange,
+    pub(super) changes: super::pull_requests::PrLoad<crate::github::CommitRangeChanges>,
+    seq: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct CommitScopePicker {
+    /// All changes, Since last review, then newest-first commit rows.
+    pub(super) cursor: usize,
+    pub(super) selection: super::pull_requests::PrCommitSelection,
+}
+
+impl CommitScopePicker {
+    fn step(&mut self, direction: i8, extend: bool, commits: usize) {
+        let next = if direction < 0 {
+            self.cursor.saturating_sub(1)
+        } else {
+            (self.cursor + 1).min(commits + 1)
+        };
+        if extend && self.cursor >= 2 && next < 2 {
+            return;
+        }
+        if next >= 2 {
+            if self.cursor < 2 {
+                self.selection.select(Some(next - 2));
+            } else {
+                self.selection.step(direction, extend, commits);
+            }
+        } else {
+            self.selection.select(None);
+        }
+        self.cursor = next;
+    }
+}
+
+#[cfg(test)]
+mod commit_scope_picker_tests {
+    use super::*;
+
+    #[test]
+    fn extending_at_newest_commit_stays_on_the_commit() {
+        let mut picker = CommitScopePicker {
+            cursor: 2,
+            ..Default::default()
+        };
+        picker.selection.select(Some(0));
+        picker.step(-1, true, 3);
+        assert_eq!(picker.cursor, 2);
+        assert_eq!(picker.selection.range(3), Some((0, 0)));
+    }
+}
+
 /// A viewed press as tests read it: path, viewed, confirmed by GitHub.
 #[cfg(test)]
 pub(super) type ViewedPressForTest = (String, bool, bool);
@@ -172,6 +227,8 @@ pub(super) struct ReviewMode {
     pub(super) title: String,
     /// The pull request's changed files, in GitHub's order.
     pub(super) files: Vec<String>,
+    /// The current PR's net-changed files, restored for All and Since.
+    pub(super) all_files: Vec<String>,
     pub(super) file_ix: usize,
     pub(super) draft: ReviewDraft,
     /// The row picked in the Your review panel.
@@ -179,7 +236,7 @@ pub(super) struct ReviewMode {
     /// Pending comments were written on an older head than the one shown.
     pub(super) head_moved: bool,
     /// A line to put the cursor on once its file's diff is on screen.
-    pending_jump: Option<(ReviewSide, u32)>,
+    pub(super) pending_jump: Option<(ReviewSide, u32)>,
     /// The shown file hasn't had its cursor placed yet.
     needs_cursor: bool,
     /// `d` pressed once on a comment in Your review, waiting for the second.
@@ -198,19 +255,17 @@ pub(super) struct ReviewMode {
     /// then answers about other lines, and its answer is dropped.
     pub(super) suggestion_generation: u64,
     written_seq: std::sync::Arc<std::sync::Mutex<u64>>,
-    /// Your latest submitted review of the pull request, loaded when review
-    /// mode opens. Ready(None) when you never reviewed it.
-    pub(super) last_review: super::pull_requests::PrLoad<Option<crate::github::LastReview>>,
+    /// Commit used for the currently computed changes-since result.
+    since_base_oid: Option<String>,
     /// What changed since that review; `None` until known.
     pub(super) since_review: Option<SinceReview>,
     /// `L`: the file list, and the keys walking it, keep to the files changed
     /// since your last review.
     pub(super) only_changed: bool,
+    pub(super) commit_range: Option<CommitReviewRange>,
     /// The head a viewed-marks check is running for.
     viewed_syncing_to: Option<String>,
-    /// Bumped per load of the last review and of what changed since it: an
-    /// answer that isn't the newest is dropped.
-    last_review_seq: u64,
+    /// Bumped per load of what changed since the last review.
     since_seq: u64,
     pub(super) viewed_sync: ViewedSync,
     viewed_seq: u64,
@@ -237,11 +292,39 @@ pub(super) struct ReviewMode {
     /// `V`: viewed files stay in the list. Off, they're hidden, the open one
     /// included; its diff stays up and `j`/`k` go on from it.
     pub(super) show_viewed: bool,
+    /// The PR's generated files (GitHub's `linguist-generated`), copied from
+    /// `pull_requests` once gix has read them, so `file_listed` and friends
+    /// (pure `&self` methods) don't have to reach back through it.
+    pub(super) generated: Arc<std::collections::BTreeSet<String>>,
+    /// `Shift+G`: generated files stay in the list, the same way `show_viewed`
+    /// works for viewed ones. Off (the default), they're hidden regardless of
+    /// viewed state — a generated file never counts toward viewed progress.
+    pub(super) show_generated: bool,
+    /// Generated files whose "Generated file" placeholder you've dismissed
+    /// with `enter`, so their diff loads normally for the rest of the review
+    /// session.
+    pub(super) generated_placeholder_dismissed: std::collections::BTreeSet<String>,
+    /// The Files list's keyboard cursor in tree layout, resting on a folder
+    /// row: `j`/`k` moved onto it rather than a file. `None` means the
+    /// cursor is wherever the open file's row is, which is every other
+    /// case, flat layout included. Keyed by the row's own path, so a filter
+    /// or collapse change that reshapes the tree drops it cleanly rather
+    /// than pointing at a stale row (`review_current_row` falls back to the
+    /// open file's row when the key no longer resolves to one).
+    pub(super) sidebar_dir_cursor: Option<Arc<std::path::Path>>,
 }
 
 impl ReviewMode {
     pub(super) fn current_path(&self) -> Option<&str> {
         self.files.get(self.file_ix).map(String::as_str)
+    }
+
+    /// Whether the open file's "Generated file" placeholder is showing right
+    /// now: it's generated, and `enter` hasn't dismissed it yet this session.
+    pub(super) fn generated_placeholder_active(&self) -> bool {
+        self.current_path().is_some_and(|path| {
+            self.is_generated(path) && !self.generated_placeholder_dismissed.contains(path)
+        })
     }
 
     /// Lays GitHub's viewed marks (the answer to load `seq`) over this
@@ -320,11 +403,7 @@ impl ReviewMode {
         if !self.only_changed || !matches!(self.since_review, Some(SinceReview::Changed(_))) {
             return None;
         }
-        self.last_review
-            .ready()?
-            .as_ref()
-            .map(|last| last.commit_id.as_str())
-            .filter(|commit| !commit.is_empty())
+        self.since_base_oid.as_deref()
     }
 
     /// Whether `path` changed since your last review.
@@ -334,10 +413,17 @@ impl ReviewMode {
 
     /// The pull request's files that changed since your last review.
     pub(super) fn files_changed_since_review(&self) -> usize {
-        self.files
+        self.all_files
             .iter()
             .filter(|path| self.changed_since_review(path))
             .count()
+    }
+
+    /// Whether `path` is one of this PR's generated files (GitHub's
+    /// `linguist-generated`), as read from `.gitattributes` at the head
+    /// commit and copied here once known.
+    pub(super) fn is_generated(&self, path: &str) -> bool {
+        self.generated.contains(path)
     }
 
     /// Whether file `ix` is in the list, the one `j`/`k`, `]`/`[` and
@@ -346,9 +432,19 @@ impl ReviewMode {
     /// viewed files. The open file follows the same rule: once everything is
     /// viewed the list is empty, even though a diff is still up. A dismissed
     /// file ("changed since you viewed") isn't viewed.
+    ///
+    /// A generated file is hidden purely by `show_generated`, regardless of
+    /// viewed state: generated files don't count toward viewed progress, so
+    /// whether one happens to be marked viewed never affects its visibility.
     pub(super) fn file_listed(&self, ix: usize) -> bool {
         self.file_passes_filters(ix)
-            && (self.show_viewed || !self.draft.viewed.contains(&self.files[ix]))
+            && self.files.get(ix).is_some_and(|path| {
+                if self.is_generated(path) {
+                    self.show_generated
+                } else {
+                    self.show_viewed || !self.draft.viewed.contains(path)
+                }
+            })
     }
 
     /// The `/` filter and `L`, viewed or not.
@@ -361,17 +457,62 @@ impl ReviewMode {
         })
     }
 
-    /// Viewed files the list hides for now: `V` shows them.
+    pub(super) fn range_head(&self) -> &str {
+        self.commit_range
+            .as_ref()
+            .map_or(self.draft.head_oid.as_str(), |range| {
+                range.selection.newest_oid.as_str()
+            })
+    }
+
+    pub(super) fn historical_range(&self) -> bool {
+        self.commit_range
+            .as_ref()
+            .is_some_and(|range| range.selection.newest_oid != self.draft.head_oid)
+    }
+
+    /// Viewed files the list hides for now: `V` shows them. A generated file
+    /// is never counted here, even when it's viewed and hidden — it's
+    /// counted once, under `generated_hidden`, so the two lines never
+    /// double-count the same file.
     pub(super) fn viewed_hidden(&self) -> usize {
         (0..self.files.len())
-            .filter(|ix| self.file_passes_filters(*ix) && !self.file_listed(*ix))
+            .filter(|ix| {
+                self.file_passes_filters(*ix)
+                    && !self.file_listed(*ix)
+                    && !self.files.get(*ix).is_some_and(|path| self.is_generated(path))
+            })
+            .count()
+    }
+
+    /// Generated files the list hides for now: `Shift+G` shows them.
+    pub(super) fn generated_hidden(&self) -> usize {
+        (0..self.files.len())
+            .filter(|ix| {
+                self.file_passes_filters(*ix)
+                    && !self.show_generated
+                    && self.files.get(*ix).is_some_and(|path| self.is_generated(path))
+            })
+            .count()
+    }
+
+    /// Files that count toward viewed progress ("X of Y viewed"): every file
+    /// but the generated ones, whether or not `Shift+G` is currently showing
+    /// them.
+    pub(super) fn non_generated_file_count(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|path| !self.is_generated(path))
             .count()
     }
 
     /// "Your last review: Approved · 2 days ago · at abc1234 · 3 commits since
     /// · 4 files changed since", once the review is known.
-    pub(super) fn last_review_line(&self, now: std::time::SystemTime) -> Option<String> {
-        let last = self.last_review.ready()?.as_ref()?;
+    pub(super) fn last_review_line(
+        &self,
+        last: &crate::github::LastReview,
+        now: std::time::SystemTime,
+    ) -> String {
         let mut parts = vec![last.verdict().to_string()];
         if let Ok(at) = last.submitted_at.parse::<jiff::Timestamp>() {
             parts.push(super::date_time::format_relative_time(at.as_second(), now));
@@ -390,7 +531,7 @@ impl ReviewMode {
             ));
             parts.push(format!("{files} file{} changed since", plural(files)));
         }
-        Some(format!("Your last review: {}", parts.join(" · ")))
+        format!("Your last review: {}", parts.join(" · "))
     }
 
     pub(super) fn files_commented(&self) -> usize {
@@ -412,6 +553,187 @@ impl GitCometView {
             Some(review.repo_id) == self.active_repo_id()
                 && self.state.sidebar_mode == SidebarMode::PullRequests
         })
+    }
+
+    pub(super) fn handle_commit_scope_picker_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let mods = keystroke.modifiers;
+        if mods.control || mods.alt || mods.platform || mods.function {
+            return true;
+        }
+        let key = keystroke.key.to_ascii_lowercase();
+        let count = self
+            .active_repo_id()
+            .and_then(|repo_id| self.pull_requests.repo(repo_id))
+            .and_then(|prs| prs.detail.ready())
+            .map_or(0, |detail| detail.commits.len());
+        let Some(picker) = self.commit_scope_picker.as_mut() else {
+            return false;
+        };
+        match key.as_str() {
+            "j" | "down" => picker.step(1, mods.shift, count),
+            "k" | "up" => picker.step(-1, mods.shift, count),
+            "escape" => self.commit_scope_picker = None,
+            "enter" => {
+                let choice = *picker;
+                let selection = self
+                    .active_repo_id()
+                    .and_then(|repo_id| self.pull_requests.repo(repo_id))
+                    .and_then(|prs| prs.detail.ready())
+                    .and_then(|detail| choice.selection.selected_range(&detail.commits));
+                self.commit_scope_picker = None;
+                if choice.cursor == 0
+                    && self
+                        .active_review()
+                        .is_some_and(|review| review.commit_range.is_none() && !review.only_changed)
+                    || choice.cursor == 1
+                        && self
+                            .active_review()
+                            .is_some_and(|review| review.only_changed)
+                    || choice.cursor >= 2
+                        && self
+                            .active_review()
+                            .and_then(|review| review.commit_range.as_ref())
+                            .is_some_and(|range| Some(&range.selection) == selection.as_ref())
+                {
+                    cx.notify();
+                    return true;
+                }
+                match choice.cursor {
+                    0 => self.set_review_commit_range(None, cx),
+                    1 => {
+                        if let Some(review) = self.review.as_mut() {
+                            review.only_changed = false;
+                        }
+                        self.review_toggle_only_changed(cx);
+                    }
+                    _ => self.set_review_commit_range(selection, cx),
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+        true
+    }
+
+    fn open_commit_scope_picker(&mut self, cx: &mut gpui::Context<Self>) {
+        let mut picker = CommitScopePicker::default();
+        if let Some(review) = self.active_review() {
+            if review.only_changed {
+                picker.cursor = 1;
+            } else if let Some(range) = &review.commit_range
+                && let Some(commits) = self
+                    .active_repo_id()
+                    .and_then(|repo_id| self.pull_requests.repo(repo_id))
+                    .and_then(|prs| prs.detail.ready())
+                    .map(|detail| detail.commits.as_slice())
+            {
+                let newest = commits
+                    .iter()
+                    .position(|commit| commit.oid == range.selection.newest_oid);
+                let oldest = commits
+                    .iter()
+                    .position(|commit| commit.oid == range.selection.oldest_oid);
+                if let (Some(newest), Some(oldest)) = (newest, oldest) {
+                    picker.selection.select_range(newest, oldest, commits.len());
+                    picker.cursor = oldest + 2;
+                }
+            }
+        }
+        self.commit_scope_picker = Some(picker);
+        cx.notify();
+    }
+
+    pub(super) fn render_commit_scope_picker(
+        &self,
+        picker: CommitScopePicker,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let scale = crate::ui_scale::UiScale::current(cx);
+        let commits = self
+            .active_repo_id()
+            .and_then(|repo_id| self.pull_requests.repo(repo_id))
+            .and_then(|prs| prs.detail.ready())
+            .map(|detail| detail.commits.as_slice())
+            .unwrap_or(&[]);
+        let selected = picker.selection.range(commits.len());
+        let mut body = components::modal_surface(theme)
+            .p(scale.px(14.0))
+            .flex()
+            .flex_col()
+            .gap(scale.px(5.0))
+            .child(div().font_weight(FontWeight::BOLD).child("Review commits"))
+            .child(
+                div()
+                    .text_color(theme.colors.foreground.secondary)
+                    .child("j/k move · J/K extend · enter apply · esc cancel"),
+            );
+        let rows = commits.len() + 2;
+        let start = picker.cursor.saturating_sub(8).min(rows.saturating_sub(18));
+        let end = (start + 18).min(rows);
+        if start > 0 {
+            body = body.child(format!("{start} earlier rows above"));
+        }
+        for ix in start..end {
+            let label = match ix {
+                0 => "All changes".to_string(),
+                1 => "Since last review".to_string(),
+                _ => {
+                    let commit = &commits[ix - 2];
+                    let checked = selected.is_some_and(|(a, b)| (a..=b).contains(&(ix - 2)));
+                    format!(
+                        "{} {}  {}",
+                        if checked { "☑" } else { "☐" },
+                        commit.oid.get(..7).unwrap_or(&commit.oid),
+                        commit.headline
+                    )
+                }
+            };
+            body = body.child(
+                div()
+                    .px(scale.px(8.0))
+                    .py(scale.px(3.0))
+                    .bg(if picker.cursor == ix {
+                        theme.colors.interaction.selected_background
+                    } else {
+                        theme.colors.surface.panel
+                    })
+                    .child(label),
+            );
+        }
+        if end < rows {
+            body = body.child(format!("{} later commits below", rows - end));
+        }
+        let scrim = components::modal_scrim(theme)
+            .id("commit_scope_scrim")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.commit_scope_picker = None;
+                    cx.notify();
+                }),
+            );
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(scrim)
+            .child(
+                div()
+                    .absolute()
+                    .top(scale.px(80.0))
+                    .left_0()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(div().w(scale.px(560.0)).child(body)),
+            )
+            .into_any_element()
     }
 
     /// The review of `number` in `repo_id`, if it's the one in progress.
@@ -439,7 +761,7 @@ impl GitCometView {
                     path: Some(shown),
                     from_commit_id,
                 } => {
-                    head.as_ref() == review.draft.head_oid
+                    head.as_ref() == review.range_head()
                         && shown == std::path::Path::new(path)
                         && self
                             .review_diff_base(review.repo_id, review.number)
@@ -452,16 +774,19 @@ impl GitCometView {
     /// Whether the review's files past the first 100 are still being listed:
     /// until then `files` isn't the whole pull request.
     pub(super) fn review_files_listing(&self) -> bool {
-        self.review
-            .as_ref()
-            .is_some_and(|review| self.pull_request_files_listing(review.repo_id, review.number))
+        self.review.as_ref().is_some_and(|review| {
+            review.commit_range.is_none()
+                && self.pull_request_files_listing(review.repo_id, review.number)
+        })
     }
 
     /// Some of the review's files couldn't be listed; `R` lists them again.
     pub(super) fn review_files_missing(&self) -> bool {
         self.review.as_ref().is_some_and(|review| {
-            self.pull_request_files_error(review.repo_id, review.number)
-                .is_some()
+            review.commit_range.is_none()
+                && self
+                    .pull_request_files_error(review.repo_id, review.number)
+                    .is_some()
         })
     }
 
@@ -470,6 +795,12 @@ impl GitCometView {
     /// `None` while neither is known.
     pub(super) fn review_diff_base(&self, repo_id: RepoId, number: u64) -> Option<String> {
         let review = self.review_of(repo_id, number)?;
+        if let Some(range) = &review.commit_range {
+            return range
+                .changes
+                .ready()
+                .map(|changes| changes.base_oid.clone());
+        }
         match review.since_base() {
             Some(base) => Some(base.to_string()),
             None => self
@@ -477,6 +808,34 @@ impl GitCometView {
                 .repo(repo_id)
                 .and_then(|prs| prs.diff_base.ready())
                 .cloned(),
+        }
+    }
+
+    /// Copies the PR's generated-files set (once gix has read it) into the
+    /// active review of it, so `ReviewMode`'s pure `&self` methods
+    /// (`file_listed`, `generated_hidden`, `is_generated`) can consult it
+    /// without reaching back through `self.pull_requests`.
+    pub(super) fn review_sync_generated_files(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(generated) = self
+            .pull_requests
+            .repo(repo_id)
+            .and_then(|prs| prs.generated_files.ready())
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(review) = self
+            .review
+            .as_mut()
+            .filter(|review| review.repo_id == repo_id && review.number == number)
+        {
+            review.generated = generated;
+            self.sync_review_marks(cx);
         }
     }
 
@@ -506,7 +865,11 @@ impl GitCometView {
             );
             return;
         };
-        if detail.too_large_for_app() || detail.files.is_empty() {
+        let cached_threads = prs.threads.ready().cloned();
+        let selected_range = prs.commit_selection.selected_range(&detail.commits);
+        let retry_diff_base = matches!(prs.diff_base, super::pull_requests::PrLoad::Failed(_));
+        let generated = prs.generated_files.ready().cloned().unwrap_or_default();
+        if detail.too_large_for_app() || (selected_range.is_none() && detail.files.is_empty()) {
             self.push_toast(
                 components::ToastKind::Warning,
                 format!(
@@ -535,6 +898,9 @@ impl GitCometView {
         if draft.viewed_head.is_none() {
             draft.viewed_head = Some(draft.head_oid.clone());
         }
+        if retry_diff_base {
+            self.reset_pull_request_diff_base(repo_id);
+        }
         // Opening the first file moves an older draft to the head, which
         // checks the viewed marks itself.
         let head_moves = draft.head_oid != detail.head_oid;
@@ -547,7 +913,12 @@ impl GitCometView {
             repo_id,
             number,
             title: detail.title.clone(),
-            files,
+            all_files: files.clone(),
+            files: if selected_range.is_some() {
+                Vec::new()
+            } else {
+                files
+            },
             file_ix,
             draft,
             selected_comment: None,
@@ -557,15 +928,21 @@ impl GitCometView {
             armed_delete: None,
             write_seq: 0,
             written_seq: Default::default(),
-            threads: Vec::new(),
-            threads_loading: !cfg!(test),
+            threads: cached_threads
+                .as_ref()
+                .map_or_else(Vec::new, |threads| threads.as_ref().clone()),
+            threads_loading: cached_threads.is_none() && !cfg!(test),
             suggestions: Vec::new(),
             suggestion_generation: 0,
-            last_review: Default::default(),
+            since_base_oid: None,
             since_review: None,
             only_changed: false,
+            commit_range: selected_range.map(|selection| CommitReviewRange {
+                selection,
+                changes: super::pull_requests::PrLoad::Loading,
+                seq: next_seq(),
+            }),
             viewed_syncing_to: None,
-            last_review_seq: 0,
             since_seq: 0,
             viewed_sync: ViewedSync::Idle,
             viewed_seq: 0,
@@ -579,6 +956,10 @@ impl GitCometView {
             reopened_for: None,
             query: Default::default(),
             show_viewed: false,
+            generated,
+            show_generated: false,
+            generated_placeholder_dismissed: Default::default(),
+            sidebar_dir_cursor: None,
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.review_active = true;
@@ -587,15 +968,64 @@ impl GitCometView {
         // A filter left from another review doesn't carry over.
         self.sidebar_pane
             .update(cx, |pane, cx| pane.reset_review_query(cx));
-        self.review_open_file(file_ix, cx);
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|review| review.commit_range.is_some())
+        {
+            self.load_review_commit_range(cx);
+        } else {
+            self.review_open_file(file_ix, cx);
+        }
         if !head_moves {
             self.review_sync_viewed(cx);
             self.load_viewed_states(cx);
         }
+        if cached_threads.is_some() {
+            self.sync_review_marks(cx);
+        }
         self.load_review_threads(cx);
-        self.load_last_review(cx);
+        if self
+            .pull_requests
+            .repo(repo_id)
+            .and_then(|prs| prs.last_review.ready())
+            .is_some()
+        {
+            self.review_load_changes_since(cx);
+        } else if self.pull_requests.repo(repo_id).is_some_and(|prs| {
+            matches!(
+                prs.last_review,
+                super::pull_requests::PrLoad::Idle | super::pull_requests::PrLoad::Failed(_)
+            )
+        }) {
+            self.load_pull_request_last_review(repo_id, number, cx);
+        }
         self.diff_return_panel = FocusPanel::Sidebar;
         self.focus_diff_when_open = true;
+    }
+
+    /// Enter on a conversation thread resumes the review on that file and line.
+    pub(super) fn start_review_at_thread(
+        &mut self,
+        thread: &ReviewThread,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // A thread belongs to the current PR diff, regardless of a range
+        // left selected in Details.
+        self.clear_pull_request_commit_selection(cx);
+        self.start_review(cx);
+        let Some(file_ix) = self
+            .active_review()
+            .and_then(|review| review.files.iter().position(|path| path == &thread.path))
+        else {
+            return;
+        };
+        self.review_open_file(file_ix, cx);
+        if let Some(line) = thread.line.or(thread.original_line)
+            && let Some(review) = self.review.as_mut()
+        {
+            review.pending_jump = Some((thread.side, line));
+        }
     }
 
     /// The diff shows the pull request's current head; a draft started on an
@@ -655,7 +1085,10 @@ impl GitCometView {
             pane.review_marks.clear();
             cx.notify();
         });
-        if self.diff_is_open() {
+        if self
+            .active_repo()
+            .is_some_and(|repo| repo.diff_state.diff_target.is_some())
+        {
             self.store.dispatch(Msg::ClearDiffSelection {
                 repo_id: review.repo_id,
             });
@@ -707,10 +1140,6 @@ impl GitCometView {
         if remaining > 0 || !review_posted {
             self.save_review(cx);
             self.sync_review_marks(cx);
-            if review_posted {
-                // The one just posted is now your last review.
-                self.load_last_review(cx);
-            }
             self.notify_pull_request_panes(cx);
             return remaining;
         }
@@ -723,7 +1152,10 @@ impl GitCometView {
             cx.notify();
         });
         if self.active_repo_id() == Some(repo_id) {
-            if self.diff_is_open() {
+            if self
+                .active_repo()
+                .is_some_and(|repo| repo.diff_state.diff_target.is_some())
+            {
                 self.store.dispatch(Msg::ClearDiffSelection { repo_id });
             }
             let window_handle = self.window_handle;
@@ -740,6 +1172,235 @@ impl GitCometView {
         0
     }
 
+    /// The review Files list's projection: which of `review.files` are
+    /// listed right now (`file_listed`, in file order) and how they lay out
+    /// under the current Flat/Tree preference. Shared by the Sidebar's rows
+    /// and by keyboard navigation (`]`/`[`, `space`, `enter` on a folder,
+    /// reveal-on-open), so both walk the same tree — never built twice.
+    pub(in crate::view) fn review_file_list_plan(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<(Arc<[usize]>, Arc<crate::view::rows::FileListPlan>)> {
+        let review = self.review.as_ref()?;
+        let repo_id = review.repo_id;
+        let listed: Arc<[usize]> = (0..review.files.len())
+            .filter(|ix| review.file_listed(*ix))
+            .collect();
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            (repo_id, review.number, &review.draft.head_oid, &*listed).hash(&mut hasher);
+            hasher.finish()
+        };
+        let files: Arc<[String]> = review.files.iter().cloned().collect();
+        let list = crate::view::rows::FileListId::Review;
+        let layout = self.details_pane.read(cx).file_list_layout_for(repo_id, list);
+        let collapsed = self
+            .details_pane
+            .read(cx)
+            .file_list_collapsed_for(repo_id, list)
+            .into_owned();
+        let listed_len = listed.len();
+        let listed_for_build = Arc::clone(&listed);
+        let plan = self
+            .review_plan_cache
+            .plan_for(key, layout, &collapsed, listed_len, move || {
+                crate::view::rows::FileTree::build(
+                    listed_for_build.iter().map(|&ix| crate::view::rows::FileTreeItem {
+                        path: std::path::Path::new(files[ix].as_str()),
+                        additions: None,
+                        deletions: None,
+                    }),
+                    crate::view::rows::CommitFileSort::default(),
+                )
+            });
+        Some((listed, plan))
+    }
+
+    /// The order review files line up in a tree, or plain file order in flat
+    /// layout: `file_passes_filters` only (the `/` filter and `L`), not
+    /// viewed/generated-hiding, so a file just marked viewed still has a
+    /// stable place to step from. `None` in flat layout — callers keep their
+    /// own raw-index stepping there, which is already tree order once there
+    /// are no folders to skip.
+    fn review_tree_order(&self, cx: &gpui::Context<Self>) -> Option<Vec<usize>> {
+        let review = self.review.as_ref()?;
+        let repo_id = review.repo_id;
+        let layout = self
+            .details_pane
+            .read(cx)
+            .file_list_layout_for(repo_id, crate::view::rows::FileListId::Review);
+        if !matches!(layout, crate::view::FileListLayout::Tree) {
+            return None;
+        }
+        let all: Vec<usize> = (0..review.files.len())
+            .filter(|ix| review.file_passes_filters(*ix))
+            .collect();
+        let tree = crate::view::rows::FileTree::build(
+            all.iter().map(|&ix| crate::view::rows::FileTreeItem {
+                path: std::path::Path::new(review.files[ix].as_str()),
+                additions: None,
+                deletions: None,
+            }),
+            crate::view::rows::CommitFileSort::default(),
+        );
+        let plan = tree.flatten(&Default::default());
+        Some(plan.ordered().iter().map(|ord| all[ord]).collect())
+    }
+
+    /// Expands any folder hiding `review.files[ix]`'s row in the Files
+    /// list's tree layout, so `]`/`[`, `space`, a thread jump or a reviewer
+    /// jump always lands on a visible row. A no-op in flat layout, or when
+    /// the file isn't part of what the list currently shows.
+    fn review_reveal_file(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.review.as_ref().map(|review| review.repo_id) else {
+            return;
+        };
+        let Some((listed, plan)) = self.review_file_list_plan(cx) else {
+            return;
+        };
+        let Some(position) = listed.iter().position(|&fi| fi == ix) else {
+            return;
+        };
+        let chains = plan.reveal(crate::view::rows::FileOrdinal(position));
+        for chain in chains {
+            let key = Arc::clone(chain.last().expect("a folded chain is never empty"));
+            self.toggle_review_file_list_dir(repo_id, key, chain, true, cx);
+        }
+    }
+
+    /// The display row the Sidebar's keyboard cursor rests on, in the
+    /// current plan: the cursor's own folder when one is set and still
+    /// resolves to a row, else the open file's row.
+    fn review_current_row(
+        &self,
+        listed: &[usize],
+        plan: &crate::view::rows::FileListPlan,
+        review: &ReviewMode,
+    ) -> Option<usize> {
+        if let Some(dir) = &review.sidebar_dir_cursor
+            && let Some(row) = Self::review_dir_row(plan, dir)
+        {
+            return Some(row);
+        }
+        let position = listed.iter().position(|&ix| ix == review.file_ix)?;
+        plan.row_ix_for_ordinal(crate::view::rows::FileOrdinal(position))
+            .map(|row| row.0)
+    }
+
+    /// The row showing the folder at `dir`, if the plan still has one.
+    fn review_dir_row(plan: &crate::view::rows::FileListPlan, dir: &std::path::Path) -> Option<usize> {
+        (0..plan.row_len()).find(|&row| {
+            matches!(
+                plan.row_at(crate::view::rows::RowIx(row)),
+                Some(crate::view::rows::FileListRow::Directory { key, .. }) if key.as_ref() == dir
+            )
+        })
+    }
+
+    /// `enter` on the Sidebar cursor's folder row: toggles it, the way a
+    /// file row's `enter` opens the file. `false` when the cursor isn't on
+    /// one, so the caller falls through to the ordinary `enter` behavior.
+    fn review_toggle_cursor_dir(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(dir) = self
+            .review
+            .as_ref()
+            .and_then(|review| review.sidebar_dir_cursor.clone())
+        else {
+            return false;
+        };
+        let Some(repo_id) = self.review.as_ref().map(|review| review.repo_id) else {
+            return false;
+        };
+        let Some((_, plan)) = self.review_file_list_plan(cx) else {
+            return false;
+        };
+        let Some(row) = Self::review_dir_row(&plan, &dir) else {
+            // The tree reshaped under it; the cursor no longer names a row.
+            if let Some(review) = self.review.as_mut() {
+                review.sidebar_dir_cursor = None;
+            }
+            return false;
+        };
+        let Some(crate::view::rows::FileListRow::Directory {
+            key,
+            chain,
+            collapsed,
+            ..
+        }) = plan.row_at(crate::view::rows::RowIx(row))
+        else {
+            return false;
+        };
+        self.toggle_review_file_list_dir(repo_id, key, chain, collapsed, cx);
+        true
+    }
+
+    /// A folder row's click or `enter` in the review Files list's tree
+    /// layout: one hop into `DetailsPaneView`'s shared collapse store, the
+    /// same one every other changed-file list's tree uses.
+    pub(in crate::view) fn toggle_review_file_list_dir(
+        &mut self,
+        repo_id: RepoId,
+        key: Arc<std::path::Path>,
+        chain: Arc<[Arc<std::path::Path>]>,
+        collapsed: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.details_pane.update(cx, |pane, cx| {
+            pane.toggle_file_list_dir(
+                repo_id,
+                crate::view::rows::FileListId::Review,
+                key,
+                chain,
+                collapsed,
+                cx,
+            );
+        });
+    }
+
+    /// `j`/`k` while the Files list has focus. In tree layout, one row at a
+    /// time, folders included: landing on a file opens it, as every `j`/`k`
+    /// press does in flat layout; landing on a folder just rests the cursor
+    /// there for `enter`. Flat layout has no folder rows, so it's exactly
+    /// `review_step_file`.
+    fn review_step_sidebar(&mut self, direction: i8, cx: &mut gpui::Context<Self>) {
+        let Some((listed, plan)) = self.review_file_list_plan(cx) else {
+            self.review_step_file(direction, cx);
+            return;
+        };
+        if !plan.is_tree() {
+            self.review_step_file(direction, cx);
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let current_row = self.review_current_row(&listed, &plan, review);
+        let row_len = plan.row_len();
+        let next_row = if direction < 0 {
+            current_row.and_then(|row| row.checked_sub(1))
+        } else {
+            current_row.map_or(Some(0), |row| (row + 1 < row_len).then_some(row + 1))
+        };
+        let Some(next_row) = next_row else {
+            return;
+        };
+        match plan.row_at(crate::view::rows::RowIx(next_row)) {
+            Some(crate::view::rows::FileListRow::Directory { key, .. }) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.sidebar_dir_cursor = Some(key);
+                }
+                cx.notify();
+            }
+            Some(crate::view::rows::FileListRow::File { ordinal, .. }) => {
+                if let Some(&ix) = listed.get(ordinal.0) {
+                    self.review_open_file(ix, cx);
+                }
+            }
+            None => {}
+        }
+    }
+
     /// Shows file `ix` of the review, fetching the pull request's commits the
     /// first time. Focus stays where it is.
     pub(super) fn review_open_file(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
@@ -752,10 +1413,62 @@ impl GitCometView {
         review.file_ix = ix;
         review.pending_jump = None;
         review.needs_cursor = true;
+        review.sidebar_dir_cursor = None;
         let (repo_id, path) = (review.repo_id, review.files[ix].clone());
+        self.review_reveal_file(ix, cx);
         self.review_follow_head(cx);
+        if self
+            .pull_requests
+            .repo(repo_id)
+            .is_some_and(|prs| matches!(prs.diff_base, super::pull_requests::PrLoad::Idle))
+        {
+            self.fetch_pull_request_commits(repo_id, cx);
+        }
+        if self.review.as_ref().is_some_and(|review| {
+            review
+                .commit_range
+                .as_ref()
+                .is_some_and(|range| range.changes.ready().is_none())
+        }) {
+            self.store.dispatch(Msg::ClearDiffSelection { repo_id });
+            self.notify_pull_request_panes(cx);
+            return;
+        }
         self.review_load_hunk_ranges(cx);
         self.sync_review_marks(cx);
+        // A generated file's diff isn't fetched until its placeholder is
+        // dismissed (`enter`): it's usually large and uninteresting (a
+        // lockfile), so there's no point loading it before the reader asks.
+        let placeholder_active = self
+            .active_review()
+            .is_some_and(ReviewMode::generated_placeholder_active);
+        if let Some((base, head)) =
+            self.review
+                .as_ref()
+                .and_then(|review| review.commit_range.as_ref())
+                .and_then(|range| {
+                    range.changes.ready().map(|changes| {
+                        (changes.base_oid.clone(), range.selection.newest_oid.clone())
+                    })
+                })
+        {
+            // Leaving the previous target in place while the placeholder is
+            // up is harmless: `review_diff_shown` already refuses to treat
+            // another file's diff as this one's, and the placeholder covers
+            // the main pane regardless of what's loaded underneath it.
+            if !placeholder_active {
+                self.store.dispatch(Msg::SelectDiff {
+                    repo_id,
+                    target: DiffTarget::CommitRange {
+                        from_commit_id: CommitId(base.into()),
+                        to_commit_id: Some(CommitId(head.into())),
+                        path: Some(std::path::PathBuf::from(&path)),
+                    },
+                });
+            }
+            self.notify_pull_request_panes(cx);
+            return;
+        }
         // By path: review mode's list and the pull request's are the same,
         // but a reload at a new head can change the latter under it. A file
         // it no longer has shows no diff rather than another file's.
@@ -764,8 +1477,25 @@ impl GitCometView {
             .repo(repo_id)
             .and_then(|prs| prs.detail.ready())
             .and_then(|detail| detail.files.iter().position(|file| file.path == path));
-        if let Some(detail_ix) = detail_ix {
-            self.open_pull_request_diff(Some(detail_ix), cx);
+        if detail_ix.is_some() {
+            let base_and_head = self.review.as_ref().and_then(|review| {
+                self.review_diff_base(repo_id, review.number)
+                    .map(|base| (base, review.draft.head_oid.clone()))
+            });
+            // See the commit-range branch above: while the placeholder is up,
+            // leave whatever was loaded before in place rather than clear it.
+            if let (Some((base, head)), false) = (base_and_head, placeholder_active) {
+                self.store.dispatch(Msg::SelectDiff {
+                    repo_id,
+                    target: DiffTarget::CommitRange {
+                        from_commit_id: CommitId(base.into()),
+                        to_commit_id: Some(CommitId(head.into())),
+                        path: Some(std::path::PathBuf::from(&path)),
+                    },
+                });
+            } else if !placeholder_active {
+                self.store.dispatch(Msg::ClearDiffSelection { repo_id });
+            }
         } else {
             // The last file's diff would carry this one's marks.
             self.store.dispatch(Msg::ClearDiffSelection { repo_id });
@@ -781,14 +1511,167 @@ impl GitCometView {
         self.notify_pull_request_panes(cx);
     }
 
-    fn review_step_file(&mut self, direction: i8, cx: &mut gpui::Context<Self>) {
+    /// `enter` on the open file's "Generated file" placeholder: loads its
+    /// diff for the rest of this review, reachable from the Sidebar or from
+    /// the Diff panel itself once focus moves there.
+    fn review_dismiss_generated_placeholder(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some((ix, path)) = self
+            .active_review()
+            .filter(|review| review.generated_placeholder_active())
+            .and_then(|review| Some((review.file_ix, review.current_path()?.to_string())))
+        else {
+            return;
+        };
+        if let Some(review) = self.review.as_mut() {
+            review.generated_placeholder_dismissed.insert(path);
+        }
+        // Re-opens the same file now that its placeholder is dismissed, which
+        // is what actually dispatches the diff load `review_open_file` skips
+        // while a generated file's placeholder is showing.
+        self.review_open_file(ix, cx);
+    }
+
+    pub(super) fn set_review_commit_range(
+        &mut self,
+        selection: Option<super::pull_requests::SelectedCommitRange>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        review.only_changed = false;
+        review.commit_range = selection.map(|selection| CommitReviewRange {
+            selection,
+            changes: super::pull_requests::PrLoad::Loading,
+            seq: next_seq(),
+        });
+        if review.commit_range.is_some() {
+            review.files.clear();
+            review.file_ix = 0;
+        } else {
+            review.files = review.all_files.clone();
+            review.file_ix = review.file_ix.min(review.files.len().saturating_sub(1));
+        }
+        review.reopened_for = None;
+        // The range just changed: a run still in flight for the old one must
+        // not land its findings (wrong lines, or `ReviewSuggestions`-routed
+        // findings meant for a different range) once it finishes.
+        review.suggestions.clear();
+        review.suggestion_generation += 1;
+        self.store.dispatch(Msg::ClearDiffSelection {
+            repo_id: review.repo_id,
+        });
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|review| review.commit_range.is_some())
+        {
+            self.load_review_commit_range(cx);
+        } else if let Some(ix) = self.review.as_ref().map(|review| review.file_ix) {
+            self.review_open_file(ix, cx);
+        }
+        self.sync_review_marks(cx);
+        self.notify_pull_request_panes(cx);
+    }
+
+    fn load_review_commit_range(&mut self, cx: &mut gpui::Context<Self>) {
         let Some(review) = self.review.as_ref() else {
             return;
         };
-        let next = if direction < 0 {
-            (0..review.file_ix).rev().find(|ix| review.file_listed(*ix))
-        } else {
-            (review.file_ix + 1..review.files.len()).find(|ix| review.file_listed(*ix))
+        let Some(range) = review.commit_range.as_ref() else {
+            return;
+        };
+        if cfg!(test) {
+            return;
+        }
+        let (repo_id, number, seq) = (review.repo_id, review.number, range.seq);
+        let (oldest, newest) = (
+            range.selection.oldest_oid.clone(),
+            range.selection.newest_oid.clone(),
+        );
+        let pr_files = review.all_files.clone();
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let task = cx.background_executor().spawn(async move {
+            crate::github::commit_range_changes(
+                &target.workdir,
+                &target.remote,
+                &oldest,
+                &newest,
+                &pr_files,
+            )
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let Some(review) = this
+                    .review
+                    .as_mut()
+                    .filter(|review| review.repo_id == repo_id && review.number == number)
+                else {
+                    return;
+                };
+                let Some(range) = review
+                    .commit_range
+                    .as_mut()
+                    .filter(|range| range.seq == seq)
+                else {
+                    return;
+                };
+                range.changes = match result {
+                    Ok(changes) => super::pull_requests::PrLoad::Ready(changes),
+                    Err(err) => super::pull_requests::PrLoad::Failed(err),
+                };
+                if let Some(changes) = range.changes.ready() {
+                    review.files = changes.files.iter().cloned().collect();
+                    review.file_ix = review
+                        .files
+                        .iter()
+                        .position(|path| !review.draft.viewed.contains(path))
+                        .unwrap_or(0);
+                }
+                let first = (0..review.files.len())
+                    .find(|ix| review.file_listed(*ix))
+                    .or_else(|| (!review.files.is_empty()).then_some(0));
+                if let Some(ix) = first {
+                    this.review_open_file(ix, cx);
+                } else {
+                    this.sync_review_marks(cx);
+                    this.notify_pull_request_panes(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// `]`/`[`, and `j`/`k` in the Sidebar's flat layout: the next/previous
+    /// listed file. In tree layout it follows the tree's display order
+    /// (`review_tree_order`) rather than raw file-index order, so it moves
+    /// the way the rows actually read top to bottom, skipping folder rows
+    /// (there is no ordinal for one) automatically.
+    fn review_step_file(&mut self, direction: i8, cx: &mut gpui::Context<Self>) {
+        let Some(current) = self.review.as_ref().map(|review| review.file_ix) else {
+            return;
+        };
+        let next = match self.review_tree_order(cx) {
+            Some(order) => {
+                let scan: Vec<usize> = match order.iter().position(|&ix| ix == current) {
+                    Some(pos) if direction < 0 => order[..pos].iter().rev().copied().collect(),
+                    Some(pos) => order[pos + 1..].to_vec(),
+                    None if direction < 0 => order.iter().rev().copied().collect(),
+                    None => order,
+                };
+                scan.into_iter()
+                    .find(|ix| self.review.as_ref().is_some_and(|review| review.file_listed(*ix)))
+            }
+            None => self.review.as_ref().and_then(|review| {
+                if direction < 0 {
+                    (0..current).rev().find(|ix| review.file_listed(*ix))
+                } else {
+                    (current + 1..review.files.len()).find(|ix| review.file_listed(*ix))
+                }
+            }),
         };
         if let Some(next) = next {
             self.review_open_file(next, cx);
@@ -800,8 +1683,19 @@ impl GitCometView {
     /// is the whole pull request.
     fn review_toggle_only_changed(&mut self, cx: &mut gpui::Context<Self>) {
         use super::pull_requests::PrLoad;
-        let listing = self.review_files_listing();
-        let missing = self.review_files_missing();
+        let listing = self
+            .review
+            .as_ref()
+            .is_some_and(|review| self.pull_request_files_listing(review.repo_id, review.number));
+        let missing = self.review.as_ref().is_some_and(|review| {
+            self.pull_request_files_error(review.repo_id, review.number)
+                .is_some()
+        });
+        let last_review = self
+            .review
+            .as_ref()
+            .and_then(|review| self.pull_requests.repo(review.repo_id))
+            .map(|prs| &prs.last_review);
         let Some(review) = self.review.as_mut() else {
             return;
         };
@@ -812,8 +1706,8 @@ impl GitCometView {
             self.review_open_file(ix, cx);
             return;
         }
-        let refusal = match (&review.last_review, &review.since_review) {
-            (PrLoad::Ready(None), _) => {
+        let refusal = match (last_review, &review.since_review) {
+            (Some(PrLoad::Ready(None)), _) => {
                 Some("You haven't reviewed this pull request before; every file is new to you.")
             }
             (_, Some(SinceReview::Gone)) => {
@@ -840,7 +1734,7 @@ impl GitCometView {
                 Some("None of this pull request's files changed since your last review.")
             }
             (_, Some(SinceReview::Changed(_))) => None,
-            (PrLoad::Failed(_), None) => Some("Couldn't load your last review."),
+            (Some(PrLoad::Failed(_)), None) => Some("Couldn't load your last review."),
             _ => Some("Still working out what changed since your last review."),
         };
         if let Some(message) = refusal {
@@ -848,6 +1742,9 @@ impl GitCometView {
             return;
         }
         review.only_changed = true;
+        review.commit_range = None;
+        review.files = review.all_files.clone();
+        review.file_ix = review.file_ix.min(review.files.len().saturating_sub(1));
         let ix = (!review.file_listed(review.file_ix))
             .then(|| (0..review.files.len()).find(|ix| review.file_listed(*ix)))
             .flatten()
@@ -865,6 +1762,15 @@ impl GitCometView {
         let Some(path) = review.current_path().map(str::to_string) else {
             return;
         };
+        if !review.all_files.contains(&path) {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "This file is not in the current PR's file list, so GitHub cannot mark it viewed."
+                    .to_string(),
+                cx,
+            );
+            return;
+        }
         let now_viewed = review.draft.viewed.insert(path.clone());
         if !now_viewed {
             review.draft.viewed.remove(&path);
@@ -885,17 +1791,29 @@ impl GitCometView {
             },
         );
         self.review_push_viewed(cx);
+        // Worked out before the mutable borrow below: in tree layout, "next"
+        // follows the tree's display order rather than raw file index.
+        let tree_order = self.review_tree_order(cx);
         let Some(review) = self.review.as_mut() else {
             return;
         };
         let next = now_viewed
             .then(|| {
                 let from = review.file_ix;
-                (1..review.files.len())
-                    .map(|step| (from + step) % review.files.len())
-                    .find(|ix| {
-                        review.file_listed(*ix) && !review.draft.viewed.contains(&review.files[*ix])
-                    })
+                let is_next_unviewed = |review: &ReviewMode, ix: &usize| {
+                    review.file_listed(*ix) && !review.draft.viewed.contains(&review.files[*ix])
+                };
+                match &tree_order {
+                    Some(order) if !order.is_empty() => {
+                        let pos = order.iter().position(|&ix| ix == from).unwrap_or(0);
+                        (1..order.len())
+                            .map(|step| order[(pos + step) % order.len()])
+                            .find(|ix| is_next_unviewed(review, ix))
+                    }
+                    _ => (1..review.files.len())
+                        .map(|step| (from + step) % review.files.len())
+                        .find(|ix| is_next_unviewed(review, ix)),
+                }
             })
             .flatten();
         self.save_review(cx);
@@ -1015,78 +1933,28 @@ impl GitCometView {
         .detach();
     }
 
-    /// Loads your latest submitted review of the pull request, then what
-    /// changed since it. Tests never run gh; they seed it.
-    fn load_last_review(&mut self, cx: &mut gpui::Context<Self>) {
-        if cfg!(test) {
-            return;
-        }
-        let Some((repo_id, number)) = self
-            .review
-            .as_ref()
-            .map(|review| (review.repo_id, review.number))
-        else {
-            return;
-        };
-        let Some(target) = self.github_target_for(repo_id) else {
-            return;
-        };
-        let Some(seq) = self.review.as_mut().map(|review| {
-            // A reload keeps the review it has until the new one lands, so
-            // the diff `L` shows keeps its base meanwhile.
-            if review.last_review.ready().is_none() {
-                review.last_review = super::pull_requests::PrLoad::Loading;
-            }
-            review.last_review_seq = next_seq();
-            review.last_review_seq
-        }) else {
-            return;
-        };
-        let task = cx.background_spawn(async move {
-            crate::github::last_review(&target.workdir, &target.slug, number)
-        });
-        cx.spawn(async move |view, cx| {
-            let result = task.await;
-            let _ = view.update(cx, |this, cx| {
-                let Some(review) = this.review.as_mut().filter(|review| {
-                    review.repo_id == repo_id
-                        && review.number == number
-                        && review.last_review_seq == seq
-                }) else {
-                    return;
-                };
-                match result {
-                    Ok(last) => review.last_review = super::pull_requests::PrLoad::Ready(last),
-                    // A failed reload keeps the review already known.
-                    Err(_) if review.last_review.ready().is_some() => {}
-                    Err(err) => review.last_review = super::pull_requests::PrLoad::Failed(err),
-                }
-                this.review_load_changes_since(cx);
-                this.notify_pull_request_panes(cx);
-            });
-        })
-        .detach();
-    }
-
     /// Works out the files changed from your last review's commit to the
     /// reviewed head, fetching the old commit by id if it isn't local. The
     /// diff shown stays the whole pull request's, so line comments hold.
-    fn review_load_changes_since(&mut self, cx: &mut gpui::Context<Self>) {
-        let Some(review) = self.review.as_mut() else {
-            return;
-        };
-        let old = review
-            .last_review
-            .ready()
+    pub(super) fn review_load_changes_since(&mut self, cx: &mut gpui::Context<Self>) {
+        let old = self
+            .review
+            .as_ref()
+            .and_then(|review| self.pull_requests.repo(review.repo_id))
+            .and_then(|prs| prs.last_review.ready())
             .and_then(Option::as_ref)
             .map(|last| last.commit_id.clone())
             .filter(|old| !old.is_empty());
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
         // What's known stays until the new answer lands: the diff `L` shows
         // keeps its base meanwhile.
         review.since_seq = next_seq();
         let seq = review.since_seq;
         let Some(old) = old else {
             review.since_review = None;
+            review.since_base_oid = None;
             review.only_changed = false;
             self.review_refresh(cx);
             return;
@@ -1094,6 +1962,7 @@ impl GitCometView {
         let head = review.draft.head_oid.clone();
         if old == head {
             review.since_review = Some(SinceReview::Changed(Default::default()));
+            review.since_base_oid = Some(old);
             review.only_changed = false;
             self.review_refresh(cx);
             return;
@@ -1102,6 +1971,7 @@ impl GitCometView {
             return;
         }
         let (repo_id, number) = (review.repo_id, review.number);
+        let old_for_result = old.clone();
         let Some(target) = self.github_target_for(repo_id) else {
             return;
         };
@@ -1124,7 +1994,10 @@ impl GitCometView {
                     return;
                 };
                 let since = match result {
-                    Ok(changes) => SinceReview::Changed(changes),
+                    Ok(changes) => {
+                        review.since_base_oid = Some(old_for_result);
+                        SinceReview::Changed(changes)
+                    }
                     Err(crate::github::SinceFailure::Gone) => SinceReview::Gone,
                     Err(crate::github::SinceFailure::Failed(why)) => SinceReview::Failed(why),
                 };
@@ -1160,7 +2033,7 @@ impl GitCometView {
                 from_commit_id,
                 to_commit_id: Some(head),
                 path: Some(shown),
-            } if head.as_ref() == review.draft.head_oid
+            } if head.as_ref() == review.range_head()
                 && shown == std::path::Path::new(path)
                 && from_commit_id.as_ref() != base =>
             {
@@ -1264,6 +2137,85 @@ impl GitCometView {
         self.notify_pull_request_panes(cx);
     }
 
+    /// A minimal review of `files`, its cursor already placed, for tests that
+    /// drive review mode's keys without the real open flow (`gh pr view`, its
+    /// draft file, GitHub's viewed marks).
+    #[cfg(test)]
+    pub(super) fn open_review_for_test(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        files: Vec<String>,
+        head_oid: impl Into<String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.review = Some(ReviewMode {
+            repo_id,
+            number,
+            title: String::new(),
+            all_files: files.clone(),
+            files,
+            file_ix: 0,
+            draft: ReviewDraft {
+                head_oid: head_oid.into(),
+                ..ReviewDraft::default()
+            },
+            selected_comment: None,
+            head_moved: false,
+            pending_jump: None,
+            needs_cursor: false,
+            armed_delete: None,
+            write_seq: 0,
+            written_seq: Default::default(),
+            threads: Vec::new(),
+            threads_loading: false,
+            suggestions: Vec::new(),
+            suggestion_generation: 0,
+            since_base_oid: None,
+            since_review: None,
+            only_changed: false,
+            commit_range: None,
+            viewed_syncing_to: None,
+            since_seq: 0,
+            viewed_sync: ViewedSync::Idle,
+            viewed_seq: 0,
+            dismissed: Default::default(),
+            confirmed: Default::default(),
+            was_dismissed: Default::default(),
+            viewed_pushing: false,
+            hunk_ranges: Default::default(),
+            hunk_ranges_loading: Default::default(),
+            hunk_key: None,
+            reopened_for: None,
+            query: Default::default(),
+            show_viewed: false,
+            generated: Default::default(),
+            show_generated: false,
+            generated_placeholder_dismissed: Default::default(),
+            sidebar_dir_cursor: None,
+        });
+        self.main_pane.update(cx, |pane, _| pane.review_active = true);
+        self.notify_pull_request_panes(cx);
+    }
+
+    /// Seeds the active review's generated-files set directly, bypassing the
+    /// real gix fetch, for tests that only care about `Shift+G` and the
+    /// generated-file placeholder.
+    #[cfg(test)]
+    pub(super) fn seed_review_generated_files_for_test(
+        &mut self,
+        paths: impl IntoIterator<Item = String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(review) = self.review.as_mut() {
+            review.generated = Arc::new(paths.into_iter().collect());
+        }
+        // The placeholder flag `sync_review_marks` copies into `main_pane`
+        // only updates when this runs; production always reaches it because
+        // `generated` and `review_open_file` land together (`start_review`).
+        self.sync_review_marks(cx);
+    }
+
     /// Your last review and what changed since it, as gh and git would load
     /// them, so tests run neither.
     #[cfg(test)]
@@ -1274,7 +2226,9 @@ impl GitCometView {
         cx: &mut gpui::Context<Self>,
     ) {
         if let Some(review) = self.review.as_mut() {
-            review.last_review = super::pull_requests::PrLoad::Ready(last);
+            self.pull_requests.repo_mut(review.repo_id).last_review =
+                super::pull_requests::PrLoad::Ready(last.clone());
+            review.since_base_oid = last.as_ref().map(|last| last.commit_id.clone());
             review.since_review = since;
         }
         self.notify_pull_request_panes(cx);
@@ -1477,7 +2431,11 @@ impl GitCometView {
         let Some(review) = self.review.as_ref() else {
             return;
         };
-        let (Some(path), true) = (review.current_path(), review.since_base().is_some()) else {
+        let (Some(path), true) = (
+            review.current_path(),
+            review.since_base().is_some()
+                || (review.commit_range.is_some() && !review.historical_range()),
+        ) else {
             return;
         };
         let (repo_id, number, path, head) = (
@@ -1627,12 +2585,55 @@ impl GitCometView {
         self.notify_pull_request_panes(cx);
     }
 
+    #[cfg(test)]
+    pub(super) fn seed_commit_range_for_test(
+        &mut self,
+        base_oid: String,
+        files: std::collections::BTreeSet<String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let Some(range) = review.commit_range.as_mut() else {
+            return;
+        };
+        range.changes = super::pull_requests::PrLoad::Ready(crate::github::CommitRangeChanges {
+            base_oid,
+            files,
+        });
+        review.files = range
+            .changes
+            .ready()
+            .unwrap()
+            .files
+            .iter()
+            .cloned()
+            .collect();
+        review.file_ix = review
+            .files
+            .iter()
+            .position(|path| !review.draft.viewed.contains(path))
+            .unwrap_or(0);
+        let first = (0..review.files.len())
+            .find(|ix| review.file_listed(*ix))
+            .or_else(|| (!review.files.is_empty()).then_some(0));
+        if let Some(ix) = first {
+            self.review_open_file(ix, cx);
+        }
+        self.sync_review_marks(cx);
+        self.notify_pull_request_panes(cx);
+    }
+
     /// The threads already on GitHub on the line under the cursor, oldest
     /// first. Two reviewers often start one each on the same line.
     pub(super) fn review_threads_at_cursor(&self, cx: &App) -> Vec<&ReviewThread> {
         let Some(review) = self.active_review() else {
             return Vec::new();
         };
+        if review.historical_range() {
+            return Vec::new();
+        }
         let (Some(path), true) = (review.current_path(), self.review_diff_shown()) else {
             return Vec::new();
         };
@@ -1641,7 +2642,9 @@ impl GitCometView {
         };
         // Since your last review the old side is that review's version, not
         // the base the threads' old lines count in.
-        let old_line = row.old_line.filter(|_| review.since_base().is_none());
+        let old_line = row
+            .old_line
+            .filter(|_| review.since_base().is_none() && review.commit_range.is_none());
         threads_on_row(&review.threads, path, old_line, row.new_line)
     }
 
@@ -1650,13 +2653,16 @@ impl GitCometView {
         let Some(review) = self.active_review() else {
             return Vec::new();
         };
+        if review.historical_range() {
+            return Vec::new();
+        }
         let (Some(path), true) = (review.current_path(), self.review_diff_shown()) else {
             return Vec::new();
         };
         let Some(row) = self.main_pane.read(cx).review_cursor_row() else {
             return Vec::new();
         };
-        let since = review.since_base().is_some();
+        let since = review.since_base().is_some() || review.commit_range.is_some();
         review
             .suggestions
             .iter()
@@ -1720,7 +2726,7 @@ impl GitCometView {
     ) {
         let Some(review) = self
             .review
-            .as_mut()
+            .as_ref()
             .filter(|review| review.repo_id == repo_id && review.number == number)
         else {
             return;
@@ -1742,18 +2748,93 @@ impl GitCometView {
             );
             return;
         };
+        let total = suggestions.len();
+        let (suggestions, dropped) = self.filter_suggestions_to_hunks(repo_id, number, suggestions);
+        let Some(review) = self
+            .review
+            .as_mut()
+            .filter(|review| review.repo_id == repo_id && review.number == number)
+        else {
+            return;
+        };
         let count = suggestions.len();
         review.suggestions = suggestions;
         self.sync_review_marks(cx);
         self.notify_pull_request_panes(cx);
-        let message = match count {
-            0 => "Codex had no line comments to suggest.".to_string(),
+        let mut message = match count {
+            0 if total == 0 => "Codex had no line comments to suggest.".to_string(),
+            0 => "Codex's line comments were all outside the diff's hunks; none could be kept."
+                .to_string(),
             n => format!(
                 "Codex suggested {n} line comment{}. t steps to them; a adds one to your review, x drops it.",
                 if n == 1 { "" } else { "s" }
             ),
         };
+        if dropped > 0 && count > 0 {
+            message.push_str(&format!(
+                " ({dropped} outside the diff's hunks {} dropped)",
+                if dropped == 1 { "was" } else { "were" }
+            ));
+        }
         self.push_toast(components::ToastKind::Success, message, cx);
+    }
+
+    /// Drops suggestions whose line falls outside the PR's own diff hunks
+    /// (GitHub would refuse the whole review over one such line): best
+    /// effort, so a path whose hunk ranges can't be read right now (still
+    /// loading, or on the old side, which has no equivalent range here)
+    /// passes its suggestions through unfiltered rather than guessing.
+    /// Returns the kept suggestions and how many were dropped.
+    fn filter_suggestions_to_hunks(
+        &self,
+        repo_id: RepoId,
+        number: u64,
+        suggestions: Vec<ReviewComment>,
+    ) -> (Vec<ReviewComment>, usize) {
+        let Some(workdir) = self
+            .state
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .map(|repo| repo.spec.workdir.clone())
+        else {
+            return (suggestions, 0);
+        };
+        let Some(base) = self.review_diff_base(repo_id, number) else {
+            return (suggestions, 0);
+        };
+        let Some(head) = self
+            .review_of(repo_id, number)
+            .map(|review| review.range_head().to_string())
+        else {
+            return (suggestions, 0);
+        };
+        let mut ranges_by_path: FxHashMap<String, Vec<(u32, u32)>> = FxHashMap::default();
+        let mut dropped = 0;
+        let kept = suggestions
+            .into_iter()
+            .filter(|comment| {
+                // Only right-side (added/unchanged, new-file) lines have a
+                // ready-made ranges helper; an old-side line is left as is.
+                if comment.anchor.side != ReviewSide::Right {
+                    return true;
+                }
+                let ranges = ranges_by_path
+                    .entry(comment.anchor.path.clone())
+                    .or_insert_with(|| {
+                        crate::github::pr_hunk_ranges(&workdir, &base, &head, &comment.anchor.path)
+                            .unwrap_or_default()
+                    });
+                let ok = ranges
+                    .iter()
+                    .any(|(lo, hi)| comment.anchor.line >= *lo && comment.anchor.line <= *hi);
+                if !ok {
+                    dropped += 1;
+                }
+                ok
+            })
+            .collect();
+        (kept, dropped)
     }
 
     /// Details shows the thread under the cursor; the cursor lives in the
@@ -1911,10 +2992,12 @@ impl GitCometView {
             .as_ref()
             .and_then(|review| {
                 let path = review.current_path()?;
-                let since = review.since_base().is_some();
+                let since = review.since_base().is_some() || review.commit_range.is_some();
                 // Since your last review, old-side lines count in another
                 // version: only head-side marks still point at their line.
-                let keep = |key: &(ReviewSide, u32)| !since || key.0 == ReviewSide::Right;
+                let keep = |key: &(ReviewSide, u32)| {
+                    !review.historical_range() && (!since || key.0 == ReviewSide::Right)
+                };
                 // A reply to an outdated conversation sits on a line of an
                 // older commit: nothing in this diff to mark.
                 let marks: Marks = review
@@ -1940,7 +3023,17 @@ impl GitCometView {
                     .map(|suggestion| (suggestion.anchor.side, suggestion.anchor.line))
                     .filter(keep)
                     .collect();
-                let scope = if since {
+                let scope = if review.historical_range() {
+                    ReviewCommentScope::Historical
+                } else if review.commit_range.is_some() {
+                    ReviewCommentScope::Range(
+                        review
+                            .hunk_ranges
+                            .get(path)
+                            .cloned()
+                            .unwrap_or(SinceLines::Loading),
+                    )
+                } else if since {
                     ReviewCommentScope::Since(
                         review
                             .hunk_ranges
@@ -1954,11 +3047,16 @@ impl GitCometView {
                 Some((marks, threads, suggestions, scope))
             })
             .unwrap_or_default();
+        let generated_placeholder = self
+            .review
+            .as_ref()
+            .is_some_and(ReviewMode::generated_placeholder_active);
         self.main_pane.update(cx, |pane, cx| {
             pane.review_marks = marks;
             pane.review_thread_marks = threads;
             pane.review_suggestion_marks = suggestions;
             pane.review_comment_scope = scope;
+            pane.review_generated_placeholder = generated_placeholder;
             cx.notify();
         });
     }
@@ -2121,8 +3219,16 @@ impl GitCometView {
         };
         let anchor = comment.anchor.clone();
         review.selected_comment = Some(ix);
-        let refusal = if review.replies_to_outdated(&comment) {
+        let refusal = if review.historical_range() {
+            Some(
+                "This comment is pinned to the current PR head; press C for All changes to open its line.",
+            )
+        } else if review.replies_to_outdated(&comment) {
             Some("This replies to an outdated conversation; its line isn't in this diff.")
+        } else if review.commit_range.is_some() && anchor.side == ReviewSide::Left {
+            Some(
+                "This comment uses the full PR base's old lines; press C for All changes to open it.",
+            )
         } else if review.since_base().is_some() && anchor.side == ReviewSide::Left {
             // The old side shown is your last review's version, not the base.
             Some("This comment is on an old line of the base; press L for the whole pull request.")
@@ -2135,7 +3241,12 @@ impl GitCometView {
             return;
         }
         let Some(file_ix) = review.files.iter().position(|path| *path == anchor.path) else {
-            let message = if self.review_files_listing() {
+            let message = if review.commit_range.is_some() {
+                format!(
+                    "{} is outside the selected commit range; press C for All changes.",
+                    anchor.path
+                )
+            } else if self.review_files_listing() {
                 format!(
                     "{} is still being listed; try again once the file list is in.",
                     anchor.path
@@ -2148,12 +3259,31 @@ impl GitCometView {
             self.push_toast(components::ToastKind::Warning, message, cx);
             return;
         };
+        self.review_jump_to(file_ix, anchor.side, anchor.line, window, cx);
+    }
+
+    /// Opens `file_ix` (if it isn't already) and lands the cursor on
+    /// `side`/`line` once its diff is on screen, focusing the diff (or
+    /// asking to once it opens). Shared tail of `review_jump_to_comment`
+    /// (above) and the reviewer menu's `b`-row jump
+    /// (`reviewer_menu::review_jump_to_line`).
+    pub(super) fn review_jump_to(
+        &mut self,
+        file_ix: usize,
+        side: ReviewSide,
+        line: u32,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
         if file_ix != review.file_ix {
             self.review_open_file(file_ix, cx);
         }
         // Lands once the file's diff is on screen (right away if it is).
         if let Some(review) = self.review.as_mut() {
-            review.pending_jump = Some((anchor.side, anchor.line));
+            review.pending_jump = Some((side, line));
         }
         if self.diff_is_open() {
             self.focus_panel(FocusPanel::Diff, window, cx);
@@ -2190,11 +3320,19 @@ impl GitCometView {
         let active = self.active_review().is_some();
         if self.main_pane.read(cx).review_active != active {
             let main = self.main_pane.clone();
+            let reopen_ix = active
+                .then(|| self.review.as_ref().map(|review| review.file_ix))
+                .flatten()
+                .filter(|_| !self.review_diff_shown());
+            let view = cx.entity();
             window.defer(cx, move |_window, cx| {
                 main.update(cx, |pane, cx| {
                     pane.review_active = active;
                     cx.notify();
                 });
+                if let Some(ix) = reopen_ix {
+                    view.update(cx, |this, cx| this.review_open_file(ix, cx));
+                }
             });
         }
         if let Some(base) = self.review_base_moved()
@@ -2209,10 +3347,10 @@ impl GitCometView {
                 view.update(cx, |this, cx| this.review_open_file(ix, cx));
             });
         }
-        if self
-            .active_review()
-            .is_some_and(|review| review.since_base().is_some())
-        {
+        if self.active_review().is_some_and(|review| {
+            review.since_base().is_some()
+                || (review.commit_range.is_some() && !review.historical_range())
+        }) {
             // Once the merge base is known, or after it moved.
             let view = cx.entity();
             window.defer(cx, move |_window, cx| {
@@ -2277,22 +3415,61 @@ impl GitCometView {
             _ => 0,
         };
         let shown = self.review_diff_shown();
+        // A rendered block has no single text-diff line: reading the cursor
+        // as one (`r`, `t`/`T`, `a`/`x`) would act on whatever row happens to
+        // share that row number, not the block actually under the cursor.
+        let markdown_preview = self.main_pane.read(cx).is_markdown_preview_active();
         match (current, lower.as_str(), shift) {
+            (_, "c", true) => {
+                self.open_commit_scope_picker(cx);
+            }
             (_, "q", false) => self.leave_review(window, cx),
             (_, "s", true) => self.open_review_submit(window, cx),
             // History is hidden while reviewing; the diff stays.
             (_, "2", false) if !self.diff_is_open() => {}
-            (Some(FocusPanel::Diff), "r", false) => self.review_reply_at_cursor(window, cx),
+            (Some(FocusPanel::Diff), "r", false) if markdown_preview => self.push_toast(
+                components::ToastKind::Warning,
+                "A rendered block has no line to reply on; c switches to Text.".to_string(),
+                cx,
+            ),
+            (Some(FocusPanel::Diff), "r", false)
+                if !self
+                    .active_review()
+                    .is_some_and(ReviewMode::historical_range) =>
+            {
+                self.review_reply_at_cursor(window, cx)
+            }
+            (Some(FocusPanel::Diff), "r", false) => self.push_toast(
+                components::ToastKind::Warning,
+                "This range ends before the PR head. Choose a range ending at the current head to add line comments.".to_string(), cx),
             (Some(FocusPanel::Details), "r", false) => self.review_reply_to_outdated(window, cx),
             // Elsewhere `r` does nothing rather than start another review.
             (_, "r", false) => {}
-            (Some(FocusPanel::Diff), "t", _) => {
+            (Some(FocusPanel::Diff), "t", _) if markdown_preview => self.push_toast(
+                components::ToastKind::Warning,
+                "A rendered block has no line to step threads by; c switches to Text.".to_string(),
+                cx,
+            ),
+            (Some(FocusPanel::Diff), "t", _)
+                if !self
+                    .active_review()
+                    .is_some_and(ReviewMode::historical_range) =>
+            {
                 self.review_step_thread(if shift { -1 } else { 1 }, cx)
             }
+            (Some(FocusPanel::Diff), "t", _) => self.push_toast(
+                components::ToastKind::Warning,
+                "This range ends before the PR head. Choose a range ending at the current head to add line comments.".to_string(), cx),
             (_, "l", true) => self.review_toggle_only_changed(cx),
             (_, "v", true) => {
                 if let Some(review) = self.review.as_mut() {
                     review.show_viewed = !review.show_viewed;
+                }
+                self.notify_pull_request_panes(cx);
+            }
+            (_, "g", true) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.show_generated = !review.show_generated;
                 }
                 self.notify_pull_request_panes(cx);
             }
@@ -2306,6 +3483,17 @@ impl GitCometView {
             {
                 self.sidebar_pane
                     .update(cx, |pane, cx| pane.reset_review_query(cx))
+            }
+            (Some(FocusPanel::Sidebar), "`", false) => {
+                if let Some(repo_id) = self.review.as_ref().map(|review| review.repo_id) {
+                    self.details_pane.update(cx, |pane, cx| {
+                        pane.toggle_file_list_layout(
+                            repo_id,
+                            crate::view::rows::FileListId::Review,
+                            cx,
+                        )
+                    });
+                }
             }
             (_, "]", false) => self.review_step_file(1, cx),
             (_, "[", false) => self.review_step_file(-1, cx),
@@ -2329,13 +3517,31 @@ impl GitCometView {
             }
             (Some(FocusPanel::Diff), _, _) if direction != 0 => {
                 if shown {
+                    let markdown_preview = self.main_pane.read(cx).is_markdown_preview_active();
                     self.defer_pane_action(self.main_pane.clone(), cx, move |pane, _, cx| {
-                        pane.review_move_cursor(i32::from(direction), shift, cx)
+                        if markdown_preview {
+                            pane.review_move_markdown_block_cursor(i32::from(direction), cx)
+                        } else {
+                            pane.review_move_cursor(i32::from(direction), shift, cx)
+                        }
                     });
                     self.notify_review_details_after_move(cx);
                 }
             }
+            // In the rendered preview a row has no single line to comment on,
+            // so `c` does what GitHub's own preview offers instead: switch to
+            // Text with the cursor already on the block's first source line.
+            (Some(FocusPanel::Diff), "c", false)
+                if self.main_pane.read(cx).is_markdown_preview_active() =>
+            {
+                self.review_switch_markdown_preview_to_text_at_cursor(cx)
+            }
             (Some(FocusPanel::Diff), "c", false) => self.review_comment_at_cursor(window, cx),
+            (Some(FocusPanel::Diff), "a" | "x", false) if markdown_preview => self.push_toast(
+                components::ToastKind::Warning,
+                "A rendered block isn't a suggestion's line; c switches to Text.".to_string(),
+                cx,
+            ),
             (Some(FocusPanel::Diff), "a", false) => self.review_take_suggestion(true, cx),
             (Some(FocusPanel::Diff), "x", false) => self.review_take_suggestion(false, cx),
             (Some(FocusPanel::Diff | FocusPanel::Sidebar), "space", false) => {
@@ -2343,12 +3549,34 @@ impl GitCometView {
             }
             (_, "space", false) => {}
             (Some(FocusPanel::Sidebar), _, false) if direction != 0 => {
-                self.review_step_file(direction, cx)
+                self.review_step_sidebar(direction, cx)
             }
             (Some(FocusPanel::Sidebar), "enter", false) => {
-                if self.diff_is_open() {
+                if self.review_toggle_cursor_dir(cx) {
+                    return Some(true);
+                }
+                let dismissed_placeholder = self
+                    .active_review()
+                    .is_some_and(ReviewMode::generated_placeholder_active);
+                self.review_dismiss_generated_placeholder(cx);
+                if dismissed_placeholder {
+                    // The diff this just asked for is still in flight (it was
+                    // never requested while the placeholder was up); focus it
+                    // as soon as it opens rather than needing a second enter.
+                    self.focus_diff_when_open = true;
+                } else if self.diff_is_open() {
                     self.focus_panel(FocusPanel::Diff, window, cx);
                 }
+            }
+            // `enter` also loads a generated file's diff from the Diff panel
+            // itself (the placeholder can be reached by moving there while
+            // it's up, not only from the Sidebar).
+            (Some(FocusPanel::Diff), "enter", false)
+                if self
+                    .active_review()
+                    .is_some_and(ReviewMode::generated_placeholder_active) =>
+            {
+                self.review_dismiss_generated_placeholder(cx);
             }
             (Some(FocusPanel::Details), _, false) if direction != 0 => {
                 self.review_select_comment(direction, cx)
@@ -2423,6 +3651,39 @@ impl GitCometView {
         };
         review.query = query;
         self.notify_pull_request_panes(cx);
+    }
+
+    /// `c` in the rendered preview: a rendered row has no single line to
+    /// comment on the way a text diff row does, so this switches to Text
+    /// instead, with the cursor already on the block's first source line.
+    fn review_switch_markdown_preview_to_text_at_cursor(&mut self, cx: &mut gpui::Context<Self>) {
+        let landed = self.main_pane.update(cx, |pane, cx| {
+            let Some((side, line)) = pane.markdown_preview_cursor_source_line() else {
+                return false;
+            };
+            pane.rendered_preview_modes
+                .set(RenderedPreviewKind::Markdown, RenderedPreviewMode::Source);
+            pane.diff_search_recompute_matches();
+            let landed = pane.review_jump_to(side, line, cx);
+            if !landed {
+                // The mode already flipped to Text, so the markdown row index
+                // still sitting in `diff_selection_anchor`/`range` no longer
+                // names a row at all there; leaving it would draw the cursor
+                // on whatever text-diff row happens to share that number.
+                pane.diff_selection_anchor = None;
+                pane.diff_selection_range = None;
+            }
+            landed
+        });
+        if landed {
+            self.notify_review_details_after_move(cx);
+        } else {
+            self.push_toast(
+                components::ToastKind::Warning,
+                "That block has no line to switch to in Text.".to_string(),
+                cx,
+            );
+        }
     }
 
     /// `S`: the submit dialog for the review in progress.
@@ -2824,6 +4085,7 @@ mod tests {
             number: 7,
             title: String::new(),
             files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+            all_files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
             file_ix: 0,
             draft: ReviewDraft::default(),
             selected_comment: None,
@@ -2837,11 +4099,11 @@ mod tests {
             suggestions: Vec::new(),
             suggestion_generation: 0,
             written_seq: Default::default(),
-            last_review: Default::default(),
+            since_base_oid: None,
             since_review: None,
             only_changed: false,
+            commit_range: None,
             viewed_syncing_to: None,
-            last_review_seq: 0,
             since_seq: 0,
             viewed_sync: ViewedSync::Idle,
             viewed_seq: 0,
@@ -2855,40 +4117,88 @@ mod tests {
             reopened_for: None,
             query: Default::default(),
             show_viewed: false,
+            generated: Default::default(),
+            show_generated: false,
+            generated_placeholder_dismissed: Default::default(),
+            sidebar_dir_cursor: None,
         };
         review.draft.head_oid = "h1".into();
         review
+    }
+
+    /// A generated file that's also viewed is hidden, and counted once —
+    /// under `generated_hidden`, never `viewed_hidden` too — until `Shift+G`
+    /// shows it. Viewing it doesn't change that.
+    #[test]
+    fn generated_files_are_hidden_regardless_of_viewed_and_counted_once() {
+        let mut review = test_review();
+        review.generated = Arc::new(["b.rs".to_string()].into_iter().collect());
+        // Nothing viewed yet: b.rs is hidden only because it's generated.
+        assert_eq!(
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(review.viewed_hidden(), 0);
+        assert_eq!(review.generated_hidden(), 1);
+        assert_eq!(review.non_generated_file_count(), 2);
+
+        // Viewing the generated file changes nothing about its visibility or
+        // which counter it falls under.
+        review.draft.viewed.insert("b.rs".to_string());
+        assert_eq!(
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(review.viewed_hidden(), 0);
+        assert_eq!(review.generated_hidden(), 1);
+
+        // A separately viewed, non-generated file is hidden under
+        // `viewed_hidden` instead.
+        review.draft.viewed.insert("a.rs".to_string());
+        assert_eq!(review.viewed_hidden(), 1);
+        assert_eq!(review.generated_hidden(), 1);
+
+        // Shift+G shows the generated file; it still doesn't count as viewed.
+        review.show_generated = true;
+        assert_eq!(
+            (0..review.files.len())
+                .filter(|ix| review.file_listed(*ix))
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(review.generated_hidden(), 0);
     }
 
     #[test]
     fn the_last_review_line_says_what_changed_since() {
         let mut review = test_review();
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
-        assert_eq!(review.last_review_line(now), None);
-        review.last_review =
-            super::super::pull_requests::PrLoad::Ready(Some(crate::github::LastReview {
-                state: "APPROVED".into(),
-                body: String::new(),
-                // Two days before `now`.
-                submitted_at: "2001-09-07T01:46:40Z".into(),
-                commit_id: "abc1234def".into(),
-            }));
+        let last = crate::github::LastReview {
+            state: "APPROVED".into(),
+            body: String::new(),
+            // Two days before `now`.
+            submitted_at: "2001-09-07T01:46:40Z".into(),
+            commit_id: "abc1234def".into(),
+        };
         assert_eq!(
-            review.last_review_line(now).as_deref(),
-            Some("Your last review: Approved · 2 days ago · at abc1234")
+            review.last_review_line(&last, now),
+            "Your last review: Approved · 2 days ago · at abc1234"
         );
         review.since_review = Some(SinceReview::Changed(crate::github::ChangesSince {
             files: ["b.rs".to_string(), "not-in-pr.rs".to_string()].into(),
             commits: 3,
         }));
         assert_eq!(
-            review.last_review_line(now).as_deref(),
-            Some(
-                "Your last review: Approved · 2 days ago · at abc1234 · 3 commits since · 1 file changed since"
-            )
+            review.last_review_line(&last, now),
+            "Your last review: Approved · 2 days ago · at abc1234 · 3 commits since · 1 file changed since"
         );
         // `L` keeps the walk to b.rs, and the diff starts at the last review.
         assert_eq!(review.since_base(), None);
+        review.since_base_oid = Some(last.commit_id.clone());
         review.only_changed = true;
         assert_eq!(
             (0..3).map(|ix| review.file_listed(ix)).collect::<Vec<_>>(),
@@ -3037,6 +4347,8 @@ mod tests {
             side,
             line,
             original_line: line,
+            is_resolved: false,
+            is_outdated: false,
             comments: vec![ThreadComment {
                 author: "octo".into(),
                 body: "?".into(),

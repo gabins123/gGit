@@ -339,6 +339,11 @@ pub struct AppStore {
     state: Arc<RwLock<Arc<AppState>>>,
     msg_tx: StoreWorkerSender,
     public_lifetime: Arc<StorePublicLifetime>,
+    /// The backend this store opens repositories with. Kept so view-layer
+    /// code that needs a one-off, ad-hoc git read (outside the reducer's own
+    /// `Msg`/effect flow) can open the same kind of repository the store
+    /// itself would, rather than hardcoding a concrete backend.
+    backend: Arc<dyn GitBackend>,
 }
 
 struct StorePublicLifetime {
@@ -363,6 +368,7 @@ impl Clone for AppStore {
             state: Arc::clone(&self.state),
             msg_tx: self.msg_tx.clone(),
             public_lifetime: Arc::clone(&self.public_lifetime),
+            backend: Arc::clone(&self.backend),
         }
     }
 }
@@ -385,6 +391,7 @@ impl AppStore {
         backend: Arc<dyn GitBackend>,
         initial: AppState,
     ) -> (Self, smol::channel::Receiver<StoreEvent>) {
+        let public_backend = Arc::clone(&backend);
         let state = Arc::new(RwLock::new(Arc::new(initial)));
         let (command_tx, command_rx) = mpsc::channel::<StoreWorkerCommand>();
         let store_id = StoreInstanceId::next();
@@ -687,6 +694,7 @@ impl AppStore {
                 state,
                 msg_tx: msg_tx.clone(),
                 public_lifetime: Arc::new(StorePublicLifetime::new(msg_tx)),
+                backend: public_backend,
             },
             event_rx,
         )
@@ -694,6 +702,14 @@ impl AppStore {
 
     pub fn dispatch(&self, msg: Msg) {
         self.msg_tx.dispatch(msg);
+    }
+
+    /// The backend this store opens repositories with, for a caller that
+    /// needs to read git data outside the reducer's own `Msg` flow (e.g. a
+    /// one-off, read-only lookup the view layer runs itself). Prefer
+    /// dispatching a `Msg` when the read belongs in the reducer's state.
+    pub fn backend(&self) -> Arc<dyn GitBackend> {
+        Arc::clone(&self.backend)
     }
 
     pub fn snapshot(&self) -> Arc<AppState> {

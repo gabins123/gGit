@@ -578,7 +578,10 @@ impl Render for GitCometView {
         // closes the list, not the diff underneath. Panel keys themselves run
         // from the app-level keystroke observer (`app.rs`).
         root = root.capture_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
-            if this.handle_codex_menu_key(&e.keystroke, window, cx)
+            if this.commit_scope_picker.is_some()
+                && this.handle_commit_scope_picker_key(&e.keystroke, cx)
+                || this.handle_reviewer_menu_key(&e.keystroke, window, cx)
+                || this.handle_codex_menu_key(&e.keystroke, window, cx)
                 || this.handle_keys_help_key(&e.keystroke, window, cx)
             {
                 cx.stop_propagation();
@@ -789,6 +792,13 @@ impl Render for GitCometView {
             .keys_help_panel
             .map(|panel| self.render_keys_help(panel, cx));
         let codex_menu = self.codex_menu_open.then(|| self.render_codex_menu(cx));
+        let reviewer_menu = self
+            .reviewer_menu
+            .is_some()
+            .then(|| self.render_reviewer_menu(cx));
+        let commit_scope_picker = self
+            .commit_scope_picker
+            .map(|picker| self.render_commit_scope_picker(picker, cx));
 
         let frame_overlay = div()
             .absolute()
@@ -797,6 +807,8 @@ impl Render for GitCometView {
             .size_full()
             .children(keys_help)
             .children(codex_menu)
+            .children(reviewer_menu)
+            .children(commit_scope_picker)
             .child(self.command_palette.clone())
             .child(stable_overlay_view(self.reveal_commit_dialog.clone()))
             .child(stable_overlay_view(self.history_refs_hover_host.clone()))

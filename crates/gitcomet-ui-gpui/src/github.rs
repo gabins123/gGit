@@ -19,8 +19,10 @@ pub(crate) const MAX_LISTED_FILES: u64 = 3_000;
 /// Files per page of that list; `gh pr view` carries the first page.
 pub(crate) const FILES_PER_PAGE: u64 = 100;
 /// Codex reads the whole diff in one prompt: past these it's too much.
-const MAX_CODEX_FILES: u64 = 100;
-const MAX_CODEX_CHANGED_LINES: u64 = 20_000;
+/// `pub(crate)` so `reviewer::diff_too_large` can apply the same limit to a
+/// reviewer scope's assembled material, not just a whole pull request.
+pub(crate) const MAX_CODEX_FILES: u64 = 100;
+pub(crate) const MAX_CODEX_CHANGED_LINES: u64 = 20_000;
 
 /// How far `gh pr list` looks. Open PRs past this are on GitHub.
 const LIST_LIMIT: u32 = 100;
@@ -60,6 +62,7 @@ pub(crate) enum ReviewDecision {
     Approved,
     ChangesRequested,
     ReviewRequired,
+    Commented,
 }
 
 impl ReviewDecision {
@@ -77,8 +80,104 @@ impl ReviewDecision {
             Self::Approved => "Approved",
             Self::ChangesRequested => "Changes requested",
             Self::ReviewRequired => "Review required",
+            Self::Commented => "Commented",
         }
     }
+
+    /// `author_login` is the pull request's own author: their replies show up
+    /// as a COMMENTED review and must not stand in for an actual reviewer.
+    fn from_reviews(
+        decision: &str,
+        requests: &[RawReviewRequest],
+        reviews: &[RawLatestReview],
+        author_login: &str,
+    ) -> Option<Self> {
+        if let Some(decision) = Self::parse(decision) {
+            return Some(decision);
+        }
+        let requested_logins: Vec<String> = requests
+            .iter()
+            .filter_map(|request| {
+                request
+                    .requested_reviewer
+                    .as_ref()
+                    .and_then(RawReviewerIdentity::display_name)
+                    .or_else(|| request.identity.display_name())
+            })
+            .collect();
+        let mut approved = false;
+        let mut commented = false;
+        let mut changes_requested = false;
+        for review in reviews {
+            // gh sometimes omits a review's author; without one there's no PR
+            // author or pending request to match, so the review still counts.
+            let login = review.author.as_ref().map_or("", |author| &author.login);
+            if !login.is_empty()
+                && (login.eq_ignore_ascii_case(author_login)
+                    || requested_logins
+                        .iter()
+                        .any(|requested| requested.eq_ignore_ascii_case(login)))
+            {
+                continue;
+            }
+            match review.state.as_str() {
+                "CHANGES_REQUESTED" => changes_requested = true,
+                "APPROVED" => approved = true,
+                "COMMENTED" => commented = true,
+                _ => {}
+            }
+        }
+        if changes_requested {
+            Some(Self::ChangesRequested)
+        } else if !requested_logins.is_empty() {
+            Some(Self::ReviewRequired)
+        } else if approved {
+            Some(Self::Approved)
+        } else if commented {
+            Some(Self::Commented)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrReviewerStatus {
+    Requested,
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+}
+
+impl PrReviewerStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "APPROVED" => Some(Self::Approved),
+            "CHANGES_REQUESTED" => Some(Self::ChangesRequested),
+            "COMMENTED" => Some(Self::Commented),
+            "DISMISSED" => Some(Self::Dismissed),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "Review requested",
+            Self::Approved => "Approved",
+            Self::ChangesRequested => "Changes requested",
+            Self::Commented => "Commented",
+            Self::Dismissed => "Dismissed",
+        }
+    }
+}
+
+/// A requested reviewer or the reviewer's latest submitted verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrReviewer {
+    /// The user's login, or a team's name when GitHub requested a team.
+    pub(crate) login: String,
+    pub(crate) status: PrReviewerStatus,
 }
 
 /// One entry of gh's `statusCheckRollup`: a check run (`name`, `status` +
@@ -171,9 +270,15 @@ struct RawSummary {
     #[serde(default)]
     is_draft: bool,
     #[serde(default)]
+    is_cross_repository: bool,
+    #[serde(default)]
     review_decision: String,
     #[serde(default)]
     status_check_rollup: Vec<CheckEntry>,
+    #[serde(default)]
+    review_requests: Vec<RawReviewRequest>,
+    #[serde(default)]
+    latest_reviews: Vec<RawLatestReview>,
 }
 
 /// A row of the open pull request list.
@@ -188,14 +293,25 @@ pub(crate) struct PullRequestSummary {
     pub(crate) head_owner: String,
     pub(crate) base: String,
     pub(crate) is_draft: bool,
+    /// From a fork: its head branch name means nothing in this repository,
+    /// so it can never be part of a stack here.
+    pub(crate) is_cross_repository: bool,
     pub(crate) review: Option<ReviewDecision>,
     pub(crate) checks: ChecksSummary,
     /// Your review is requested on it.
     pub(crate) review_requested: bool,
+    /// The signed-in GitHub account authored this pull request.
+    pub(crate) is_mine: bool,
 }
 
 impl From<RawSummary> for PullRequestSummary {
     fn from(raw: RawSummary) -> Self {
+        let review = ReviewDecision::from_reviews(
+            &raw.review_decision,
+            &raw.review_requests,
+            &raw.latest_reviews,
+            &raw.author.login,
+        );
         Self {
             number: raw.number,
             title: raw.title,
@@ -204,9 +320,11 @@ impl From<RawSummary> for PullRequestSummary {
             head_owner: raw.head_repository_owner.login,
             base: raw.base_ref_name,
             is_draft: raw.is_draft,
-            review: ReviewDecision::parse(&raw.review_decision),
+            is_cross_repository: raw.is_cross_repository,
+            review,
             checks: ChecksSummary::from_entries(&raw.status_check_rollup),
             review_requested: false,
+            is_mine: false,
         }
     }
 }
@@ -220,9 +338,523 @@ pub(crate) struct PullRequestFile {
     pub(crate) deletions: u64,
 }
 
+/// A stacked pull request unit: every PR from the stack base up. GitHub
+/// allows a PR to have two children (a tree); it is flattened here, depth
+/// first, ordered by number, so it still "shows as one" — `stack_parent`,
+/// `stack_child` and `stack_depth` below recover the real shape from base and
+/// head branches (or, for a native stack, straight-line by construction).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestStack {
+    /// Every pull request in the stack; `members[0]` is always the base.
+    pub(crate) members: Vec<u64>,
+    /// One of GitHub's own stacks (the GraphQL `stack` field), not just a
+    /// base-branch chain gGit inferred.
+    pub(crate) native: bool,
+}
+
+/// Builds stacks from the base-branch chain: PR B is on PR A when B's base
+/// branch is A's head branch, both in `repo_owner`'s repository (a fork's PR
+/// can't stack: GitHub's `isCrossRepository` is trusted first, a
+/// case-insensitive owner compare backs it up in case gh ever fails to
+/// report it). `native_stacks` are GitHub's own stacks (from the live
+/// GraphQL `stack` field, see `native_stacks` below); a chain is `native`
+/// when its member set matches one of them exactly. Pure and cycle-safe: a
+/// chain that loops back on itself stops instead of growing forever.
+pub(crate) fn compute_pull_request_stacks(
+    prs: &[PullRequestSummary],
+    repo_owner: &str,
+    native_stacks: &[PullRequestStack],
+) -> Vec<PullRequestStack> {
+    use std::collections::HashMap;
+
+    let eligible: Vec<&PullRequestSummary> = prs
+        .iter()
+        .filter(|pr| !pr.is_cross_repository && pr.head_owner.eq_ignore_ascii_case(repo_owner))
+        .collect();
+    let by_head: HashMap<&str, u64> = eligible
+        .iter()
+        .map(|pr| (pr.head.as_str(), pr.number))
+        .collect();
+    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut has_parent: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for pr in &eligible {
+        if let Some(&parent) = by_head.get(pr.base.as_str())
+            && parent != pr.number
+        {
+            children.entry(parent).or_default().push(pr.number);
+            has_parent.insert(pr.number);
+        }
+    }
+    for kids in children.values_mut() {
+        kids.sort_unstable();
+    }
+
+    let mut roots: Vec<u64> = eligible
+        .iter()
+        .map(|pr| pr.number)
+        .filter(|number| !has_parent.contains(number) && children.contains_key(number))
+        .collect();
+    roots.sort_unstable();
+
+    roots
+        .into_iter()
+        .filter_map(|root| stack_from_root(root, &children))
+        .map(|members| {
+            let native = native_stacks.iter().any(|native| {
+                native.members.len() == members.len()
+                    && native.members.iter().all(|number| members.contains(number))
+            });
+            PullRequestStack { members, native }
+        })
+        .collect()
+}
+
+/// Every pull request reachable from `root` through `children`, depth-first
+/// pre-order (a parent before its children), or `None` when that's fewer
+/// than the two pull requests a stack needs. Cycle-safe: a number already
+/// visited is never queued again.
+fn stack_from_root(
+    root: u64,
+    children: &std::collections::HashMap<u64, Vec<u64>>,
+) -> Option<Vec<u64>> {
+    let mut members = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = vec![root];
+    while let Some(number) = pending.pop() {
+        if !visited.insert(number) {
+            continue;
+        }
+        members.push(number);
+        if let Some(kids) = children.get(&number) {
+            pending.extend(kids.iter().rev());
+        }
+    }
+    (members.len() >= 2).then_some(members)
+}
+
+/// The pull request `number`'s base branch points at, among `members` — its
+/// real parent, not just the entry before it in a flattened list (a tree's
+/// depth-first order can put a sibling there instead).
+pub(crate) fn stack_parent(members: &[u64], number: u64, prs: &[PullRequestSummary]) -> Option<u64> {
+    let pr = prs.iter().find(|pr| pr.number == number)?;
+    members.iter().copied().find(|&candidate| {
+        candidate != number
+            && prs
+                .iter()
+                .any(|other| other.number == candidate && other.head == pr.base)
+    })
+}
+
+/// The lowest-numbered pull request based directly on `number`, among
+/// `members` — deterministic when `number` has more than one child.
+pub(crate) fn stack_child(members: &[u64], number: u64, prs: &[PullRequestSummary]) -> Option<u64> {
+    let pr = prs.iter().find(|pr| pr.number == number)?;
+    members
+        .iter()
+        .copied()
+        .filter(|&candidate| {
+            candidate != number
+                && prs
+                    .iter()
+                    .any(|other| other.number == candidate && other.base == pr.head)
+        })
+        .min()
+}
+
+/// `number`'s distance from the stack's base (0 = bottom), following real
+/// parent links (`stack_parent`) rather than a flattened member order a tree
+/// can put out of a line. `None` when `number` isn't among `members`.
+pub(crate) fn stack_depth(members: &[u64], number: u64, prs: &[PullRequestSummary]) -> Option<usize> {
+    if !members.contains(&number) {
+        return None;
+    }
+    let mut depth = 0;
+    let mut current = number;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(parent) = stack_parent(members, current, prs) {
+        if !seen.insert(current) {
+            break;
+        }
+        depth += 1;
+        current = parent;
+    }
+    Some(depth)
+}
+
+/// GitHub's own stacks among `numbers` (queried pull requests), read from the
+/// live GraphQL `stack` field: each stack's members, in GitHub's own order
+/// (its `entries`, sorted by `position`; `members[0]` is the stack's base).
+/// Best-effort: a repository without the public preview, or any GraphQL
+/// failure, comes back empty rather than failing the whole list.
+pub(crate) fn native_stacks(workdir: &Path, repo: &str, numbers: &[u64]) -> Vec<PullRequestStack> {
+    if numbers.is_empty() || !is_repo_slug(repo) {
+        return Vec::new();
+    }
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Vec::new();
+    };
+    let mut fields = String::new();
+    for number in numbers {
+        if *number > i32::MAX as u64 {
+            continue;
+        }
+        fields.push_str(&format!(
+            "pr{number}: pullRequest(number: {number}) {{ stack {{ number entries(first: 50) {{ nodes {{ position pullRequest {{ number }} }} }} }} }}\n"
+        ));
+    }
+    let query =
+        format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ {fields} }} }}");
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "graphql",
+        "--hostname=github.com",
+        &format!("--raw-field=query={query}"),
+    ]);
+    match run(command, None) {
+        Ok(bytes) => parse_native_stacks(&bytes).unwrap_or_default(),
+        Err(err) => {
+            eprintln!("Couldn't read GitHub's native pull request stacks: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn parse_native_stacks(bytes: &[u8]) -> Result<Vec<PullRequestStack>, PrError> {
+    #[derive(Deserialize)]
+    struct EntryPr {
+        number: u64,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EntryNode {
+        position: i64,
+        #[serde(default)]
+        pull_request: Option<EntryPr>,
+    }
+    #[derive(Deserialize, Default)]
+    struct EntryConnection {
+        #[serde(default)]
+        nodes: Vec<Option<EntryNode>>,
+    }
+    #[derive(Deserialize)]
+    struct Stack {
+        number: u64,
+        #[serde(default)]
+        entries: EntryConnection,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        stack: Option<Stack>,
+    }
+    let value: serde_json::Value = parse_json(bytes)?;
+    let repository = value
+        .get("data")
+        .and_then(|data| data.get("repository"))
+        .and_then(|repo| repo.as_object())
+        .ok_or_else(|| PrError::Failed("unexpected gh output".to_string()))?;
+    let mut by_stack_id: std::collections::HashMap<u64, Vec<(i64, u64)>> =
+        std::collections::HashMap::new();
+    for entry in repository.values() {
+        if entry.is_null() {
+            continue;
+        }
+        let entry: Entry = serde_json::from_value(entry.clone())
+            .map_err(|err| PrError::Failed(format!("unexpected gh output: {err}")))?;
+        let Some(stack) = entry.stack else { continue };
+        let members = by_stack_id.entry(stack.number).or_default();
+        for node in stack.entries.nodes.into_iter().flatten() {
+            let Some(pr) = node.pull_request else { continue };
+            if !members.iter().any(|(_, number)| *number == pr.number) {
+                members.push((node.position, pr.number));
+            }
+        }
+    }
+    let mut stacks: Vec<PullRequestStack> = by_stack_id
+        .into_values()
+        .filter_map(|mut members| {
+            members.sort_by_key(|(position, _)| *position);
+            let members: Vec<u64> = members.into_iter().map(|(_, number)| number).collect();
+            (members.len() >= 2).then_some(PullRequestStack {
+                members,
+                native: true,
+            })
+        })
+        .collect();
+    stacks.sort_by_key(|stack| stack.members.first().copied());
+    Ok(stacks)
+}
+
+/// What merging `number` in `stack` would do, following GitHub's stacked
+/// merge rules: the selected pull request and every unmerged one below it
+/// land together, bottom-up. Only the pull requests *below* `number` need to
+/// be approved, pass their checks, and be ready; `number` itself only needs
+/// to satisfy the base branch's protection rules, which GitHub checks (and
+/// reports through `merge_stack`'s `failed` outcome) at merge time — as does
+/// a non-linear stack, so this never re-derives that shape itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StackMergePlan {
+    /// This pull request and everything below it, bottom-up: what merges.
+    pub(crate) merges: Vec<u64>,
+    /// The rest of the stack, staying open.
+    pub(crate) stays_open: Vec<u64>,
+    /// Why the merge is refused, naming the pull request, or `None` when it
+    /// can go ahead.
+    pub(crate) refusal: Option<String>,
+}
+
+/// Plans a stack merge of `number`, or `None` when it isn't in `stack`.
+pub(crate) fn plan_stack_merge(
+    stack: &PullRequestStack,
+    number: u64,
+    prs: &[PullRequestSummary],
+) -> Option<StackMergePlan> {
+    let ix = stack.members.iter().position(|member| *member == number)?;
+    let by_number: std::collections::HashMap<u64, &PullRequestSummary> =
+        prs.iter().map(|pr| (pr.number, pr)).collect();
+    let refuse = |reason: String| StackMergePlan {
+        merges: Vec::new(),
+        stays_open: stack.members.clone(),
+        refusal: Some(reason),
+    };
+    for &below in &stack.members[..ix] {
+        let Some(pr) = by_number.get(&below) else {
+            return Some(refuse(format!(
+                "#{below} below isn't loaded — refresh or open on GitHub"
+            )));
+        };
+        // No review decision at all means this repository doesn't require
+        // one: that's fine. Anything short of approved is not.
+        if matches!(pr.review, Some(decision) if decision != ReviewDecision::Approved) {
+            return Some(refuse(format!("#{below} isn't approved")));
+        }
+        if pr.checks.failing > 0 {
+            return Some(refuse(format!("#{below} has failing checks")));
+        }
+        if pr.checks.pending > 0 {
+            return Some(refuse(format!("#{below} has checks still running")));
+        }
+        if pr.is_draft {
+            return Some(refuse(format!("#{below} is a draft")));
+        }
+    }
+    Some(StackMergePlan {
+        merges: stack.members[..=ix].to_vec(),
+        stays_open: stack.members[ix + 1..].to_vec(),
+        refusal: None,
+    })
+}
+
+/// How long `merge_stack` polls GitHub's asynchronous merge job before
+/// reporting the outcome as unknown (not failed: GitHub may still finish it).
+const STACK_MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const STACK_MERGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Transient poll failures (a dropped connection, a gh hiccup) tolerated
+/// before giving up on the poll and reporting the outcome as unknown.
+const STACK_MERGE_MAX_POLL_FAILURES: u32 = 3;
+
+/// What GitHub did with a stack merge. Both are terminal: `Enqueued` means it
+/// went into a required merge queue instead of merging immediately, and
+/// GitHub gives nothing further to poll for once it has.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StackMergeOutcome {
+    Merged,
+    Enqueued,
+}
+
+/// The JSON body `merge_stack` sends: the merge method, and the head commit
+/// pinned the way the single-PR path's `--match-head-commit` pins it — per
+/// GitHub's docs, "if the PR is pushed in between the merge being requested
+/// and being executed, the merge will be cancelled."
+fn merge_async_payload(method: MergeMethod, head_oid: &str) -> String {
+    serde_json::json!({
+        "merge_method": method.api_name(),
+        "sha": head_oid,
+    })
+    .to_string()
+}
+
+/// Merges `number` through GitHub's asynchronous stack merge API
+/// (`PUT .../pulls/{number}/merge-async`), the one GitHub documents as
+/// required for a stacked pull request: "the operation includes all open
+/// downstack pull requests." Polls `GET .../merge-async/{uuid}` while the job
+/// is `pending`.
+pub(crate) fn merge_stack(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+    method: MergeMethod,
+    head_oid: &str,
+) -> Result<StackMergeOutcome, PrError> {
+    if !is_repo_slug(repo) {
+        return Err(PrError::Failed(format!(
+            "{repo} isn't a GitHub repository name"
+        )));
+    }
+    if !is_object_id(head_oid) {
+        return Err(PrError::Failed(format!(
+            "#{number}'s head commit isn't known yet"
+        )));
+    }
+    let payload = merge_async_payload(method, head_oid);
+    let mut start = gh(workdir);
+    start.args([
+        "api",
+        "--hostname=github.com",
+        &format!("repos/{repo}/pulls/{number}/merge-async"),
+        "--method=PUT",
+        "--input=-",
+    ]);
+    let mut job = parse_merge_async_job(&run_merge_async_start(start, &payload)?)?;
+    let deadline = std::time::Instant::now() + STACK_MERGE_TIMEOUT;
+    let mut poll_failures = 0u32;
+    let unknown = || {
+        PrError::Failed(format!(
+            "#{number}'s stack merge outcome is unknown; check it on GitHub"
+        ))
+    };
+    loop {
+        match job.status {
+            MergeAsyncStatus::Merged => return Ok(StackMergeOutcome::Merged),
+            MergeAsyncStatus::Enqueued => return Ok(StackMergeOutcome::Enqueued),
+            MergeAsyncStatus::Failed => {
+                return Err(PrError::Failed(job.message.unwrap_or_else(|| {
+                    format!("#{number}'s stack merge failed on GitHub")
+                })));
+            }
+            MergeAsyncStatus::Pending => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(unknown());
+        }
+        std::thread::sleep(STACK_MERGE_POLL_INTERVAL);
+        let Some(uuid) = job.uuid.clone() else {
+            return Err(unknown());
+        };
+        let mut poll = gh(workdir);
+        poll.args([
+            "api",
+            "--hostname=github.com",
+            &format!("repos/{repo}/pulls/{number}/merge-async/{uuid}"),
+        ]);
+        match run(poll, None).and_then(|bytes| parse_merge_async_job(&bytes)) {
+            Ok(next) => {
+                job = next;
+                poll_failures = 0;
+            }
+            Err(_) => {
+                poll_failures += 1;
+                if poll_failures >= STACK_MERGE_MAX_POLL_FAILURES {
+                    return Err(unknown());
+                }
+            }
+        }
+    }
+}
+
+/// GitHub's asynchronous merge job status
+/// (`pending`/`merged`/`enqueued`/`failed`, per GitHub's OpenAPI schema for
+/// `pull-request-merge-async-result`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeAsyncStatus {
+    Pending,
+    Merged,
+    Enqueued,
+    Failed,
+}
+
+/// GitHub's asynchronous merge job, as both `merge-async` and its polling
+/// endpoint return it: `{status, details}`. `details.uuid` polls a `pending`
+/// job; `details.message` explains a `failed` one.
+struct MergeAsyncJob {
+    status: MergeAsyncStatus,
+    uuid: Option<String>,
+    message: Option<String>,
+}
+
+fn parse_merge_async_job(bytes: &[u8]) -> Result<MergeAsyncJob, PrError> {
+    #[derive(Deserialize, Default)]
+    struct RawDetails {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        uuid: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct RawJob {
+        status: String,
+        #[serde(default)]
+        details: Option<RawDetails>,
+    }
+    let raw: RawJob = parse_json(bytes)?;
+    let status = match raw.status.as_str() {
+        "pending" => MergeAsyncStatus::Pending,
+        "merged" => MergeAsyncStatus::Merged,
+        "enqueued" => MergeAsyncStatus::Enqueued,
+        "failed" => MergeAsyncStatus::Failed,
+        other => {
+            return Err(PrError::Failed(format!(
+                "unexpected gh output: unknown merge status {other}"
+            )));
+        }
+    };
+    let details = raw.details.unwrap_or_default();
+    Ok(MergeAsyncJob {
+        status,
+        uuid: details.uuid,
+        message: details.message,
+    })
+}
+
+/// `run`, but on a non-zero exit it first looks at stdout for GitHub's own
+/// explanation: `merge-async` returns its `{status, details}` body even on
+/// 400 and 409 (a non-linear stack, a branch protection rule), and gh's exit
+/// code otherwise hides it behind a generic HTTP error that only stderr's
+/// status line explains. Used only by `merge_stack`'s starting `PUT`; every
+/// other caller keeps plain `run`, whose stderr-only failure is what gh
+/// normally gives.
+fn run_merge_async_start(mut command: Command, body: &str) -> Result<Vec<u8>, PrError> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => PrError::GhMissing,
+        _ => PrError::Failed(err.to_string()),
+    })?;
+    if let Some(mut pipe) = child.stdin.take() {
+        // A write error surfaces as the child's own failure below.
+        let _ = pipe.write_all(body.as_bytes());
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| PrError::Failed(err.to_string()))?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    if let Some(message) = merge_async_failure_message(&output.stdout) {
+        return Err(PrError::Failed(message));
+    }
+    Err(classify_failure(
+        String::from_utf8_lossy(&output.stderr).trim(),
+    ))
+}
+
+/// GitHub's own explanation from a `merge-async` response's
+/// `details.message`, when gh's stdout on a failed exit is that response
+/// body (a 400 or 409, per GitHub's OpenAPI schema for
+/// `pull-request-merge-async-result`); `None` when stdout isn't that body,
+/// or has no message.
+fn merge_async_failure_message(stdout: &[u8]) -> Option<String> {
+    parse_merge_async_job(stdout).ok()?.message
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawComment {
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     author: Author,
     #[serde(default)]
@@ -238,6 +870,8 @@ struct RawComment {
 #[serde(rename_all = "camelCase")]
 struct RawReview {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     author: Author,
     #[serde(default)]
     body: String,
@@ -248,11 +882,132 @@ struct RawReview {
     submitted_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPullRequestCommit {
+    #[serde(default)]
+    oid: String,
+    #[serde(default)]
+    message_headline: String,
+    #[serde(default)]
+    committed_date: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestCommit {
+    pub(crate) oid: String,
+    pub(crate) headline: String,
+    pub(crate) committed_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewerIdentity {
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+impl RawReviewerIdentity {
+    fn display_name(&self) -> Option<String> {
+        self.login
+            .as_ref()
+            .or(self.name.as_ref())
+            .or(self.slug.as_ref())
+            .filter(|name| !name.is_empty())
+            .cloned()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewRequest {
+    #[serde(flatten)]
+    identity: RawReviewerIdentity,
+    #[serde(default)]
+    requested_reviewer: Option<RawReviewerIdentity>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLatestReview {
+    #[serde(default)]
+    author: Option<Author>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    submitted_at: Option<String>,
+}
+
+fn reviewers(requests: Vec<RawReviewRequest>, reviews: Vec<RawLatestReview>) -> Vec<PrReviewer> {
+    let mut result = Vec::new();
+    for request in requests {
+        let Some(login) = request
+            .requested_reviewer
+            .as_ref()
+            .and_then(RawReviewerIdentity::display_name)
+            .or_else(|| request.identity.display_name())
+        else {
+            continue;
+        };
+        if !result
+            .iter()
+            .any(|reviewer: &PrReviewer| reviewer.login.eq_ignore_ascii_case(&login))
+        {
+            result.push(PrReviewer {
+                login,
+                status: PrReviewerStatus::Requested,
+            });
+        }
+    }
+
+    let mut latest = Vec::<(String, String, PrReviewerStatus)>::new();
+    for review in reviews {
+        let (Some(author), Some(status)) = (review.author, PrReviewerStatus::parse(&review.state))
+        else {
+            continue;
+        };
+        let submitted_at = review.submitted_at.unwrap_or_default();
+        if let Some((login, latest_at, latest_status)) = latest
+            .iter_mut()
+            .find(|(login, _, _)| login.eq_ignore_ascii_case(&author.login))
+        {
+            if submitted_at >= *latest_at {
+                *login = author.login;
+                *latest_at = submitted_at;
+                *latest_status = status;
+            }
+        } else {
+            latest.push((author.login, submitted_at, status));
+        }
+    }
+    for (login, _, status) in latest {
+        match result
+            .iter_mut()
+            .find(|reviewer: &&mut PrReviewer| reviewer.login.eq_ignore_ascii_case(&login))
+        {
+            Some(reviewer) if reviewer.status == PrReviewerStatus::Requested => {}
+            Some(reviewer) => reviewer.status = status,
+            None => result.push(PrReviewer { login, status }),
+        }
+    }
+    result.sort_by(|a, b| {
+        a.login
+            .to_ascii_lowercase()
+            .cmp(&b.login.to_ascii_lowercase())
+            .then_with(|| a.login.cmp(&b.login))
+    });
+    result
+}
+
 /// A comment or review on the pull request's conversation. The body is
-/// GitHub text from anyone who can comment: shown as plain text, never run
-/// or rendered as markup.
+/// untrusted GitHub text rendered only through the safe Markdown preview path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConversationEntry {
+    pub(crate) id: String,
     pub(crate) author: String,
     /// "commented", "approved", "requested changes", …
     pub(crate) verb: &'static str,
@@ -270,6 +1025,7 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
         .filter(|comment| !comment.is_minimized)
         .map(|comment| {
             (
+                comment.id,
                 comment.author,
                 "commented",
                 comment.created_at,
@@ -286,6 +1042,7 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
             _ => "reviewed",
         };
         Some((
+            review.id,
             review.author,
             verb,
             review.submitted_at.unwrap_or_default(),
@@ -294,7 +1051,12 @@ fn conversation(comments: Vec<RawComment>, reviews: Vec<RawReview>) -> Vec<Conve
     });
     let mut entries: Vec<ConversationEntry> = comments
         .chain(reviews)
-        .map(|(author, verb, at, body)| ConversationEntry {
+        .map(|(id, author, verb, at, body)| ConversationEntry {
+            id: if id.is_empty() {
+                format!("{verb}:{}:{at}", author.login)
+            } else {
+                id
+            },
             author: author.login,
             verb,
             at,
@@ -349,6 +1111,12 @@ struct RawDetail {
     comments: Vec<RawComment>,
     #[serde(default)]
     reviews: Vec<RawReview>,
+    #[serde(default)]
+    review_requests: Vec<RawReviewRequest>,
+    #[serde(default)]
+    latest_reviews: Vec<RawLatestReview>,
+    #[serde(default)]
+    commits: Vec<RawPullRequestCommit>,
 }
 
 /// Everything the Details panel shows for one pull request.
@@ -380,6 +1148,9 @@ pub(crate) struct PullRequestDetail {
     /// Failing first, then pending, then passing.
     pub(crate) check_runs: Vec<CheckRun>,
     pub(crate) conversation: Vec<ConversationEntry>,
+    pub(crate) reviewers: Vec<PrReviewer>,
+    /// GitHub's PR commits, newest first.
+    pub(crate) commits: Vec<PullRequestCommit>,
 }
 
 impl PullRequestDetail {
@@ -397,10 +1168,21 @@ impl PullRequestDetail {
 
 impl From<RawDetail> for PullRequestDetail {
     fn from(raw: RawDetail) -> Self {
+        let review = ReviewDecision::from_reviews(
+            &raw.review_decision,
+            &raw.review_requests,
+            &raw.latest_reviews,
+            &raw.author.login,
+        );
         Self {
             number: raw.number,
             title: raw.title,
-            body: raw.body,
+            body: raw
+                .body
+                .trim()
+                .chars()
+                .take(MAX_CONVERSATION_BODY_CHARS)
+                .collect(),
             url: raw.url,
             author: raw.author.login,
             head: raw.head_ref_name,
@@ -410,7 +1192,7 @@ impl From<RawDetail> for PullRequestDetail {
             is_draft: raw.is_draft,
             is_cross_repository: raw.is_cross_repository,
             state: raw.state,
-            review: ReviewDecision::parse(&raw.review_decision),
+            review,
             mergeable: match raw.mergeable.as_str() {
                 "MERGEABLE" => Some(true),
                 "CONFLICTING" => Some(false),
@@ -438,6 +1220,18 @@ impl From<RawDetail> for PullRequestDetail {
                 runs
             },
             conversation: conversation(raw.comments, raw.reviews),
+            reviewers: reviewers(raw.review_requests, raw.latest_reviews),
+            commits: raw
+                .commits
+                .into_iter()
+                .rev()
+                .filter(|commit| is_object_id(&commit.oid))
+                .map(|commit| PullRequestCommit {
+                    oid: commit.oid,
+                    headline: commit.message_headline.chars().take(200).collect(),
+                    committed_at: commit.committed_date,
+                })
+                .collect(),
         }
     }
 }
@@ -547,13 +1341,17 @@ pub(crate) struct ReviewThread {
     pub(crate) line: Option<u32>,
     /// The line it was written on, in the commit it was written on.
     pub(crate) original_line: Option<u32>,
+    /// GitHub's authoritative conversation status.
+    pub(crate) is_resolved: bool,
+    /// GitHub's authoritative changed-line status.
+    pub(crate) is_outdated: bool,
     pub(crate) comments: Vec<ThreadComment>,
 }
 
 impl ReviewThread {
-    /// The lines it was on changed since: GitHub shows it as outdated.
+    /// Whether GitHub considers this thread outdated.
     pub(crate) fn outdated(&self) -> bool {
-        self.line.is_none() && self.original_line.is_some()
+        self.is_outdated
     }
 }
 
@@ -604,6 +1402,10 @@ fn review_threads(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
             side: root.side.unwrap_or(ReviewSide::Right),
             line: root.line,
             original_line: root.original_line,
+            is_resolved: false,
+            // Filled authoritatively by the GraphQL thread query; retain the
+            // REST heuristic until then for callers that only parse REST.
+            is_outdated: root.line.is_none() && root.original_line.is_some(),
             comments: vec![comment(root)],
         })
         .collect();
@@ -686,6 +1488,15 @@ impl MergeMethod {
             Self::Merge => "--merge",
             Self::Squash => "--squash",
             Self::Rebase => "--rebase",
+        }
+    }
+
+    /// The REST API's own spelling, for the async stack merge's JSON body.
+    fn api_name(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
         }
     }
 }
@@ -796,7 +1607,7 @@ pub(crate) fn list_open(
         &repo_flag(repo),
         "--state=open",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
     ]);
     let raw: Vec<RawSummary> = parse_json(&run(command, None)?)?;
     let complete = raw.len() < LIST_LIMIT as usize;
@@ -811,9 +1622,22 @@ pub(crate) fn list_open(
         "--state=open",
         "--search=review-requested:@me",
         &format!("--limit={LIST_LIMIT}"),
-        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,reviewDecision,statusCheckRollup",
+        "--json=number,title,author,headRefName,headRepositoryOwner,baseRefName,isDraft,isCrossRepository,reviewDecision,statusCheckRollup,reviewRequests,latestReviews",
     ]);
-    let requested = run(requested, None).and_then(|out| parse_json::<Vec<RawSummary>>(&out));
+    // Run alongside the login lookup below: both are independent `gh` calls
+    // on the critical path of every list load and refresh.
+    let (requested, login) = std::thread::scope(|scope| {
+        let requested = scope.spawn(|| {
+            run(requested, None).and_then(|out| parse_json::<Vec<RawSummary>>(&out))
+        });
+        let login = viewer_login(workdir);
+        (
+            requested
+                .join()
+                .unwrap_or_else(|_| Err(PrError::Failed("gh pr list panicked".to_string()))),
+            login,
+        )
+    });
     let known = requested.is_ok();
     for raw in requested.unwrap_or_default() {
         match list.iter_mut().find(|pr| pr.number == raw.number) {
@@ -823,6 +1647,14 @@ pub(crate) fn list_open(
                 ..raw.into()
             }),
         }
+    }
+    match login {
+        Ok(login) => {
+            for pr in &mut list {
+                pr.is_mine = pr.author.eq_ignore_ascii_case(&login);
+            }
+        }
+        Err(error) => eprintln!("Couldn't identify pull request author: {error}"),
     }
     Ok((list, known, complete))
 }
@@ -837,7 +1669,7 @@ pub(crate) fn view(workdir: &Path, repo: &str, number: u64) -> Result<PullReques
         "--json=number,title,body,url,author,headRefName,headRefOid,baseRefName,baseRefOid,\
          isDraft,isCrossRepository,state,reviewDecision,mergeable,additions,deletions,\
          changedFiles,files,\
-         statusCheckRollup,comments,reviews",
+          statusCheckRollup,comments,reviews,reviewRequests,latestReviews,commits",
     ]);
     let raw: RawDetail = parse_json(&run(command, None)?)?;
     Ok(raw.into())
@@ -1050,7 +1882,154 @@ pub(crate) fn list_review_threads(
         "--slurp",
     ]);
     let pages: Vec<Vec<RawReviewComment>> = parse_json(&run(command, None)?)?;
-    Ok(review_threads(pages.into_iter().flatten().collect()))
+    let mut threads = review_threads(pages.into_iter().flatten().collect());
+    match review_thread_statuses(workdir, repo, number) {
+        Ok(statuses) => {
+            let missing = apply_review_thread_statuses(&mut threads, &statuses);
+            if !missing.is_empty() {
+                eprintln!(
+                    "GitHub returned no status for review threads {missing:?} of {repo}#{number}"
+                );
+            }
+        }
+        Err(err) => eprintln!("Couldn't load review thread statuses for {repo}#{number}: {err}"),
+    }
+    Ok(threads)
+}
+
+fn apply_review_thread_statuses(
+    threads: &mut [ReviewThread],
+    statuses: &std::collections::HashMap<u64, ReviewThreadStatus>,
+) -> Vec<u64> {
+    let mut missing = Vec::new();
+    for thread in threads {
+        let Some(status) = statuses.get(&thread.root_id) else {
+            missing.push(thread.root_id);
+            continue;
+        };
+        thread.is_resolved = status.is_resolved;
+        thread.is_outdated = status.is_outdated;
+    }
+    missing
+}
+
+const REVIEW_THREAD_STATUSES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId } } } } } } }";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewThreadStatus {
+    is_resolved: bool,
+    is_outdated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusPage {
+    data: RawReviewThreadStatusData,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusData {
+    repository: RawReviewThreadStatusRepository,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusRepository {
+    pull_request: RawReviewThreadStatusPullRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusPullRequest {
+    review_threads: RawReviewThreadStatusConnection,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThreadStatusConnection {
+    #[serde(default)]
+    nodes: Vec<RawReviewThreadStatusNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadStatusNode {
+    is_resolved: bool,
+    is_outdated: bool,
+    comments: RawReviewThreadRootComments,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThreadRootComments {
+    #[serde(default)]
+    nodes: Vec<RawReviewThreadRootComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawReviewThreadRootComment {
+    #[serde(default)]
+    database_id: Option<u64>,
+}
+
+fn parse_review_thread_statuses(
+    stdout: &[u8],
+) -> Result<std::collections::HashMap<u64, ReviewThreadStatus>, PrError> {
+    let unexpected =
+        |err: serde_json::Error| PrError::Failed(format!("unexpected gh output: {err}"));
+    let mut statuses = std::collections::HashMap::new();
+    let mut has_page = false;
+    for value in serde_json::Deserializer::from_slice(stdout).into_iter::<serde_json::Value>() {
+        let value = value.map_err(unexpected)?;
+        let pages = match value {
+            serde_json::Value::Array(pages) => pages,
+            page => vec![page],
+        };
+        for value in pages {
+            let page: RawReviewThreadStatusPage =
+                serde_json::from_value(value).map_err(unexpected)?;
+            has_page = true;
+            for node in page.data.repository.pull_request.review_threads.nodes {
+                if let Some(database_id) = node.comments.nodes.first().and_then(|c| c.database_id) {
+                    statuses.insert(
+                        database_id,
+                        ReviewThreadStatus {
+                            is_resolved: node.is_resolved,
+                            is_outdated: node.is_outdated,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if !has_page {
+        return Err(PrError::Failed(
+            "unexpected gh output: no review thread status pages".to_string(),
+        ));
+    }
+    Ok(statuses)
+}
+
+/// The resolved and outdated state of every review thread, fetched with
+/// GitHub's paginated GraphQL connection and keyed by the REST root comment id.
+fn review_thread_statuses(
+    workdir: &Path,
+    repo: &str,
+    number: u64,
+) -> Result<std::collections::HashMap<u64, ReviewThreadStatus>, PrError> {
+    let (owner, name) = graphql_target(repo, number)?;
+    let mut command = gh(workdir);
+    command.args([
+        "api",
+        "graphql",
+        "--hostname=github.com",
+        "--paginate",
+        &format!("--raw-field=query={REVIEW_THREAD_STATUSES_QUERY}"),
+        &format!("--raw-field=owner={owner}"),
+        &format!("--raw-field=name={name}"),
+        &format!("--field=number={number}"),
+    ]);
+    parse_review_thread_statuses(&run(command, None)?)
 }
 
 /// A review you submitted on a pull request, as GitHub's REST API lists it.
@@ -1418,6 +2397,25 @@ pub(crate) fn new_pull_request_defaults(
     NewPullRequestDefaults { base, title, body }
 }
 
+/// The default branch's name and its local tracking ref's commit id: the
+/// commit a pull request's base "leaves" the default branch at is measured
+/// from this. `None` when the default branch, or its local tracking ref,
+/// isn't known (never fetched, or no such remote-tracking branch locally).
+pub(crate) fn default_branch_ref_and_oid(workdir: &Path, remote: &str) -> Option<(String, String)> {
+    let branch = default_branch(workdir, remote)?;
+    let mut command = git(workdir);
+    command.args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/remotes/{remote}/{branch}"),
+    ]);
+    let oid = String::from_utf8_lossy(&run_git(command).ok()?)
+        .trim()
+        .to_string();
+    is_object_id(&oid).then_some((branch, oid))
+}
+
 /// `refs/remotes/<remote>/HEAD`, as clone sets it; else main or master.
 fn default_branch(workdir: &Path, remote: &str) -> Option<String> {
     let mut command = git(workdir);
@@ -1623,6 +2621,75 @@ pub(crate) fn changes_since(
     Ok(ChangesSince { files, commits })
 }
 
+/// A contiguous selection of PR commits, from the parent of its oldest
+/// commit through its newest commit. Net changes are limited to GitHub's PR
+/// file list; first-parent non-merge commits also retain reverted paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommitRangeChanges {
+    pub(crate) base_oid: String,
+    pub(crate) files: std::collections::BTreeSet<String>,
+}
+
+pub(crate) fn commit_range_changes(
+    workdir: &Path,
+    remote: &str,
+    oldest_oid: &str,
+    newest_oid: &str,
+    pr_files: &[String],
+) -> Result<CommitRangeChanges, PrError> {
+    if !is_object_id(oldest_oid) || !is_object_id(newest_oid) {
+        return Err(PrError::Failed(
+            "GitHub returned an unexpected commit id".to_string(),
+        ));
+    }
+    fetch_missing(workdir, remote, &[oldest_oid, newest_oid])?;
+    let mut parent = git(workdir);
+    parent.args(["rev-parse", "--verify", &format!("{oldest_oid}^")]);
+    let base_oid = String::from_utf8_lossy(&run_git(parent)?)
+        .trim()
+        .to_string();
+    if !is_object_id(&base_oid) {
+        return Err(PrError::Failed(
+            "Couldn't find the selected commit's parent".to_string(),
+        ));
+    }
+    let mut diff = git(workdir);
+    diff.args([
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "-z",
+        &base_oid,
+        newest_oid,
+        "--",
+    ]);
+    let allowed: std::collections::BTreeSet<&str> = pr_files.iter().map(String::as_str).collect();
+    let mut files: std::collections::BTreeSet<String> = parse_name_list(&run_git(diff)?)
+        .into_iter()
+        .filter(|path| allowed.contains(path.as_str()))
+        .collect();
+    let mut log = git(workdir);
+    log.args([
+        "log",
+        "--first-parent",
+        "--no-merges",
+        "--format=",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        &format!("{base_oid}..{newest_oid}"),
+        "--",
+    ]);
+    files.extend(parse_name_list(&run_git(log)?));
+    if files.len() > MAX_LISTED_FILES as usize {
+        return Err(PrError::Failed(format!(
+            "This commit range changes more than {MAX_LISTED_FILES} files; review it on GitHub."
+        )));
+    }
+    Ok(CommitRangeChanges { base_oid, files })
+}
+
 /// The head-side line ranges (first, last) of `path`'s hunks in the pull
 /// request's own diff, with GitHub's 3 lines of context: the lines GitHub
 /// takes a head-side comment on.
@@ -1715,6 +2782,44 @@ pub(crate) fn prepare_diff_range(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn review_decision_ranks_changes_requested_over_a_pending_request() {
+        let requests: Vec<super::RawReviewRequest> =
+            serde_json::from_str(r#"[{"requestedReviewer": {"login": "bob"}}]"#)
+                .expect("requests");
+        let reviews: Vec<super::RawLatestReview> = serde_json::from_str(
+            r#"[{"author": {"login": "alice"}, "state": "CHANGES_REQUESTED"}]"#,
+        )
+        .expect("reviews");
+        assert_eq!(
+            super::ReviewDecision::from_reviews("", &requests, &reviews, "pr-author"),
+            Some(super::ReviewDecision::ChangesRequested)
+        );
+    }
+
+    #[test]
+    fn review_decision_is_review_required_with_only_a_pending_request() {
+        let requests: Vec<super::RawReviewRequest> =
+            serde_json::from_str(r#"[{"requestedReviewer": {"login": "bob"}}]"#)
+                .expect("requests");
+        assert_eq!(
+            super::ReviewDecision::from_reviews("", &requests, &[], "pr-author"),
+            Some(super::ReviewDecision::ReviewRequired)
+        );
+    }
+
+    #[test]
+    fn review_decision_ignores_the_authors_own_comment() {
+        let reviews: Vec<super::RawLatestReview> = serde_json::from_str(
+            r#"[{"author": {"login": "pr-author"}, "state": "COMMENTED"}]"#,
+        )
+        .expect("reviews");
+        assert_eq!(
+            super::ReviewDecision::from_reviews("", &[], &reviews, "pr-author"),
+            None
+        );
+    }
+
+    #[test]
     fn your_last_review_is_your_latest_submitted_one() {
         let pages: Vec<Vec<super::RawRestReview>> = serde_json::from_str(
             r#"[[
@@ -1805,6 +2910,65 @@ mod tests {
     }
 
     #[test]
+    fn graphql_thread_statuses_match_rest_roots_and_override_the_rest_heuristic() {
+        let raw: Vec<super::RawReviewComment> = serde_json::from_str(
+            r#"[
+                {"id": 1, "path": "a.rs", "line": null, "original_line": 12, "body": "old"},
+                {"id": 2, "path": "b.rs", "line": 4, "original_line": 4, "body": "current"}
+            ]"#,
+        )
+        .expect("REST comments");
+        let mut threads = super::review_threads(raw);
+        assert!(threads[0].outdated());
+        let page = |id, is_resolved, is_outdated| {
+            serde_json::json!({
+                "data": {"repository": {"pullRequest": {"reviewThreads": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [{
+                        "isResolved": is_resolved,
+                        "isOutdated": is_outdated,
+                        "comments": {"nodes": [{"databaseId": id}]}
+                    }]
+                }}}}
+            })
+            .to_string()
+        };
+        let pages = format!("{}\n{}", page(1, true, false), page(2, false, true));
+        let statuses = super::parse_review_thread_statuses(pages.as_bytes()).expect("statuses");
+        assert!(super::apply_review_thread_statuses(&mut threads, &statuses).is_empty());
+
+        let first = threads.iter().find(|thread| thread.root_id == 1).unwrap();
+        assert!(first.is_resolved);
+        assert!(!first.is_outdated);
+        assert!(!first.outdated());
+        let second = threads.iter().find(|thread| thread.root_id == 2).unwrap();
+        assert!(!second.is_resolved);
+        assert!(second.is_outdated);
+        assert!(second.outdated());
+        let raw: Vec<super::RawReviewComment> = serde_json::from_str(
+            r#"[{"id": 1, "path": "a.rs", "line": null, "original_line": 12, "body": "old"},
+                {"id": 2, "path": "b.rs", "line": 4, "original_line": 4, "body": "current"}]"#,
+        )
+        .expect("REST comments");
+        let mut partial = super::review_threads(raw);
+        let statuses = std::collections::HashMap::from([(
+            2,
+            super::ReviewThreadStatus {
+                is_resolved: true,
+                is_outdated: true,
+            },
+        )]);
+        assert_eq!(
+            super::apply_review_thread_statuses(&mut partial, &statuses),
+            vec![1]
+        );
+        assert!(!partial[0].is_resolved);
+        assert!(partial[0].outdated());
+        assert!(partial[1].is_resolved);
+        assert!(partial[1].is_outdated);
+    }
+
+    #[test]
     fn changed_paths_read_nul_separated() {
         let files = super::parse_name_list(b"a.rs\0dir/b c.rs\0\0");
         assert_eq!(
@@ -1874,6 +3038,24 @@ mod tests {
     }
 
     #[test]
+    fn review_summary_distinguishes_comment_only_and_requested_again() {
+        let raw: Vec<RawSummary> = parse_json(
+            br#"[{
+            "number":1,"title":"one","headRefName":"one","baseRefName":"main",
+            "latestReviews":[{"state":"COMMENTED"}]
+        },{
+            "number":2,"title":"two","headRefName":"two","baseRefName":"main",
+            "reviewRequests":[{"login":"reviewer"}],
+            "latestReviews":[{"state":"APPROVED"}]
+        }]"#,
+        )
+        .expect("reviews");
+        let prs: Vec<PullRequestSummary> = raw.into_iter().map(Into::into).collect();
+        assert_eq!(prs[0].review, Some(ReviewDecision::Commented));
+        assert_eq!(prs[1].review, Some(ReviewDecision::ReviewRequired));
+    }
+
+    #[test]
     fn detail_json_maps_mergeable_and_size_limits() {
         let json = r#"{
             "number": 52, "title": "Vendor grammars", "body": "", "url": "https://github.com/o/r/pull/52",
@@ -1894,6 +3076,164 @@ mod tests {
         // but reviewable here, a page of files at a time.
         assert!(detail.too_large_for_codex());
         assert!(!detail.too_large_for_app());
+    }
+
+    #[test]
+    fn detail_json_maps_and_deduplicates_reviewers() {
+        let json = r#"{
+            "number": 9, "title": "t", "url": "u", "headRefName": "h", "headRefOid": "a",
+            "baseRefName": "b", "baseRefOid": "c",
+            "reviewRequests": [
+                {"__typename": "User", "login": "Octo"},
+                {"requestedReviewer": {"__typename": "Team", "name": "Platform"}}
+            ],
+            "latestReviews": [
+                {"author": {"login": "octo"}, "state": "APPROVED", "submittedAt": "2026-09-01T00:00:00Z"},
+                {"author": {"login": "zed"}, "state": "COMMENTED", "submittedAt": "2026-09-02T00:00:00Z"},
+                {"author": null, "state": "CHANGES_REQUESTED", "submittedAt": "2026-09-03T00:00:00Z"},
+                {"author": {"login": "pending"}, "state": "PENDING", "submittedAt": null}
+            ]
+        }"#;
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.as_bytes())
+            .expect("valid detail")
+            .into();
+        assert_eq!(
+            detail
+                .reviewers
+                .iter()
+                .map(|reviewer| (reviewer.login.as_str(), reviewer.status))
+                .collect::<Vec<_>>(),
+            [
+                ("Octo", PrReviewerStatus::Requested),
+                ("Platform", PrReviewerStatus::Requested),
+                ("zed", PrReviewerStatus::Commented),
+            ]
+        );
+        assert_eq!(
+            PrReviewerStatus::ChangesRequested.label(),
+            "Changes requested"
+        );
+    }
+
+    #[test]
+    fn detail_json_lists_commits_newest_first() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let json = serde_json::json!({
+            "number": 9, "title": "t", "url": "u", "headRefName": "h", "headRefOid": new,
+            "baseRefName": "b", "baseRefOid": "c",
+            "commits": [
+                {"oid": old, "messageHeadline": "first", "committedDate": "2026-09-01T00:00:00Z"},
+                {"oid": new, "messageHeadline": "second", "committedDate": "2026-09-02T00:00:00Z"},
+                {"oid": "bad", "messageHeadline": "invalid", "committedDate": ""}
+            ]
+        });
+        let detail: PullRequestDetail = parse_json::<RawDetail>(json.to_string().as_bytes())
+            .expect("valid detail")
+            .into();
+        assert_eq!(detail.commits.len(), 2);
+        assert_eq!(detail.commits[0].headline, "second");
+        assert_eq!(detail.commits[1].headline, "first");
+    }
+
+    #[test]
+    fn commit_range_starts_at_oldest_parent_and_lists_touched_paths() {
+        let dir = tempfile::tempdir().expect("temporary repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        let commit = |message: &str| {
+            git(&["add", "--all"]);
+            git(&[
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ]);
+            git(&["rev-parse", "HEAD"])
+        };
+        std::fs::write(dir.path().join("a.rs"), "base\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "base\n").unwrap();
+        std::fs::write(dir.path().join("reverted.rs"), "base\n").unwrap();
+        let base = commit("base");
+        std::fs::write(dir.path().join("a.rs"), "oldest\n").unwrap();
+        let oldest = commit("oldest");
+        std::fs::write(dir.path().join("b.rs"), "newest\n").unwrap();
+        commit("middle");
+        std::fs::write(dir.path().join("reverted.rs"), "changed\n").unwrap();
+        commit("change reverted file");
+        std::fs::write(dir.path().join("reverted.rs"), "base\n").unwrap();
+        commit("revert file");
+        git(&["checkout", "-q", "-b", "feature"]);
+        git(&["checkout", "-q", "-b", "upstream", &base]);
+        std::fs::write(dir.path().join("main-only.rs"), "imported\n").unwrap();
+        commit("upstream change");
+        git(&["checkout", "-q", "feature"]);
+        git(&[
+            "-c",
+            "user.name=Tester",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            "merge upstream",
+            "upstream",
+        ]);
+        let newest = git(&["rev-parse", "HEAD"]);
+
+        let files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let range = super::commit_range_changes(dir.path(), "unused", &oldest, &newest, &files)
+            .expect("local range");
+        assert_eq!(range.base_oid, base);
+        assert_eq!(
+            range.files.into_iter().collect::<Vec<_>>(),
+            ["a.rs", "b.rs", "reverted.rs"]
+        );
+        assert!(
+            super::commit_range_changes(dir.path(), "unused", "invalid", &newest, &files).is_err()
+        );
+
+        let remote = tempfile::tempdir().expect("remote");
+        let remote_path = remote.path().to_str().expect("UTF-8 path");
+        git(&["init", "--bare", "-q", remote_path]);
+        git(&["push", "-q", remote_path, "HEAD:refs/heads/main"]);
+        let client = tempfile::tempdir().expect("client");
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(client.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let fetched =
+            super::commit_range_changes(client.path(), remote_path, &oldest, &newest, &files)
+                .expect("fetch missing commits from the remote");
+        assert_eq!(fetched.base_oid, base);
+        assert_eq!(
+            fetched.files.into_iter().collect::<Vec<_>>(),
+            ["a.rs", "b.rs", "reverted.rs"]
+        );
     }
 
     #[test]
@@ -2145,5 +3485,383 @@ mod tests {
         assert!(!is_object_id("--upload-pack=evil"));
         assert!(!is_object_id("HEAD"));
         assert!(!is_object_id(&"g".repeat(40)));
+    }
+
+    fn stack_pr(number: u64, head: &str, base: &str, owner: &str) -> super::PullRequestSummary {
+        super::PullRequestSummary {
+            number,
+            title: format!("pr {number}"),
+            author: "someone".to_string(),
+            head: head.to_string(),
+            head_owner: owner.to_string(),
+            base: base.to_string(),
+            is_draft: false,
+            is_cross_repository: false,
+            review: None,
+            checks: super::ChecksSummary::default(),
+            review_requested: false,
+            is_mine: false,
+        }
+    }
+
+    #[test]
+    fn a_linear_chain_becomes_one_stack_bottom_first() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+            stack_pr(3, "feat-c", "feat-b", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].members, vec![1, 2, 3]);
+        assert!(!stacks[0].native);
+    }
+
+    #[test]
+    fn a_pr_with_two_children_is_a_tree_shown_as_one_stack() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+            stack_pr(3, "feat-c", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].members.len(), 3);
+        assert_eq!(stacks[0].members[0], 1);
+        assert_eq!(
+            stacks[0].members[1..].iter().collect::<std::collections::HashSet<_>>(),
+            [&2, &3].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn a_cross_repository_pull_request_never_stacks() {
+        let mut fork = stack_pr(2, "feat-a", "feat-a", "me");
+        fork.is_cross_repository = true;
+        let prs = vec![stack_pr(1, "feat-a", "dev", "me"), fork];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn a_differently_owned_head_never_stacks_even_when_not_flagged_cross_repository() {
+        // The case-insensitive owner compare is a fallback for when
+        // `isCrossRepository` itself can't be trusted.
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "someone-else"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn the_owner_compare_is_case_insensitive() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "Me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "ME", &[]);
+        assert_eq!(stacks.len(), 1);
+    }
+
+    #[test]
+    fn a_base_branch_cycle_does_not_grow_the_stack_forever() {
+        // Two pull requests whose base branches point at each other: not a
+        // real GitHub state, but detection must terminate and skip it.
+        let prs = vec![
+            stack_pr(1, "feat-a", "feat-b", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn a_pr_whose_base_branch_has_no_pull_request_is_not_a_stack() {
+        let prs = vec![stack_pr(1, "feat-a", "dev", "me")];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn a_chain_matching_a_native_stacks_members_is_native() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let native = [super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        }];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &native);
+        assert_eq!(stacks.len(), 1);
+        assert!(stacks[0].native);
+    }
+
+    #[test]
+    fn a_chain_with_no_matching_native_stack_stays_a_plain_base_branch_chain() {
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+        ];
+        let stacks = super::compute_pull_request_stacks(&prs, "me", &[]);
+        assert_eq!(stacks.len(), 1);
+        assert!(!stacks[0].native);
+    }
+
+    #[test]
+    fn stack_parent_and_child_follow_real_base_and_head_not_flattened_order() {
+        // 1 has two children, 2 and 3: a tree, flattened as [1, 2, 3] or
+        // [1, 3, 2] depending on traversal, but 2 and 3 are siblings, not
+        // parent and child.
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            stack_pr(2, "feat-b", "feat-a", "me"),
+            stack_pr(3, "feat-c", "feat-a", "me"),
+        ];
+        let members = [1, 2, 3];
+        assert_eq!(super::stack_parent(&members, 2, &prs), Some(1));
+        assert_eq!(super::stack_parent(&members, 3, &prs), Some(1));
+        assert_eq!(super::stack_parent(&members, 1, &prs), None);
+        // Two children: the lowest number wins, deterministically.
+        assert_eq!(super::stack_child(&members, 1, &prs), Some(2));
+        assert_eq!(super::stack_depth(&members, 1, &prs), Some(0));
+        assert_eq!(super::stack_depth(&members, 2, &prs), Some(1));
+        assert_eq!(super::stack_depth(&members, 3, &prs), Some(1));
+        assert_eq!(super::stack_depth(&members, 99, &prs), None);
+    }
+
+    fn approved_stack_pr(number: u64, head: &str, base: &str) -> super::PullRequestSummary {
+        let mut pr = stack_pr(number, head, base, "me");
+        pr.review = Some(super::ReviewDecision::Approved);
+        pr
+    }
+
+    #[test]
+    fn merging_the_top_of_a_clean_stack_takes_everything_below_it() {
+        let prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+            approved_stack_pr(3, "feat-c", "feat-b"),
+        ];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2, 3],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.merges, vec![1, 2]);
+        assert_eq!(plan.stays_open, vec![3]);
+        assert_eq!(plan.refusal, None);
+    }
+
+    #[test]
+    fn the_selected_pull_request_itself_needs_no_review_or_checks() {
+        // Only #1 (below #2) is checked; #2 itself has no review and no
+        // checks recorded, and that's fine: branch protection is GitHub's
+        // job at merge time.
+        let prs = vec![approved_stack_pr(1, "feat-a", "dev"), stack_pr(2, "feat-b", "feat-a", "me")];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, None);
+    }
+
+    #[test]
+    fn no_review_decision_below_is_not_a_refusal() {
+        // A repository with no required reviews reports no decision at all;
+        // that must not be confused with an explicit non-approval.
+        let prs = vec![
+            stack_pr(1, "feat-a", "dev", "me"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, None);
+    }
+
+    #[test]
+    fn an_unapproved_pull_request_below_refuses_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].review = Some(super::ReviewDecision::ChangesRequested);
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert!(plan.merges.is_empty());
+        assert_eq!(plan.refusal, Some("#1 isn't approved".to_string()));
+    }
+
+    #[test]
+    fn failing_checks_below_refuse_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].checks.failing = 1;
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, Some("#1 has failing checks".to_string()));
+    }
+
+    #[test]
+    fn pending_checks_below_refuse_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].checks.pending = 1;
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, Some("#1 has checks still running".to_string()));
+    }
+
+    #[test]
+    fn a_draft_below_refuses_the_merge_by_name() {
+        let mut prs = vec![
+            approved_stack_pr(1, "feat-a", "dev"),
+            approved_stack_pr(2, "feat-b", "feat-a"),
+        ];
+        prs[0].is_draft = true;
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert_eq!(plan.refusal, Some("#1 is a draft".to_string()));
+    }
+
+    #[test]
+    fn a_below_pull_request_missing_from_the_loaded_list_refuses_by_name() {
+        // #1 exists in the real stack (GitHub said so) but never loaded
+        // locally: LIST_LIMIT, a filter, or a merged pull request gh's list
+        // left out.
+        let prs = vec![approved_stack_pr(2, "feat-b", "feat-a")];
+        let stack = super::PullRequestStack {
+            members: vec![1, 2],
+            native: true,
+        };
+        let plan = super::plan_stack_merge(&stack, 2, &prs).expect("in the stack");
+        assert!(plan.merges.is_empty());
+        assert_eq!(
+            plan.refusal,
+            Some("#1 below isn't loaded — refresh or open on GitHub".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_async_payload_pins_the_head_and_names_the_method() {
+        let payload = super::merge_async_payload(super::MergeMethod::Squash, "deadbeef");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("json");
+        assert_eq!(value["merge_method"], "squash");
+        assert_eq!(value["sha"], "deadbeef");
+    }
+
+    #[test]
+    fn merge_async_job_reads_a_pending_result() {
+        let job = super::parse_merge_async_job(
+            br#"{"status": "pending", "details": {"message": "Merge in progress", "uuid": "11111111-1111-1111-1111-111111111111", "merge_method": "merge", "merge_action": "merge", "expected_head_sha": "deadbeef"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Pending);
+        assert_eq!(
+            job.uuid.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+    }
+
+    #[test]
+    fn merge_async_job_reads_a_merged_result() {
+        let job = super::parse_merge_async_job(br#"{"status": "merged"}"#).expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Merged);
+    }
+
+    #[test]
+    fn merge_async_job_reads_an_enqueued_result() {
+        let job = super::parse_merge_async_job(
+            br#"{"status": "enqueued", "details": {"message": "Added to the merge queue"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Enqueued);
+    }
+
+    #[test]
+    fn merge_async_job_reads_a_failed_result_with_its_message() {
+        let job = super::parse_merge_async_job(
+            br#"{"status": "failed", "details": {"message": "Required status check has not succeeded"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(job.status, super::MergeAsyncStatus::Failed);
+        assert_eq!(
+            job.message.as_deref(),
+            Some("Required status check has not succeeded")
+        );
+    }
+
+    #[test]
+    fn a_409_failed_body_on_stdout_gives_githubs_own_reason() {
+        // A 400 or 409 from `merge-async` still returns the
+        // `pull-request-merge-async-result` body; gh's own exit is non-zero,
+        // but the reason is on stdout, not stderr.
+        let stdout = br#"{"status": "failed", "details": {"message": "The stack needs to be rebased before it can be merged"}}"#;
+        assert_eq!(
+            super::merge_async_failure_message(stdout),
+            Some("The stack needs to be rebased before it can be merged".to_string())
+        );
+    }
+
+    #[test]
+    fn stdout_that_isnt_a_merge_async_body_has_no_message() {
+        assert_eq!(super::merge_async_failure_message(b"not json"), None);
+        assert_eq!(
+            super::merge_async_failure_message(br#"{"message": "some other API error"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn native_stacks_parse_dynamic_graphql_aliases_ordered_by_position() {
+        let body = br#"{"data":{"repository":{
+            "pr1": {"stack": {"number": 7, "entries": {"nodes": [
+                {"position": 1, "pullRequest": {"number": 2}},
+                {"position": 0, "pullRequest": {"number": 1}}
+            ]}}},
+            "pr2": {"stack": {"number": 7, "entries": {"nodes": [
+                {"position": 1, "pullRequest": {"number": 2}},
+                {"position": 0, "pullRequest": {"number": 1}}
+            ]}}},
+            "pr3": {"stack": null},
+            "pr4": null
+        }}}"#;
+        let stacks = super::parse_native_stacks(body).expect("parses");
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].members, vec![1, 2]);
+        assert!(stacks[0].native);
+    }
+
+    #[test]
+    fn a_native_stack_with_only_one_entry_is_dropped() {
+        let body = br#"{"data":{"repository":{
+            "pr1": {"stack": {"number": 7, "entries": {"nodes": [
+                {"position": 0, "pullRequest": {"number": 1}}
+            ]}}}
+        }}}"#;
+        let stacks = super::parse_native_stacks(body).expect("parses");
+        assert!(stacks.is_empty());
     }
 }

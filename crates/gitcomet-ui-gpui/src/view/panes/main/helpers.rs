@@ -3259,6 +3259,10 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) diff_focused_change_block: Option<DiffFocusedChangeBlock>,
     /// Review mode drives the diff from the keyboard: j/k move a line cursor, shift extends it.
     pub(in crate::view) review_active: bool,
+    /// The open review file is generated (GitHub's `linguist-generated`) and
+    /// its "Generated file" placeholder hasn't been dismissed with `enter`
+    /// yet: the main pane shows the placeholder instead of the diff.
+    pub(in crate::view) review_generated_placeholder: bool,
     /// Lines of the shown file that carry a pending review comment.
     pub(in crate::view) review_marks: FxHashSet<(crate::github::ReviewSide, u32)>,
     /// Lines of the shown file with a review thread already on GitHub.
@@ -3454,8 +3458,19 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) file_image_diff_cache_new: Option<Arc<gpui::RenderImage>>,
     pub(in crate::view) file_image_diff_cache_old_svg_path: Option<std::path::PathBuf>,
     pub(in crate::view) file_image_diff_cache_new_svg_path: Option<std::path::PathBuf>,
+    pub(in crate::view) file_image_diff_cache_old_info: Option<ImageDiffSideInfo>,
+    pub(in crate::view) file_image_diff_cache_new_info: Option<ImageDiffSideInfo>,
     pub(in crate::view) file_image_preview_animation: FileImagePreviewAnimation,
     pub(in crate::view) file_image_preview_animation_task: Option<gpui::Task<()>>,
+    /// Image diff compare mode (Side by side / Swipe / Onion skin). Sticky
+    /// across files; `image_diff_swipe_position`/`image_diff_onion_opacity`
+    /// reset to their defaults whenever a new image diff loads (see
+    /// `reset_file_image_diff_cache_data`), but the mode itself does not.
+    pub(in crate::view) image_diff_mode: ImageDiffMode,
+    /// Swipe divider position, 0.0 (all old) to 1.0 (all new).
+    pub(in crate::view) image_diff_swipe_position: f32,
+    /// Onion skin opacity of the new image over the old, 0.0 to 1.0.
+    pub(in crate::view) image_diff_onion_opacity: f32,
 
     pub(in crate::view) conflict_image_preview_seq: u64,
     pub(in crate::view) conflict_image_preview_inflight: Option<u64>,
@@ -3703,6 +3718,10 @@ pub(crate) struct MainPaneView {
         Option<std::time::Duration>,
 
     pub(in crate::view) history_view: Entity<super::HistoryView>,
+    pub(in crate::view) pull_request_scroll: ScrollHandle,
+    pub(in crate::view) pr_markdown_cache: super::pull_request::PrMarkdownCache,
+    pub(in crate::view) pull_request_scroll_key:
+        Option<(u64, crate::view::pull_requests::PrContentTab, Option<usize>)>,
     pub(in crate::view) diff_scroll: UniformListScrollHandle,
     pub(in crate::view) diff_split_right_scroll: UniformListScrollHandle,
     pub(in crate::view) conflict_resolver_diff_scroll: UniformListScrollHandle,

@@ -9,6 +9,8 @@
 use super::branch_sidebar::BranchMenuTarget;
 use super::panels::{branch_action_reference, can_amend};
 use super::*;
+use crate::github::{ChecksSummary, ReviewDecision};
+use crate::view::pr_symbols;
 use gitcomet_core::domain::DiffArea;
 use gitcomet_state::model::SidebarMode;
 
@@ -190,6 +192,9 @@ pub(super) fn panel_focus_ring(theme: AppTheme) -> gpui::Div {
 
 impl GitCometView {
     pub(super) fn diff_is_open(&self) -> bool {
+        if self.pull_request_content_active() {
+            return false;
+        }
         self.active_repo()
             .is_some_and(|repo| repo.diff_state.diff_target.is_some())
     }
@@ -443,6 +448,29 @@ impl GitCometView {
 
     /// The hint bar's keys for `panel`, which differ on the Pull requests tab.
     pub(super) fn key_hints(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if matches!(panel, FocusPanel::Diff | FocusPanel::History)
+            && self
+                .active_review()
+                .is_some_and(super::review::ReviewMode::historical_range)
+        {
+            return &[
+                ("j/k", "line"),
+                ("shift+j/k", "select"),
+                ("}/{", "change"),
+                ("]/[", "file"),
+                ("space", "viewed"),
+                ("/", "filter"),
+                ("V", "show viewed"),
+                ("G", "show generated"),
+                ("alt+p", "preview"),
+                ("alt+v", "image mode"),
+                (",/.", "divider/opacity"),
+                ("L", "changed since"),
+                ("C", "commits"),
+                ("S", "submit"),
+                ("q", "leave"),
+            ];
+        }
         if self.active_review().is_some() {
             return match panel {
                 FocusPanel::Sidebar => &[
@@ -450,8 +478,11 @@ impl GitCometView {
                     ("space", "viewed"),
                     ("/", "filter"),
                     ("V", "show viewed"),
+                    ("G", "show generated"),
                     ("L", "changed since"),
-                    ("enter", "diff"),
+                    ("C", "commits"),
+                    ("enter", "diff/folder"),
+                    ("`", "tree/flat"),
                     ("S", "submit"),
                     ("q", "leave"),
                 ],
@@ -465,7 +496,11 @@ impl GitCometView {
                     ("}/{", "change"),
                     ("]/[", "file"),
                     ("space", "viewed"),
+                    ("alt+p", "preview"),
+                    ("alt+v", "image mode"),
+                    (",/.", "divider/opacity"),
                     ("L", "changed since"),
+                    ("C", "commits"),
                     ("S", "submit"),
                 ],
                 FocusPanel::Details => &[
@@ -474,6 +509,7 @@ impl GitCometView {
                     ("e", "edit"),
                     ("d d", "delete"),
                     ("r", "reply outdated"),
+                    ("C", "commits"),
                     ("S", "submit"),
                 ],
             };
@@ -486,18 +522,33 @@ impl GitCometView {
                 FocusPanel::Sidebar => {
                     return &[
                         ("j/k", "PR"),
-                        ("enter", "diff"),
+                        ("</>", "stack"),
+                        ("enter", "read"),
                         ("space", "checkout"),
                         ("r", "review"),
                         ("M", "merge"),
                         ("o", "GitHub"),
                     ];
                 }
+                FocusPanel::History if self.pull_request_content_active() => {
+                    return &[
+                        ("j/k", "entry"),
+                        ("</>", "stack"),
+                        ("[/]", "tab"),
+                        ("enter", "thread"),
+                        ("V", "resolved"),
+                        ("o", "GitHub"),
+                        ("r", "review"),
+                    ];
+                }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
-                        ("j/k", "file"),
-                        ("J/K", "scroll"),
-                        ("enter", "diff"),
+                        ("j/k", "commit"),
+                        ("J/K", "range"),
+                        ("</>", "stack"),
+                        ("esc", "all"),
+                        ("enter", "read"),
+                        ("space", "checkout"),
                         ("r", "review"),
                         ("M", "merge"),
                     ];
@@ -530,11 +581,46 @@ impl GitCometView {
         panel.status_hints()
     }
 
-    fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+    pub(super) fn key_help(&self, panel: FocusPanel) -> &'static [(&'static str, &'static str)] {
+        if matches!(panel, FocusPanel::Diff | FocusPanel::History)
+            && self
+                .active_review()
+                .is_some_and(super::review::ReviewMode::historical_range)
+        {
+            return &[
+                ("j / k", "Line cursor down / up"),
+                ("shift+j / k", "Select lines from the cursor"),
+                ("} / {", "Next / previous change"),
+                ("] / [", "Next / previous file"),
+                ("space", "Mark viewed"),
+                (
+                    "/",
+                    "Filter the file list: fuzzy words, .rs for a type; esc clears",
+                ),
+                ("V", "Show / hide viewed files (hidden by default)"),
+                (
+                    "Shift+G",
+                    "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                ),
+                (
+                    "Alt+P",
+                    "Toggle the rendered Preview / Text switch, where it shows",
+                ),
+                ("Alt+V", "Cycle an image diff's view mode"),
+                (",/.", "Move the Swipe divider or the Onion skin opacity"),
+                ("L", "Changes since your last review"),
+                ("C", "Pick a commit range"),
+                ("S", "Submit the review"),
+                ("q", "Leave review mode"),
+            ];
+        }
         if self.active_review().is_some() {
             return match panel {
                 FocusPanel::Sidebar => &[
-                    ("j / k", "Next / previous file"),
+                    (
+                        "j / k",
+                        "Next / previous row; in tree layout, folder rows included",
+                    ),
                     (
                         "space",
                         "Mark viewed (on GitHub too), then the next unviewed file",
@@ -548,28 +634,64 @@ impl GitCometView {
                         "Filter the file list: fuzzy words, .rs for a type; esc clears",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "Shift+G",
+                        "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                    ),
+                    (
+                        "C",
+                        "Pick all changes, since last review, or a commit range",
+                    ),
                     ("R", "Retry the files that failed to list"),
-                    ("enter", "Go to the diff"),
+                    (
+                        "enter",
+                        "Go to the diff; on a folder row (tree layout), toggle it open / closed",
+                    ),
+                    ("`", "Tree or flat file list"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
                 ],
                 FocusPanel::Diff | FocusPanel::History => &[
-                    ("j / k", "Line cursor down / up"),
+                    ("j / k", "Line cursor down / up; by rendered block in Preview"),
                     ("shift+j / k", "Select lines from the cursor"),
                     (
                         "c",
-                        "Comment on the line or selection; alt+s suggests a change",
+                        "Comment on the line or selection (alt+s suggests a change); in Preview, switches to Text at the block's first line",
                     ),
-                    ("t / T", "Next / previous thread or Codex suggestion"),
-                    ("r", "Reply to the thread on this line"),
-                    ("a / x", "Adopt / drop the Codex suggestion on this line"),
-                    ("} / {", "Next / previous change"),
+                    (
+                        "t / T",
+                        "Next / previous thread or Codex suggestion; switch to Text first in Preview",
+                    ),
+                    (
+                        "r",
+                        "Reply to the thread on this line; switch to Text first in Preview",
+                    ),
+                    (
+                        "a / x",
+                        "Adopt / drop the Codex suggestion on this line; switch to Text first in Preview",
+                    ),
+                    (
+                        "} / {",
+                        "Next / previous change; by rendered block in Preview",
+                    ),
                     ("] / [", "Next / previous file"),
                     (
                         "space",
                         "Mark viewed (on GitHub too), then the next unviewed file",
                     ),
                     (
+                        "Alt+P",
+                        "Toggle the rendered Preview / Text switch, where it shows",
+                    ),
+                    (
+                        "Alt+V",
+                        "Cycle Side by side / Swipe / Onion skin, where an image diff shows",
+                    ),
+                    (
+                        ", / .",
+                        "Move the Swipe divider or the Onion skin opacity by 10%",
+                    ),
+                    (
                         "L",
                         "Changes since your last review (files and diff) / the whole PR",
                     ),
@@ -578,6 +700,14 @@ impl GitCometView {
                         "Filter the file list: fuzzy words, .rs for a type; esc clears",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "Shift+G",
+                        "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                    ),
+                    (
+                        "C",
+                        "Pick all changes, since last review, or a commit range",
+                    ),
                     ("esc", "Drop the selection"),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
@@ -596,6 +726,14 @@ impl GitCometView {
                         "Changes since your last review (files and diff) / the whole PR",
                     ),
                     ("V", "Show / hide viewed files (hidden by default)"),
+                    (
+                        "Shift+G",
+                        "Show / hide generated files (hidden by default; don't count toward viewed progress)",
+                    ),
+                    (
+                        "C",
+                        "Pick all changes, since last review, or a commit range",
+                    ),
                     ("S", "Submit the review"),
                     ("q", "Leave review mode; pending comments stay"),
                 ],
@@ -609,7 +747,8 @@ impl GitCometView {
                 FocusPanel::Sidebar => {
                     return &[
                         ("j / k", "Next / previous pull request"),
-                        ("enter", "Open its diff"),
+                        ("< / >", "Pull request below / above it in its stack"),
+                        ("enter", "Read the pull request in the middle panel"),
                         ("space", "Check it out locally"),
                         ("n", "New pull request"),
                         ("r", "Review it: line comments, one submit"),
@@ -620,11 +759,24 @@ impl GitCometView {
                         ("[ / ]", "Branches / Files / Pull requests tab"),
                     ];
                 }
+                FocusPanel::History if self.pull_request_content_active() => {
+                    return &[
+                        ("j / k", "Next / previous entry or thread"),
+                        ("< / >", "Pull request below / above it in its stack"),
+                        ("[ / ]", "Conversation / Comments tab"),
+                        ("enter", "Review at the selected thread's line"),
+                        ("V", "Show / hide resolved and outdated threads"),
+                        ("o", "Open on GitHub"),
+                        ("r", "Review the pull request"),
+                    ];
+                }
                 FocusPanel::Details if self.pull_request_details_active() => {
                     return &[
-                        ("j / k", "Next / previous file"),
-                        ("J / K", "Scroll the checks and conversation"),
-                        ("enter", "Open the file's diff"),
+                        ("j / k", "Next / previous PR commit"),
+                        ("J / K", "Extend the contiguous commit range"),
+                        ("< / >", "Pull request below / above it in its stack"),
+                        ("esc", "Select all commits"),
+                        ("enter", "Read the pull request in the middle panel"),
                         ("space", "Check it out locally"),
                         ("r", "Review"),
                         ("M", "Merge it on GitHub"),
@@ -1246,9 +1398,40 @@ impl GitCometView {
             return Some(true);
         }
         let selected = self.active_pull_requests().and_then(|prs| prs.selected);
-        let in_details = current == Some(FocusPanel::Details) && self.pull_request_details_active();
+        let in_details = current == Some(FocusPanel::Details) && self.pull_request_content_active();
+        let in_content = current == Some(FocusPanel::History) && self.pull_request_content_active();
+        let in_sidebar = current == Some(FocusPanel::Sidebar) && self.active_review().is_none();
+        // `<`/`>` move to the pull request below/above the selected one in
+        // its stack, in the list, panel 2 and Details. US layouts send them
+        // as shift+`,`/`.`; ISO/DE layouts have `<`/`>` as their own key
+        // (there, shift+`,` sends `;`), so both are matched.
+        let stack_step = match key {
+            "," if shift => Some(-1),
+            "." if shift => Some(1),
+            "<" => Some(-1),
+            ">" => Some(1),
+            _ => None,
+        };
+        if let Some(direction) = stack_step
+            && (in_sidebar || in_content || in_details)
+        {
+            return Some(self.select_pull_request_stack_neighbor(direction, cx));
+        }
         if shift {
             return match key.to_ascii_lowercase().as_str() {
+                "j" | "k" if in_details => {
+                    self.step_pull_request_commit(
+                        if key.eq_ignore_ascii_case("j") { 1 } else { -1 },
+                        true,
+                        cx,
+                    );
+                    Some(true)
+                }
+                "c" | "t" if in_content => Some(true),
+                "v" if in_content => {
+                    self.toggle_pull_request_hidden_threads(cx);
+                    Some(true)
+                }
                 // Submit a review with no line comments: the quick verdict.
                 "s" => {
                     let number = selected?;
@@ -1276,14 +1459,6 @@ impl GitCometView {
                     );
                     Some(true)
                 }
-                // lazygit's main-panel scroll: checks and conversation.
-                direction @ ("j" | "k") if in_details => {
-                    let direction = if direction == "j" { 1 } else { -1 };
-                    self.details_pane.update(cx, |pane, cx| {
-                        pane.scroll_pull_request_details(direction, cx)
-                    });
-                    Some(true)
-                }
                 _ => None,
             };
         }
@@ -1293,25 +1468,53 @@ impl GitCometView {
             _ => 0,
         };
         match (current, key) {
-            (Some(FocusPanel::Sidebar), _) if direction != 0 => {
-                self.select_adjacent_pull_request(direction, cx);
+            (Some(FocusPanel::Details), _) if direction != 0 && in_details => {
+                self.step_pull_request_commit(direction, false, cx);
                 Some(true)
             }
-            (Some(FocusPanel::Details), _) if direction != 0 && in_details => {
-                self.select_adjacent_pull_request_file(direction, cx);
+            (Some(FocusPanel::Details), "escape") if in_details => {
+                self.clear_pull_request_commit_selection(cx);
+                Some(true)
+            }
+            (Some(FocusPanel::History), "t" | "g" | "m" | "escape") if in_content => Some(true),
+            (Some(FocusPanel::History), _) if direction != 0 && in_content => {
+                self.step_pull_request_content(direction, cx);
+                Some(true)
+            }
+            (Some(FocusPanel::History), "[") if in_content => {
+                self.set_pull_request_content_tab(
+                    super::pull_requests::PrContentTab::Conversation,
+                    cx,
+                );
+                Some(true)
+            }
+            (Some(FocusPanel::History), "]") if in_content => {
+                self.set_pull_request_content_tab(super::pull_requests::PrContentTab::Comments, cx);
+                Some(true)
+            }
+            (Some(FocusPanel::History), "enter") if in_content => {
+                if self.active_pull_requests().is_some_and(|prs| {
+                    prs.content_tab == super::pull_requests::PrContentTab::Comments
+                }) && let Some(thread) = self.selected_pull_request_thread()
+                {
+                    self.start_review_at_thread(&thread, cx);
+                }
+                Some(true)
+            }
+            (Some(FocusPanel::Sidebar), _) if direction != 0 => {
+                self.select_adjacent_pull_request(direction, cx);
                 Some(true)
             }
             (Some(FocusPanel::Sidebar | FocusPanel::Details), "space") if selected.is_some() => {
                 self.checkout_pull_request(cx);
                 Some(true)
             }
-            (Some(from @ (FocusPanel::Sidebar | FocusPanel::Details)), "enter")
-                if selected.is_some() =>
-            {
-                if self.open_pull_request_diff(None, cx) {
-                    self.diff_return_panel = from;
-                    self.focus_diff_when_open = true;
-                }
+            (Some(FocusPanel::Sidebar), "enter") if selected.is_some() => {
+                self.focus_panel(FocusPanel::History, window, cx);
+                Some(true)
+            }
+            (Some(FocusPanel::Details), "enter") if in_details => {
+                self.focus_panel(FocusPanel::History, window, cx);
                 Some(true)
             }
             (_, "n") => {
@@ -1363,11 +1566,17 @@ impl GitCometView {
     ) -> bool {
         // With nothing focused the root's capture listener never runs, so the
         // open `?` list and Codex menu are served from here too.
+        if self.reviewer_menu.is_some() {
+            return self.handle_reviewer_menu_key(keystroke, window, cx);
+        }
         if self.codex_menu_open {
             return self.handle_codex_menu_key(keystroke, window, cx);
         }
         if self.keys_help_panel.is_some() {
             return self.handle_keys_help_key(keystroke, window, cx);
+        }
+        if self.commit_scope_picker.is_some() {
+            return self.handle_commit_scope_picker_key(keystroke, cx);
         }
         let mods = keystroke.modifiers;
         if mods.control || mods.alt || mods.platform || mods.function {
@@ -1381,7 +1590,11 @@ impl GitCometView {
         {
             let key = keystroke.key.as_str();
             if key == "i" {
-                self.codex_menu_open = true;
+                if self.pr_reviewer_context_active() {
+                    self.open_reviewer_menu(cx);
+                } else {
+                    self.codex_menu_open = true;
+                }
                 cx.notify();
                 return true;
             }
@@ -1425,7 +1638,11 @@ impl GitCometView {
                 return true;
             }
             "i" => {
-                self.codex_menu_open = true;
+                if self.pr_reviewer_context_active() {
+                    self.open_reviewer_menu(cx);
+                } else {
+                    self.codex_menu_open = true;
+                }
                 cx.notify();
                 return true;
             }
@@ -1545,6 +1762,183 @@ impl GitCometView {
                 )
                 .children(rows.iter().map(|&(keys, label)| row(keys, label)))
         };
+        let legend_row = |id: &'static str, icon: AnyElement, label: &'static str| {
+            div()
+                .debug_selector(move || id.to_string())
+                .flex()
+                .items_center()
+                .gap(scale.px(8.0))
+                .py(scale.px(2.0))
+                .child(
+                    div()
+                        .w(scale.px(20.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .text_size(scale.ui_text(13.0))
+                        .text_color(theme.colors.foreground.primary)
+                        .child(label),
+                )
+        };
+        // A section of its own rather than more `key_help` rows: those render
+        // through `shortcut_keys`, which turns any left column text into
+        // keycap chips, and "Symbols" / "Review" aren't keys.
+        let pr_legend = || {
+            let size = scale.px(14.0);
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .pb(scale.px(4.0))
+                        .text_size(scale.ui_text(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.colors.foreground.secondary)
+                        .child("Pull request symbols"),
+                )
+                .child(legend_row(
+                    "legend_open",
+                    pr_symbols::state("OPEN", false, theme).render(
+                        "legend_open".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Open",
+                ))
+                .child(legend_row(
+                    "legend_draft",
+                    pr_symbols::state("OPEN", true, theme).render(
+                        "legend_draft".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Draft",
+                ))
+                .child(legend_row(
+                    "legend_merged",
+                    pr_symbols::state("MERGED", false, theme).render(
+                        "legend_merged".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Merged",
+                ))
+                .child(legend_row(
+                    "legend_closed",
+                    pr_symbols::state("CLOSED", false, theme).render(
+                        "legend_closed".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Closed",
+                ))
+                .child(legend_row(
+                    "legend_review_required",
+                    pr_symbols::review(ReviewDecision::ReviewRequired, theme).render(
+                        "legend_review_required".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Review required",
+                ))
+                .child(legend_row(
+                    "legend_review_approved",
+                    pr_symbols::review(ReviewDecision::Approved, theme).render(
+                        "legend_review_approved".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Approved",
+                ))
+                .child(legend_row(
+                    "legend_review_changes",
+                    pr_symbols::review(ReviewDecision::ChangesRequested, theme).render(
+                        "legend_review_changes".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Changes requested",
+                ))
+                .child(legend_row(
+                    "legend_review_commented",
+                    pr_symbols::review(ReviewDecision::Commented, theme).render(
+                        "legend_review_commented".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Commented",
+                ))
+                .child(legend_row(
+                    "legend_checks_failing",
+                    pr_symbols::checks(
+                        ChecksSummary {
+                            failing: 1,
+                            pending: 0,
+                            passing: 0,
+                        },
+                        theme,
+                    )
+                    .expect("failing > 0 always renders a symbol")
+                    .render("legend_checks_failing".to_string(), theme, size),
+                    "Checks failing",
+                ))
+                .child(legend_row(
+                    "legend_checks_pending",
+                    pr_symbols::checks(
+                        ChecksSummary {
+                            failing: 0,
+                            pending: 1,
+                            passing: 0,
+                        },
+                        theme,
+                    )
+                    .expect("pending > 0 always renders a symbol")
+                    .render("legend_checks_pending".to_string(), theme, size),
+                    "Checks running",
+                ))
+                .child(legend_row(
+                    "legend_checks_passing",
+                    pr_symbols::checks(
+                        ChecksSummary {
+                            failing: 0,
+                            pending: 0,
+                            passing: 1,
+                        },
+                        theme,
+                    )
+                    .expect("passing > 0 always renders a symbol")
+                    .render("legend_checks_passing".to_string(), theme, size),
+                    "Checks passing",
+                ))
+                .child(legend_row(
+                    "legend_person",
+                    pr_symbols::person(theme).render("legend_person".to_string(), theme, size),
+                    "Your pull request",
+                ))
+                .child(legend_row(
+                    "legend_pending",
+                    pr_symbols::pending(1, theme).render(
+                        "legend_pending".to_string(),
+                        theme,
+                        size,
+                    ),
+                    "Pending review comments",
+                ))
+                .child(legend_row(
+                    "legend_at_pill",
+                    pr_symbols::at_pill(theme, "legend_at_pill"),
+                    "Your review is requested",
+                ))
+                .child(legend_row(
+                    "legend_kind_tag",
+                    pr_symbols::kind_tag("feat", theme, scale.ui_text(11.0)),
+                    "feat / fix / refactor / docs / deps from the title",
+                ))
+        };
         let body = components::modal_surface(theme)
             .p(scale.px(14.0))
             .flex()
@@ -1558,6 +1952,9 @@ impl GitCometView {
                     .child(format!("Keys · {}", panel.name())),
             )
             .child(section(panel.name(), self.key_help(panel)))
+            .when(self.state.sidebar_mode == SidebarMode::PullRequests, |body| {
+                body.child(pr_legend())
+            })
             .child(section("Every panel", PANEL_KEYS_HELP))
             .child(
                 div()

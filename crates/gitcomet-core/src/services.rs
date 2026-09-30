@@ -1677,6 +1677,22 @@ pub trait GitRepository: Send + Sync {
         )))
     }
 
+    /// The subset of `paths` GitHub would treat as generated
+    /// (`linguist-generated`) at `commit_id`: an explicit attribute in
+    /// `.gitattributes` at that commit wins over the built-in list
+    /// (`crate::generated_files`), which decides only for a path
+    /// `.gitattributes` says nothing about. Read from the commit's own tree,
+    /// never the working tree.
+    fn generated_file_paths_at_commit(
+        &self,
+        _commit_id: &CommitId,
+        _paths: &[std::path::PathBuf],
+    ) -> Result<std::collections::BTreeSet<std::path::PathBuf>> {
+        Err(Error::new(ErrorKind::Unsupported(
+            "generated-file detection is not implemented for this backend",
+        )))
+    }
+
     fn submodule_diff_summary(
         &self,
         _target: &crate::domain::DiffTarget,

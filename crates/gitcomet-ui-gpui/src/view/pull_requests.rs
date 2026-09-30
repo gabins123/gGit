@@ -31,19 +31,116 @@ impl<T> PrLoad<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum PrContentTab {
+    #[default]
+    Conversation,
+    Comments,
+}
+
+/// The All commits row is `None`; commit indexes are newest first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PrCommitSelection {
+    pub(super) cursor: Option<usize>,
+    anchor: Option<usize>,
+}
+
+impl PrCommitSelection {
+    pub(super) fn range(self, len: usize) -> Option<(usize, usize)> {
+        let cursor = self.cursor.filter(|ix| *ix < len)?;
+        let anchor = self.anchor.filter(|ix| *ix < len).unwrap_or(cursor);
+        Some((cursor.min(anchor), cursor.max(anchor)))
+    }
+
+    pub(super) fn step(&mut self, direction: i8, extend: bool, len: usize) {
+        let next = match (self.cursor, direction) {
+            (None, 1) if len > 0 => Some(0),
+            (Some(ix), 1) if ix + 1 < len => Some(ix + 1),
+            (Some(0), -1) => extend.then_some(0),
+            (Some(ix), -1) => Some(ix - 1),
+            _ => self.cursor,
+        };
+        if extend && let (Some(cursor), Some(_)) = (self.cursor, next) {
+            self.anchor.get_or_insert(cursor);
+        } else if !extend || next.is_none() {
+            self.anchor = None;
+        }
+        self.cursor = next;
+    }
+
+    pub(super) fn select(&mut self, ix: Option<usize>) {
+        self.cursor = ix;
+        self.anchor = None;
+    }
+
+    pub(super) fn select_range(&mut self, newest: usize, oldest: usize, len: usize) {
+        if newest <= oldest && oldest < len {
+            self.cursor = Some(oldest);
+            self.anchor = Some(newest);
+        }
+    }
+
+    pub(super) fn selected_range(
+        self,
+        commits: &[github::PullRequestCommit],
+    ) -> Option<SelectedCommitRange> {
+        let (newest, oldest) = self.range(commits.len())?;
+        Some(SelectedCommitRange {
+            oldest_oid: commits[oldest].oid.clone(),
+            newest_oid: commits[newest].oid.clone(),
+            count: oldest - newest + 1,
+            total: commits.len(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SelectedCommitRange {
+    pub(super) oldest_oid: String,
+    pub(super) newest_oid: String,
+    pub(super) count: usize,
+    pub(super) total: usize,
+}
+
+/// The merge dialog's note for a pull request on a plain base-branch chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum BaseChainMergeNote {
+    /// Not the chain's bottom: names where it actually merges, and the
+    /// stack's real base.
+    NotStackBase { into: String, stack_base: String },
+    /// The chain's bottom: deleting the branch (`Alt+D`) retargets the next
+    /// pull request to this one's base.
+    BottomOfChain,
+}
+
 #[derive(Default)]
 pub(super) struct RepoPullRequests {
     pub(super) list: PrLoad<Arc<Vec<PullRequestSummary>>>,
+    /// The stacks found in `list` (base-branch chains, `native` marked where
+    /// GitHub's own stack agrees), recomputed with it. Drives the list's
+    /// grouping, Details' Stack section, and `<`/`>`. Empty when the
+    /// repository has none.
+    pub(super) stacks: Vec<github::PullRequestStack>,
+    /// GitHub's own stacks (from the live GraphQL `stack` field), queried
+    /// only for `stacks`' members. The merge dialog and `submit_pull_request_merge`
+    /// use this, per pull request, rather than `stacks`' chain-wide `native`
+    /// flag: a chain can be a real stack for only part of its members.
+    pub(super) native_stacks: Vec<github::PullRequestStack>,
     pub(super) selected: Option<u64>,
     pub(super) detail: PrLoad<Arc<PullRequestDetail>>,
+    pub(super) threads: PrLoad<Arc<Vec<github::ReviewThread>>>,
+    pub(super) content_tab: PrContentTab,
+    pub(super) selected_entry: Option<usize>,
+    pub(super) selected_thread: Option<usize>,
+    pub(super) commit_selection: PrCommitSelection,
+    pub(super) last_review: PrLoad<Option<github::LastReview>>,
+    pub(super) show_hidden_threads: bool,
     /// The selected PR's merge base, once its commits are local.
     pub(super) diff_base: PrLoad<String>,
-    /// Index into the selected PR's files.
-    pub(super) selected_file: Option<usize>,
-    /// Its diff was asked for (enter, a click, review mode), so the commit
-    /// fetch opens it when it lands, or reports why it can't. The fetch
-    /// starts as soon as the details land; asked for or not.
-    pub(super) diff_asked: bool,
+    /// Which of the selected PR's files GitHub would treat as generated
+    /// (`linguist-generated`), read from `.gitattributes` at the PR's head
+    /// commit once it's fetched locally (right after `diff_base` lands).
+    pub(super) generated_files: PrLoad<Arc<std::collections::BTreeSet<String>>>,
     /// Set while a review or create is with gh.
     pub(super) submitting: bool,
     /// gh's refusal of the last review, create or merge, shown in its dialog.
@@ -68,8 +165,11 @@ pub(super) struct RepoPullRequests {
     pub(super) files_error: Option<String>,
     list_seq: u64,
     detail_seq: u64,
+    last_review_seq: u64,
+    threads_seq: u64,
     diff_seq: u64,
     files_seq: u64,
+    generated_files_seq: u64,
 }
 
 impl RepoPullRequests {
@@ -77,7 +177,200 @@ impl RepoPullRequests {
     pub(super) fn files_listing(&self) -> bool {
         self.file_page_count > 0 && self.next_file_page <= self.file_page_count
     }
+
+    pub(super) fn visible_thread_indexes(&self) -> Vec<usize> {
+        self.threads
+            .ready()
+            .map(|threads| visible_pr_thread_indexes(threads, self.show_hidden_threads))
+            .unwrap_or_default()
+    }
+
+    /// The merge dialog's note for a pull request on a plain base-branch
+    /// chain (not one of GitHub's own native stacks, where the stack merge
+    /// plan is shown instead): where the merge actually lands, or that
+    /// deleting the branch retargets the next pull request.
+    pub(super) fn base_chain_merge_note(&self, number: u64) -> Option<BaseChainMergeNote> {
+        if self.native_stack_containing(number).is_some() {
+            return None;
+        }
+        let (stack, _) = self.stack_position(number)?;
+        let list = self.list.ready()?;
+        let base_of = |candidate: u64| {
+            list.iter()
+                .find(|pr| pr.number == candidate)
+                .map(|pr| pr.base.clone())
+        };
+        if github::stack_parent(&stack.members, number, list).is_none() {
+            Some(BaseChainMergeNote::BottomOfChain)
+        } else {
+            Some(BaseChainMergeNote::NotStackBase {
+                into: base_of(number)?,
+                stack_base: base_of(stack.members[0])?,
+            })
+        }
+    }
+
+    /// The native GitHub stack `number` belongs to, if any — per pull
+    /// request, not `stacks`' chain-wide `native` flag: a chain can be a
+    /// real stack for only part of its members.
+    fn native_stack_containing(&self, number: u64) -> Option<&github::PullRequestStack> {
+        self.native_stacks
+            .iter()
+            .find(|stack| stack.members.contains(&number))
+    }
+
+    /// What merging `number` would do, when GitHub reports it as part of one
+    /// of its own stacks. `None` outside a native stack, where merging works
+    /// as it does today.
+    pub(super) fn stack_merge_plan(&self, number: u64) -> Option<github::StackMergePlan> {
+        let stack = self.native_stack_containing(number)?;
+        let list = self.list.ready()?;
+        github::plan_stack_merge(stack, number, list)
+    }
+
+    /// The stack `number` belongs to (for display: base-branch chains,
+    /// native or not), and its position within it (bottom is 0). The
+    /// position is the flattened member index; for a real depth, or the
+    /// actual parent/child, see `github::stack_depth`/`stack_parent`/
+    /// `stack_child`, which follow base/head links instead — a tree can put
+    /// siblings next to each other in this flattened order.
+    pub(super) fn stack_position(&self, number: u64) -> Option<(&github::PullRequestStack, usize)> {
+        self.stacks.iter().find_map(|stack| {
+            stack
+                .members
+                .iter()
+                .position(|member| *member == number)
+                .map(|ix| (stack, ix))
+        })
+    }
+
+    /// The pull request below (`direction < 0`, its real parent) or above
+    /// (`direction > 0`, its lowest-numbered child) `number` in its stack,
+    /// or `None` off either end or outside a stack.
+    pub(super) fn stack_neighbor(&self, number: u64, direction: i8) -> Option<u64> {
+        let (stack, _) = self.stack_position(number)?;
+        let list = self.list.ready()?;
+        if direction < 0 {
+            github::stack_parent(&stack.members, number, list)
+        } else {
+            github::stack_child(&stack.members, number, list)
+        }
+    }
 }
+
+/// `inbox_rank` for every pull request in `list`, except a stack's members
+/// all take the stack's best (lowest) rank: otherwise a stack that straddles
+/// ranks (one member waiting on review, another not) would split its own
+/// section header, or interleave sections around itself.
+pub(super) fn stack_adjusted_ranks(
+    list: &[PullRequestSummary],
+    drafts: &FxHashMap<u64, usize>,
+    stacks: &[github::PullRequestStack],
+) -> Vec<u8> {
+    let mut ranks: Vec<u8> = list.iter().map(|pr| inbox_rank(pr, drafts)).collect();
+    let index_of: FxHashMap<u64, usize> = list
+        .iter()
+        .enumerate()
+        .map(|(ix, pr)| (pr.number, ix))
+        .collect();
+    for stack in stacks {
+        let Some(best) = stack
+            .members
+            .iter()
+            .filter_map(|number| index_of.get(number))
+            .map(|&ix| ranks[ix])
+            .min()
+        else {
+            continue;
+        };
+        for member in &stack.members {
+            if let Some(&ix) = index_of.get(member) {
+                ranks[ix] = best;
+            }
+        }
+    }
+    ranks
+}
+
+/// The base-branch chains in `list`, and GitHub's own stacks among them
+/// (`native` marked correctly once those are known). The GraphQL stack query
+/// only ever asks about pull requests already in a chain — skipped entirely
+/// when there are none — since GitHub's real stacks are a subset of gGit's
+/// inferred chains. Best-effort: a failed or unsupported stack query leaves
+/// every chain plain rather than breaking the list.
+fn compute_stacks_and_native(
+    workdir: &std::path::Path,
+    repo: &str,
+    list: &[PullRequestSummary],
+    owner: &str,
+) -> (Vec<github::PullRequestStack>, Vec<github::PullRequestStack>) {
+    let chains = github::compute_pull_request_stacks(list, owner, &[]);
+    if chains.is_empty() {
+        return (chains, Vec::new());
+    }
+    let numbers: Vec<u64> = chains.iter().flat_map(|stack| stack.members.iter().copied()).collect();
+    let native_stacks = github::native_stacks(workdir, repo, &numbers);
+    let stacks = if native_stacks.is_empty() {
+        chains
+    } else {
+        github::compute_pull_request_stacks(list, owner, &native_stacks)
+    };
+    (stacks, native_stacks)
+}
+
+/// Reorders `list` so each stack's pull requests sit together, bottom PR
+/// first, at the position of whichever member `list` already ranks highest
+/// (inbox order runs first, so that is the stack's most important pull
+/// request). Pull requests outside any stack keep their relative order.
+pub(super) fn apply_stack_order(list: &mut Vec<PullRequestSummary>, stacks: &[github::PullRequestStack]) {
+    if stacks.is_empty() {
+        return;
+    }
+    let member_stack: FxHashMap<u64, usize> = stacks
+        .iter()
+        .enumerate()
+        .flat_map(|(ix, stack)| stack.members.iter().map(move |number| (*number, ix)))
+        .collect();
+    let by_number: FxHashMap<u64, PullRequestSummary> =
+        list.iter().cloned().map(|pr| (pr.number, pr)).collect();
+    let mut emitted = vec![false; stacks.len()];
+    let mut ordered = Vec::with_capacity(list.len());
+    for pr in list.iter() {
+        match member_stack.get(&pr.number) {
+            Some(&stack_ix) if !emitted[stack_ix] => {
+                emitted[stack_ix] = true;
+                ordered.extend(
+                    stacks[stack_ix]
+                        .members
+                        .iter()
+                        .filter_map(|number| by_number.get(number).cloned()),
+                );
+            }
+            Some(_) => {}
+            None => ordered.push(pr.clone()),
+        }
+    }
+    *list = ordered;
+}
+
+pub(super) fn visible_pr_thread_indexes(
+    threads: &[github::ReviewThread],
+    show_hidden: bool,
+) -> Vec<usize> {
+    let mut visible: Vec<_> = threads
+        .iter()
+        .enumerate()
+        .filter(|(_, thread)| show_hidden || (!thread.is_resolved && !thread.outdated()))
+        .map(|(ix, _)| ix)
+        .collect();
+    // REST threads are already in line order within each file. Stable sorting
+    // only by path keeps that order when grouping interleaved test or cache data.
+    visible.sort_by(|&a, &b| threads[a].path.cmp(&threads[b].path));
+    visible.truncate(MAX_PR_VISIBLE_THREADS);
+    visible
+}
+
+pub(super) const MAX_PR_VISIBLE_THREADS: usize = 200;
 
 /// Pages of files fetched at once: enough to have the list long before
 /// the first file is reviewed, few enough to stay clear of GitHub's limits
@@ -203,9 +496,11 @@ impl GitCometView {
             return;
         }
         let drafts = entry.drafts.clone();
+        let stacks = entry.stacks.clone();
         if let PrLoad::Ready(list) = &mut entry.list {
             let list: &mut Vec<PullRequestSummary> = Arc::make_mut(list);
             inbox_order(list, &drafts);
+            apply_stack_order(list, &stacks);
         }
     }
 }
@@ -217,6 +512,14 @@ struct ReviewSubmitted {
     /// The pending comments and replies now on GitHub.
     comments: Vec<crate::github::ReviewComment>,
     error: Option<PrError>,
+}
+
+/// What a successful merge submit actually did, so the toast can say so.
+enum MergeOutcome {
+    /// The single-PR `gh pr merge` path.
+    Plain,
+    /// GitHub's asynchronous stack merge API.
+    Stack(github::StackMergeOutcome),
 }
 
 /// The dialog a gh submit came from, so its outcome reaches that dialog and
@@ -265,7 +568,7 @@ impl PullRequestsState {
         self.repos.get(&repo_id)
     }
 
-    fn repo_mut(&mut self, repo_id: RepoId) -> &mut RepoPullRequests {
+    pub(super) fn repo_mut(&mut self, repo_id: RepoId) -> &mut RepoPullRequests {
         self.repos.entry(repo_id).or_default()
     }
 }
@@ -311,12 +614,17 @@ impl GitCometView {
                 .is_some_and(|prs| prs.selected.is_some())
     }
 
+    pub(super) fn pull_request_content_active(&self) -> bool {
+        self.pull_request_details_active() && self.active_review().is_none()
+    }
+
     /// The sidebar and details panes are cached views, so a change to pull
     /// request state has to reach them explicitly; so does an open dialog
     /// that shows it.
     pub(super) fn notify_pull_request_panes(&mut self, cx: &mut gpui::Context<Self>) {
         self.sidebar_pane.update(cx, |_, cx| cx.notify());
         self.details_pane.update(cx, |_, cx| cx.notify());
+        self.main_pane.update(cx, |_, cx| cx.notify());
         // Deferred: this also runs inside the host's own submit handler.
         let host = self.popover_host.clone();
         cx.defer(move |cx| host.update(cx, |_, cx| cx.notify()));
@@ -338,6 +646,14 @@ impl GitCometView {
             return;
         };
         let repo_id = target.repo_id;
+        if self
+            .pull_requests
+            .repo(repo_id)
+            .is_some_and(|prs| matches!(prs.diff_base, PrLoad::Failed(_)))
+        {
+            self.reset_pull_request_diff_base(repo_id);
+            self.fetch_pull_request_commits(repo_id, cx);
+        }
         let entry = self.pull_requests.repo_mut(repo_id);
         // `R` also lists again the files a failed page left out.
         if entry.files_error.is_some() && !entry.files_listing() {
@@ -364,7 +680,11 @@ impl GitCometView {
                         .then(|| list.iter().map(|pr| pr.number).chain(reviewing).collect());
                     let drafts = super::review::pending_review_counts(&target.slug, open.as_ref());
                     inbox_order(&mut list, &drafts);
-                    (list, drafts, requested_known)
+                    let owner = target.slug.split('/').next().unwrap_or_default();
+                    let (stacks, native_stacks) =
+                        compute_stacks_and_native(&target.workdir, &target.slug, &list, owner);
+                    apply_stack_order(&mut list, &stacks);
+                    (list, drafts, requested_known, stacks, native_stacks)
                 },
             )
         });
@@ -376,7 +696,7 @@ impl GitCometView {
                     return;
                 }
                 entry.list = match result {
-                    Ok((mut list, drafts, requested_known)) => {
+                    Ok((mut list, drafts, requested_known, stacks, native_stacks)) => {
                         // gh couldn't say who is waiting this time: keep what
                         // it said last, so rows don't jump sections.
                         if !requested_known && let Some(previous) = entry.list.ready() {
@@ -386,8 +706,11 @@ impl GitCometView {
                                     .any(|old| old.number == pr.number && old.review_requested);
                             }
                             inbox_order(&mut list, &drafts);
+                            apply_stack_order(&mut list, &stacks);
                         }
                         entry.drafts = drafts;
+                        entry.stacks = stacks;
+                        entry.native_stacks = native_stacks;
                         PrLoad::Ready(Arc::new(list))
                     }
                     Err(err) => PrLoad::Failed(err),
@@ -403,23 +726,44 @@ impl GitCometView {
         let Some(repo_id) = self.active_repo_id() else {
             return;
         };
+        if self
+            .active_repo()
+            .is_some_and(|repo| repo.diff_state.diff_target.is_some())
+        {
+            self.store.dispatch(Msg::ClearDiffSelection { repo_id });
+        }
         let entry = self.pull_requests.repo_mut(repo_id);
         if entry.selected == Some(number) && !matches!(entry.detail, PrLoad::Failed(_)) {
             return;
         }
         entry.selected = Some(number);
         entry.detail = PrLoad::Loading;
+        entry.threads = PrLoad::Idle;
+        entry.threads_seq += 1;
+        entry.content_tab = PrContentTab::Conversation;
+        entry.selected_entry = None;
+        entry.selected_thread = None;
+        entry.commit_selection = PrCommitSelection::default();
+        entry.last_review = PrLoad::Idle;
+        entry.last_review_seq += 1;
+        entry.show_hidden_threads = false;
         entry.diff_base = PrLoad::Idle;
         entry.diff_seq += 1;
-        entry.diff_asked = false;
+        // A previous pull request's generated-file set is that pull
+        // request's, at that head; the new selection starts unknown, and the
+        // seq bump drops a result still landing for it.
+        entry.generated_files = PrLoad::Idle;
+        entry.generated_files_seq += 1;
         // The previous pull request's listing stops where it is.
         entry.files_seq += 1;
         entry.file_page_count = 0;
         entry.files_error = None;
+        // A leftover reviewer Ask must not fire against the newly selected
+        // pull request.
+        self.clear_pending_reviewer_ask_if_stale();
         // A diff asked for on the previous pull request must not steal focus.
         self.focus_diff_when_open = false;
         let entry = self.pull_requests.repo_mut(repo_id);
-        entry.selected_file = None;
         entry.submit_error = None;
         // `j`/`k` can pass many pull requests a second, and each load is
         // several GitHub requests: gh runs for the one the selection settles on.
@@ -483,7 +827,16 @@ impl GitCometView {
                             }
                             _ => false,
                         };
+                        let same_commits = entry.detail.ready().is_some_and(|previous| {
+                            previous.number == number && previous.commits == detail.commits
+                        });
                         entry.detail = PrLoad::Ready(Arc::new(detail));
+                        entry.selected_entry = None;
+                        if !same_commits {
+                            entry.commit_selection = PrCommitSelection::default();
+                        }
+                        this.load_pull_request_last_review(repo_id, number, cx);
+                        this.load_pull_request_threads(repo_id, number, cx);
                         if !carried {
                             this.list_more_pull_request_files(repo_id, cx);
                         }
@@ -512,6 +865,100 @@ impl GitCometView {
         })
         .detach();
         self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn load_pull_request_last_review(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.last_review_seq += 1;
+        let seq = entry.last_review_seq;
+        if entry.last_review.ready().is_none() {
+            entry.last_review = PrLoad::Loading;
+        }
+        let task = cx.background_spawn(async move {
+            github::last_review(&target.workdir, &target.slug, number)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let entry = this.pull_requests.repo_mut(repo_id);
+                if entry.last_review_seq != seq || entry.selected != Some(number) {
+                    return;
+                }
+                match result {
+                    Ok(last) => entry.last_review = PrLoad::Ready(last),
+                    Err(_) if entry.last_review.ready().is_some() => {}
+                    Err(err) => entry.last_review = PrLoad::Failed(err),
+                }
+                if this
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.repo_id == repo_id && review.number == number)
+                {
+                    this.review_load_changes_since(cx);
+                }
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn load_pull_request_threads(
+        &mut self,
+        repo_id: RepoId,
+        number: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.threads_seq += 1;
+        let seq = entry.threads_seq;
+        if !matches!(&entry.threads, PrLoad::Ready(_)) {
+            entry.threads = PrLoad::Loading;
+        }
+        let task = cx.background_spawn(async move {
+            github::list_review_threads(&target.workdir, &target.slug, number)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let entry = this.pull_requests.repo_mut(repo_id);
+                if entry.threads_seq != seq || entry.selected != Some(number) {
+                    return;
+                }
+                match result {
+                    Ok(threads) => {
+                        entry.selected_thread = None;
+                        entry.threads = PrLoad::Ready(Arc::new(threads));
+                    }
+                    Err(err) if matches!(&entry.threads, PrLoad::Ready(_)) => {
+                        this.push_toast(
+                            components::ToastKind::Warning,
+                            format!("Couldn't reload review threads of #{number}: {err}"),
+                            cx,
+                        );
+                    }
+                    Err(err) => entry.threads = PrLoad::Failed(err),
+                }
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
     }
 
     /// Pages in the files past the first 100, several pages at once, as soon
@@ -627,6 +1074,7 @@ impl GitCometView {
         let PrLoad::Ready(detail) = &mut entry.detail else {
             return false;
         };
+        let mut classify_new_files = false;
         if !arrived.is_empty() {
             let detail = Arc::make_mut(detail);
             let mut known: rustc_hash::FxHashSet<String> =
@@ -635,6 +1083,7 @@ impl GitCometView {
                 .into_iter()
                 .filter(|file| known.insert(file.path.clone()))
                 .collect();
+            classify_new_files = !new.is_empty();
             detail.files.extend(new.iter().cloned());
             // Review mode lists the same files in the same order; checked
             // against its own list, which a reload at a new head doesn't reset.
@@ -645,23 +1094,40 @@ impl GitCometView {
             {
                 let fresh: Vec<String> = {
                     let listed: rustc_hash::FxHashSet<&str> =
-                        review.files.iter().map(String::as_str).collect();
+                        review.all_files.iter().map(String::as_str).collect();
                     new.into_iter()
                         .map(|file| file.path)
                         .filter(|path| !listed.contains(path.as_str()))
                         .collect()
                 };
-                review.files.extend(fresh);
+                review.all_files.extend(fresh.iter().cloned());
+                if review.commit_range.is_none() {
+                    review.files.extend(fresh);
+                }
             }
+        }
+        if classify_new_files {
+            // A page landing after the merge base's own detection pass ran
+            // means those files never got checked for `linguist-generated`;
+            // redo the (cheap, local, gix-only) detection over the full list.
+            let entry = self.pull_requests.repo_mut(repo_id);
+            if !matches!(entry.generated_files, PrLoad::Idle | PrLoad::Loading) {
+                entry.generated_files = PrLoad::Idle;
+            }
+            self.fetch_pull_request_generated_files(repo_id, cx);
         }
         self.notify_pull_request_panes(cx);
         true
     }
 
-    /// Fetches the PR's commits as soon as its details land, so the diff is
-    /// ready by the time it's asked for. Only a diff someone asked for opens,
-    /// or reports a failure.
-    fn fetch_pull_request_commits(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) {
+    /// Fetches the PR's commits as soon as its details land, so a review diff
+    /// can open immediately. A review waiting for this fetch opens its file
+    /// when the merge base arrives, or reports a failure.
+    pub(super) fn fetch_pull_request_commits(
+        &mut self,
+        repo_id: RepoId,
+        cx: &mut gpui::Context<Self>,
+    ) {
         if cfg!(test) {
             return;
         }
@@ -697,25 +1163,97 @@ impl GitCometView {
                 if entry.diff_seq != seq {
                     return;
                 }
-                let asked = entry.diff_asked;
                 match result {
                     Ok(merge_base) => {
                         entry.diff_base = PrLoad::Ready(merge_base);
-                        if asked {
-                            this.show_pull_request_file(repo_id);
+                        if let Some(ix) = this.active_review().and_then(|review| {
+                            (review.repo_id == repo_id
+                                && review.number == number
+                                && review.commit_range.is_none())
+                            .then_some(review.file_ix)
+                        }) {
+                            this.review_open_file(ix, cx);
                         }
+                        // The head commit is fetched locally now, so gix can
+                        // read its tree (and `.gitattributes`) without a
+                        // network call.
+                        this.fetch_pull_request_generated_files(repo_id, cx);
                     }
                     Err(err) => {
                         let message = format!("Couldn't load the diff of #{number}: {err}");
                         entry.diff_base = PrLoad::Failed(err);
-                        // Told once: a later retry (a reload) doesn't open it.
-                        entry.diff_asked = false;
-                        if asked {
-                            this.focus_diff_when_open = false;
+                        if this.review_of(repo_id, number).is_some() {
                             this.push_toast(components::ToastKind::Error, message, cx);
                         }
                     }
                 }
+                this.notify_pull_request_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches which of the selected PR's files GitHub would treat as
+    /// generated (`linguist-generated`), read from `.gitattributes` at the
+    /// PR's head commit — a gix-only read of the commit's own tree, never the
+    /// working tree. Cosmetic-only (hiding/marking generated files in the
+    /// review file list, and the Details size line): a failure just leaves
+    /// every file shown as not generated, with no toast.
+    pub(super) fn fetch_pull_request_generated_files(
+        &mut self,
+        repo_id: RepoId,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(target) = self.github_target_for(repo_id) else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if !matches!(entry.generated_files, PrLoad::Idle | PrLoad::Failed(_)) {
+            return;
+        }
+        let Some(detail) = entry.detail.ready().cloned() else {
+            return;
+        };
+        entry.generated_files = PrLoad::Loading;
+        entry.generated_files_seq += 1;
+        let seq = entry.generated_files_seq;
+        let number = detail.number;
+        let head_oid = detail.head_oid.clone();
+        let paths: Vec<std::path::PathBuf> = detail
+            .files
+            .iter()
+            .map(|file| std::path::PathBuf::from(&file.path))
+            .collect();
+        // The same backend the store opens every other repository with (a
+        // test run's fake backend included) — never a concrete backend
+        // hardcoded here, which would bypass whatever the app was actually
+        // configured with.
+        let backend = self.store.backend();
+        let task = cx.background_spawn(async move {
+            let repo = backend.open(&target.workdir).map_err(|err| err.to_string())?;
+            let commit_id = gitcomet_core::domain::CommitId(head_oid.into());
+            let generated = repo
+                .generated_file_paths_at_commit(&commit_id, &paths)
+                .map_err(|err| err.to_string())?;
+            Ok::<_, String>(
+                generated
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<std::collections::BTreeSet<String>>(),
+            )
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let entry = this.pull_requests.repo_mut(repo_id);
+                if entry.generated_files_seq != seq {
+                    return;
+                }
+                entry.generated_files = match result {
+                    Ok(generated) => PrLoad::Ready(Arc::new(generated)),
+                    Err(_) => PrLoad::Idle,
+                };
+                this.review_sync_generated_files(repo_id, number, cx);
                 this.notify_pull_request_panes(cx);
             });
         })
@@ -750,122 +1288,179 @@ impl GitCometView {
         true
     }
 
-    /// Shows the selected PR's current file as a merge-base..head range diff.
-    /// Its commits must already be local (`diff_base` ready). Only for the
-    /// active repository: a fetch that lands after a tab switch just waits.
-    fn show_pull_request_file(&mut self, repo_id: RepoId) -> bool {
-        if self.active_repo_id() != Some(repo_id) {
-            return false;
-        }
-        let Some(prs) = self.pull_requests.repo(repo_id) else {
-            return false;
-        };
-        let (Some(detail), Some(merge_base), Some(file_ix)) =
-            (prs.detail.ready(), prs.diff_base.ready(), prs.selected_file)
-        else {
-            return false;
-        };
-        let Some(file) = detail.files.get(file_ix) else {
-            return false;
-        };
-        // Review mode's `L` starts the diff at your last review instead.
-        let from = self
-            .review_diff_base(repo_id, detail.number)
-            .unwrap_or_else(|| merge_base.clone());
-        self.store.dispatch(Msg::SelectDiff {
-            repo_id,
-            target: DiffTarget::CommitRange {
-                from_commit_id: CommitId(from.as_str().into()),
-                to_commit_id: Some(CommitId(detail.head_oid.as_str().into())),
-                path: Some(std::path::PathBuf::from(&file.path)),
-            },
-        });
-        true
-    }
-
-    /// Opens the selected PR's diff at `file_ix` (default: the current or first
-    /// file). The first time, its commits are fetched by id — no ref or file in
-    /// the repository changes — and the diff shows once they arrive. Returns
-    /// whether a diff is on its way.
-    pub(super) fn open_pull_request_diff(
-        &mut self,
-        file_ix: Option<usize>,
-        cx: &mut gpui::Context<Self>,
-    ) -> bool {
-        let Some(target) = self.github_target() else {
-            return false;
-        };
-        let repo_id = target.repo_id;
-        let entry = self.pull_requests.repo_mut(repo_id);
-        let Some(detail) = entry.detail.ready().cloned() else {
-            return false;
-        };
-        if detail.too_large_for_app() {
-            self.push_toast(
-                components::ToastKind::Warning,
-                format!(
-                    "#{} has {} files; GitHub lists only the first {}. Press o to review it on GitHub.",
-                    detail.number,
-                    detail.changed_files,
-                    github::MAX_LISTED_FILES
-                ),
-                cx,
-            );
-            return false;
-        }
-        if detail.files.is_empty() {
-            return false;
-        }
-        let last = detail.files.len() - 1;
-        entry.selected_file = Some(file_ix.or(entry.selected_file).unwrap_or(0).min(last));
-        entry.diff_asked = true;
-        match entry.diff_base {
-            PrLoad::Ready(_) => {
-                self.show_pull_request_file(repo_id);
-                self.notify_pull_request_panes(cx);
-                return true;
-            }
-            // The file just picked opens when the fetch lands.
-            PrLoad::Loading => {
-                self.notify_pull_request_panes(cx);
-                return true;
-            }
-            PrLoad::Idle | PrLoad::Failed(_) => {}
-        }
-        self.fetch_pull_request_commits(repo_id, cx);
-        self.notify_pull_request_panes(cx);
-        true
-    }
-
-    /// `j`/`k` over the selected PR's files. Moves the diff along once one is
-    /// open; before that it only moves the highlight.
-    pub(super) fn select_adjacent_pull_request_file(
+    /// `<`/`>`: the pull request below or above the selected one in its
+    /// stack. No-op outside a stack, or at either end of it.
+    pub(super) fn select_pull_request_stack_neighbor(
         &mut self,
         direction: i8,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        let Some(repo_id) = self.active_repo_id() else {
+        let Some(prs) = self.active_pull_requests() else {
             return false;
+        };
+        let Some(current) = prs.selected else {
+            return false;
+        };
+        let Some(neighbor) = prs.stack_neighbor(current, direction) else {
+            return false;
+        };
+        self.select_pull_request(neighbor, cx);
+        true
+    }
+
+    pub(super) fn set_pull_request_content_tab(
+        &mut self,
+        tab: PrContentTab,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        self.pull_requests.repo_mut(repo_id).content_tab = tab;
+        self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn step_pull_request_commit(
+        &mut self,
+        direction: i8,
+        extend: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
         };
         let entry = self.pull_requests.repo_mut(repo_id);
-        let Some(len) = entry.detail.ready().map(|detail| detail.files.len()) else {
-            return false;
+        let len = entry
+            .detail
+            .ready()
+            .map_or(0, |detail| detail.commits.len());
+        entry.commit_selection.step(direction, extend, len);
+        self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn clear_pull_request_commit_selection(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
         };
-        let next = match (entry.selected_file, direction < 0) {
-            (Some(ix), false) => Some(ix + 1).filter(|ix| *ix < len),
+        self.pull_requests.repo_mut(repo_id).commit_selection = PrCommitSelection::default();
+        self.notify_pull_request_panes(cx);
+    }
+
+    pub(super) fn select_pull_request_commit(
+        &mut self,
+        ix: Option<usize>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if ix.is_none_or(|ix| {
+            entry
+                .detail
+                .ready()
+                .is_some_and(|detail| ix < detail.commits.len())
+        }) {
+            entry.commit_selection.select(ix);
+            self.notify_pull_request_panes(cx);
+        }
+    }
+
+    pub(super) fn select_pull_request_entry(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if entry
+            .detail
+            .ready()
+            .is_some_and(|detail| ix < detail.conversation.len())
+        {
+            entry.selected_entry = Some(ix);
+            self.notify_pull_request_panes(cx);
+        }
+    }
+
+    pub(super) fn select_pull_request_thread(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        if entry.visible_thread_indexes().contains(&ix) {
+            entry.selected_thread = Some(ix);
+            self.notify_pull_request_panes(cx);
+        }
+    }
+
+    pub(super) fn step_pull_request_content(
+        &mut self,
+        direction: i8,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        let entry = self.pull_requests.repo_mut(repo_id);
+        let (selection, len) = match entry.content_tab {
+            PrContentTab::Conversation => (
+                &mut entry.selected_entry,
+                entry
+                    .detail
+                    .ready()
+                    .map_or(0, |detail| detail.conversation.len()),
+            ),
+            PrContentTab::Comments => {
+                let visible = entry.visible_thread_indexes();
+                let next = match entry
+                    .selected_thread
+                    .and_then(|ix| visible.iter().position(|item| *item == ix))
+                {
+                    Some(ix) if direction < 0 => ix.checked_sub(1),
+                    Some(ix) => Some(ix + 1).filter(|ix| *ix < visible.len()),
+                    None if direction < 0 => visible.len().checked_sub(1),
+                    None => (!visible.is_empty()).then_some(0),
+                };
+                if let Some(next) = next {
+                    entry.selected_thread = Some(visible[next]);
+                    self.notify_pull_request_panes(cx);
+                }
+                return;
+            }
+        };
+        let next = match (*selection, direction < 0) {
             (Some(ix), true) => ix.checked_sub(1),
-            (None, false) => (len > 0).then_some(0),
+            (Some(ix), false) => Some(ix + 1).filter(|ix| *ix < len),
             (None, true) => len.checked_sub(1),
+            (None, false) => (len > 0).then_some(0),
         };
-        let Some(next) = next else {
-            return false;
+        if let Some(next) = next {
+            *selection = Some(next);
+            self.notify_pull_request_panes(cx);
+        }
+    }
+
+    pub(super) fn toggle_pull_request_hidden_threads(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
         };
-        entry.selected_file = Some(next);
-        if entry.diff_asked && entry.diff_base.ready().is_some() {
-            self.show_pull_request_file(repo_id);
+        let entry = self.pull_requests.repo_mut(repo_id);
+        entry.show_hidden_threads = !entry.show_hidden_threads;
+        if entry
+            .selected_thread
+            .is_some_and(|ix| !entry.visible_thread_indexes().contains(&ix))
+        {
+            entry.selected_thread = None;
         }
         self.notify_pull_request_panes(cx);
-        true
+    }
+
+    pub(super) fn selected_pull_request_thread(&self) -> Option<github::ReviewThread> {
+        let prs = self.active_pull_requests()?;
+        let ix = prs.selected_thread?;
+        prs.visible_thread_indexes()
+            .contains(&ix)
+            .then(|| prs.threads.ready()?.get(ix).cloned())
+            .flatten()
     }
 
     /// `o` on a branch, as in lazygit: GitHub's page for opening a pull request
@@ -1139,27 +1734,53 @@ impl GitCometView {
             self.notify_pull_request_panes(cx);
             return;
         };
+        // A native stack merges through GitHub's own stack merge API; the
+        // dialog already showed the plan, so a refusal here should not
+        // normally happen, but nothing here trusts stale UI state.
+        let stack_plan = entry.stack_merge_plan(number);
+        if let Some(plan) = &stack_plan
+            && let Some(refusal) = &plan.refusal
+        {
+            entry.submit_error = Some(refusal.clone());
+            self.notify_pull_request_panes(cx);
+            return;
+        }
         entry.submitting = true;
         entry.submit_error = None;
         let slug = target.slug.clone();
-        let request = MergeRequest {
-            method,
-            delete_branch,
-            head_oid,
-        };
         let task = cx.background_spawn(async move {
-            github::merge(&target.workdir, &target.slug, number, &request)
+            match stack_plan {
+                Some(_) => github::merge_stack(&target.workdir, &target.slug, number, method, &head_oid)
+                    .map(MergeOutcome::Stack),
+                None => {
+                    let request = MergeRequest {
+                        method,
+                        delete_branch,
+                        head_oid,
+                    };
+                    github::merge(&target.workdir, &target.slug, number, &request)
+                        .map(|()| MergeOutcome::Plain)
+                }
+            }
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
                 this.pull_requests.repo_mut(repo_id).submitting = false;
                 match result {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         this.close_pull_request_prompt(repo_id, PrDialog::Merge(number), cx);
+                        let message = match outcome {
+                            MergeOutcome::Plain | MergeOutcome::Stack(github::StackMergeOutcome::Merged) => {
+                                format!("Merged #{number}")
+                            }
+                            MergeOutcome::Stack(github::StackMergeOutcome::Enqueued) => {
+                                format!("#{number} added to the merge queue")
+                            }
+                        };
                         this.push_toast_with_link(
                             components::ToastKind::Success,
-                            format!("Merged #{number}"),
+                            message,
                             format!("https://github.com/{slug}/pull/{number}"),
                             "View on GitHub".to_string(),
                             cx,
@@ -1175,6 +1796,9 @@ impl GitCometView {
                         cx,
                     ),
                 }
+                // A native stack merge (merged or enqueued) can change every
+                // pull request in it, not just this one; the list refresh
+                // below recomputes stacks and every row's state regardless.
                 this.reload_pull_request(repo_id, number, cx);
             });
         })
@@ -1528,6 +2152,15 @@ impl GitCometView {
         entry.next_file_page = 2;
     }
 
+    #[cfg(test)]
+    pub(super) fn seed_pull_request_threads_for_test(
+        &mut self,
+        repo_id: RepoId,
+        threads: Vec<github::ReviewThread>,
+    ) {
+        self.pull_requests.repo_mut(repo_id).threads = PrLoad::Ready(Arc::new(threads));
+    }
+
     /// A page of files as the background listing would hand it in.
     #[cfg(test)]
     pub(super) fn land_pull_request_files_page_for_test(
@@ -1569,6 +2202,13 @@ impl GitCometView {
             entry.diff_base = PrLoad::Idle;
             entry.diff_seq += 1;
         }
+        // The moved head's tree may set `.gitattributes` differently (or the
+        // file list itself has changed); re-read generated status at the new
+        // head rather than keep the old one's answer.
+        if !matches!(entry.generated_files, PrLoad::Idle) {
+            entry.generated_files = PrLoad::Idle;
+            entry.generated_files_seq += 1;
+        }
     }
 
     /// Clears a stale gh refusal when a review or create dialog opens.
@@ -1584,6 +2224,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn commit_selection_is_contiguous_and_escape_can_return_to_all() {
+        let mut selection = PrCommitSelection::default();
+        assert_eq!(selection.range(3), None);
+        selection.step(1, false, 3);
+        assert_eq!(selection.range(3), Some((0, 0)));
+        selection.step(1, true, 3);
+        selection.step(1, true, 3);
+        assert_eq!(selection.range(3), Some((0, 2)));
+        selection.step(-1, true, 3);
+        assert_eq!(selection.range(3), Some((0, 1)));
+        selection.step(-1, false, 3);
+        assert_eq!(selection.range(3), Some((0, 0)));
+        selection.step(-1, true, 3);
+        assert_eq!(selection.range(3), Some((0, 0)));
+        selection.step(-1, false, 3);
+        assert_eq!(selection.range(3), None);
+        selection.select(None);
+        assert_eq!(selection.range(3), None);
+    }
+
+    #[test]
     fn the_list_leads_with_reviews_waiting_on_you_then_yours_in_progress() {
         let pr = |number, review_requested| PullRequestSummary {
             number,
@@ -1593,9 +2254,11 @@ mod tests {
             head_owner: String::new(),
             base: String::new(),
             is_draft: false,
+            is_cross_repository: false,
             review: None,
             checks: Default::default(),
             review_requested,
+            is_mine: false,
         };
         let mut list = vec![pr(1, false), pr(2, false), pr(3, true), pr(4, false)];
         let drafts = FxHashMap::from_iter([(4, 2usize)]);
@@ -1603,5 +2266,119 @@ mod tests {
         // GitHub's order holds within each part.
         let numbers: Vec<u64> = list.iter().map(|pr| pr.number).collect();
         assert_eq!(numbers, [3, 4, 1, 2]);
+    }
+
+    fn plain_pr(number: u64) -> PullRequestSummary {
+        PullRequestSummary {
+            number,
+            title: String::new(),
+            author: String::new(),
+            head: String::new(),
+            head_owner: String::new(),
+            base: String::new(),
+            is_draft: false,
+            is_cross_repository: false,
+            review: None,
+            checks: Default::default(),
+            review_requested: false,
+            is_mine: false,
+        }
+    }
+
+    #[test]
+    fn a_stack_sits_together_at_its_top_ranked_members_place() {
+        // The list arrives already inbox-ordered [2, 5, 1]: 2 outranks 1
+        // (both in the stack) and 5. The stack [1, 2] must still move up to
+        // sit together at 2's spot, base (1) first — not stay split around 5.
+        let mut list = vec![plain_pr(2), plain_pr(5), plain_pr(1)];
+        let stack = github::PullRequestStack {
+            members: vec![1, 2],
+            native: false,
+        };
+        apply_stack_order(&mut list, std::slice::from_ref(&stack));
+        let numbers: Vec<u64> = list.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, [1, 2, 5]);
+    }
+
+    fn stack_chain_pr(number: u64, head: &str, base: &str, review_requested: bool) -> PullRequestSummary {
+        PullRequestSummary {
+            number,
+            title: String::new(),
+            author: String::new(),
+            head: head.to_string(),
+            head_owner: String::new(),
+            base: base.to_string(),
+            is_draft: false,
+            is_cross_repository: false,
+            review: None,
+            checks: Default::default(),
+            review_requested,
+            is_mine: false,
+        }
+    }
+
+    #[test]
+    fn a_stack_takes_the_best_rank_of_any_of_its_members_for_section_headers() {
+        // [2 waiting, 5 waiting, 1 open, 7 open], stack [1, 2]: without the
+        // fix, #1's own rank (open) would split the stack's section header
+        // away from #2's (waiting).
+        let list = vec![
+            stack_chain_pr(2, "feat-b", "feat-a", true),
+            stack_chain_pr(5, "feat-e", "dev", true),
+            stack_chain_pr(1, "feat-a", "dev", false),
+            stack_chain_pr(7, "feat-g", "dev", false),
+        ];
+        let stacks = [github::PullRequestStack {
+            members: vec![1, 2],
+            native: false,
+        }];
+        let ranks = stack_adjusted_ranks(&list, &FxHashMap::default(), &stacks);
+        // #1 (index 2) now takes #2's (index 0) best rank: waiting on review.
+        assert_eq!(ranks[2], ranks[0]);
+        assert_eq!(ranks[0], inbox_rank(&list[0], &FxHashMap::default()));
+        // #5 and #7, outside the stack, keep their own ranks.
+        assert_eq!(ranks[1], inbox_rank(&list[1], &FxHashMap::default()));
+        assert_eq!(ranks[3], inbox_rank(&list[3], &FxHashMap::default()));
+    }
+
+    #[test]
+    fn stack_neighbor_walks_up_and_down_and_stops_at_the_ends() {
+        let mut entry = RepoPullRequests::default();
+        let list = vec![
+            stack_chain_pr(1, "feat-a", "dev", false),
+            stack_chain_pr(2, "feat-b", "feat-a", false),
+            stack_chain_pr(3, "feat-c", "feat-b", false),
+        ];
+        entry.list = PrLoad::Ready(Arc::new(list));
+        entry.stacks = vec![github::PullRequestStack {
+            members: vec![1, 2, 3],
+            native: false,
+        }];
+        assert_eq!(entry.stack_neighbor(2, -1), Some(1));
+        assert_eq!(entry.stack_neighbor(2, 1), Some(3));
+        assert_eq!(entry.stack_neighbor(1, -1), None);
+        assert_eq!(entry.stack_neighbor(3, 1), None);
+        assert_eq!(entry.stack_neighbor(99, 1), None);
+    }
+
+    #[test]
+    fn stack_neighbor_follows_the_real_parent_and_child_in_a_tree() {
+        // 1 has two children, 2 and 3: `<` from either goes to 1, and `>`
+        // from 1 goes to the lowest-numbered child, not whichever the
+        // flattened member order happens to list next.
+        let mut entry = RepoPullRequests::default();
+        let list = vec![
+            stack_chain_pr(1, "feat-a", "dev", false),
+            stack_chain_pr(2, "feat-b", "feat-a", false),
+            stack_chain_pr(3, "feat-c", "feat-a", false),
+        ];
+        entry.list = PrLoad::Ready(Arc::new(list));
+        entry.stacks = vec![github::PullRequestStack {
+            members: vec![1, 3, 2],
+            native: false,
+        }];
+        assert_eq!(entry.stack_neighbor(2, -1), Some(1));
+        assert_eq!(entry.stack_neighbor(3, -1), Some(1));
+        assert_eq!(entry.stack_neighbor(1, 1), Some(2));
     }
 }

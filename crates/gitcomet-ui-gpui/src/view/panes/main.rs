@@ -16,6 +16,7 @@ mod helpers;
 mod interactive_rebase;
 mod markdown_state;
 mod preview;
+mod pull_request;
 mod review_cursor;
 pub(in crate::view) use review_cursor::{ReviewCommentScope, ReviewMark, SinceLines};
 pub(in crate::view) mod submodule_summary;
@@ -105,6 +106,13 @@ impl Render for MainPaneView {
             v.set_history_content_width(history_content_width);
         });
 
+        let show_pull_request = self
+            .root_view
+            .upgrade()
+            .is_some_and(|root| root.read(cx).pull_request_content_active());
+        if !show_pull_request {
+            self.pull_request_scroll_key = None;
+        }
         let show_diff = self
             .active_repo()
             .and_then(|r| r.diff_state.diff_target.as_ref())
@@ -116,10 +124,27 @@ impl Render for MainPaneView {
         // Keep blame in sync with the displayed file/revision while annotate is
         // on; the request is a no-op when the target is unchanged. Render must not
         // force a retry — a persistent error would re-dispatch every frame.
-        if self.annotate_enabled && show_diff {
+        if self.annotate_enabled && show_diff && !show_pull_request {
             self.request_blame_for_current_target(false, cx);
         }
-        let inner = if show_diff {
+        // A generated file (GitHub's `linguist-generated`, e.g. a lockfile)
+        // shows a placeholder instead of its diff until `enter` dismisses it
+        // for the rest of the review — usually uninteresting, and sometimes
+        // large. Not gated on `show_diff`: its diff is deliberately never
+        // requested while the placeholder is up (`review_open_file`), so
+        // `diff_target` may be unset or still pointing at a previous file.
+        let show_generated_placeholder =
+            !show_pull_request && self.review_active && self.review_generated_placeholder;
+        let inner = if show_pull_request {
+            self.pull_request_view(cx)
+        } else if show_generated_placeholder {
+            components::empty_state(
+                self.theme,
+                "Generated file",
+                "GitHub hides generated files like this one by default. Press enter to load its diff.",
+            )
+            .into_any_element()
+        } else if show_diff {
             self.diff_view(window, cx).into_any_element()
         } else if in_rebase {
             self.interactive_rebase_view(window, cx).into_any_element()
