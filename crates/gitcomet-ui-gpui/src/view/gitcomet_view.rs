@@ -2575,6 +2575,13 @@ impl GitCometView {
         let selected_pr = prs.and_then(|prs| prs.selected);
         let review = self.active_review();
         let scale_percent = crate::ui_scale::current(cx).percent;
+        // In review mode the list on screen is the review file list, which
+        // keeps its own layout (the backtick toggle), not the preference.
+        let file_list_layout = review.map_or(self.file_list_layout, |review| {
+            self.details_pane
+                .read(cx)
+                .file_list_layout_for(review.repo_id, crate::view::rows::FileListId::Review)
+        });
         serde_json::json!({
             "repo_workdir": self.active_repo_workdir().map(|p| p.display().to_string()),
             "sidebar_mode": sidebar_mode,
@@ -2583,7 +2590,7 @@ impl GitCometView {
             "pr_content_tab": prs.filter(|_| selected_pr.is_some()).map(|prs| lower(&prs.content_tab)),
             "review_active": review.is_some(),
             "review_file": review.and_then(|r| r.files.get(r.file_ix)),
-            "file_list_layout": self.file_list_layout.key(),
+            "file_list_layout": file_list_layout.key(),
             "window_size": [
                 f32::from(window.viewport_size().width),
                 f32::from(window.viewport_size().height),
