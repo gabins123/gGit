@@ -2853,10 +2853,17 @@ impl DetailsPaneView {
 
     /// Facts for the selected pull request.
     fn pull_request_details_view(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
+        use super::super::pr_symbols as symbols;
         use super::super::pull_requests::PrLoad;
+        use crate::theme::with_alpha;
+        use crate::view::tooltip::GitCometTooltipExt as _;
 
         let theme = self.theme;
-        let secondary = theme.colors.foreground.secondary;
+        let ui = crate::ui_scale::UiScale::current(cx);
+        let colors = theme.colors;
+        let secondary = colors.foreground.secondary;
+        let primary = colors.foreground.primary;
+        let clear = gpui::rgba(0x0000_0000);
         let Some(root) = self.root_view.upgrade() else {
             return div().into_any_element();
         };
@@ -2869,6 +2876,7 @@ impl DetailsPaneView {
             last_review,
             stack_members,
             generated_count,
+            review_requested,
         ) = {
             let root = root.read(cx);
             let Some(prs) = root.active_pull_requests() else {
@@ -2883,6 +2891,11 @@ impl DetailsPaneView {
                     .filter_map(|number| list.iter().find(|pr| pr.number == *number).cloned())
                     .collect::<Vec<_>>()
             });
+            let review_requested = prs
+                .list
+                .ready()
+                .and_then(|list| list.iter().find(|pr| pr.number == selected))
+                .is_some_and(|pr| pr.review_requested);
             (
                 prs.detail.clone(),
                 selected,
@@ -2892,6 +2905,7 @@ impl DetailsPaneView {
                 prs.last_review.clone(),
                 stack_members,
                 prs.generated_files.ready().map(|generated| generated.len()),
+                review_requested,
             )
         };
         let detail = match detail {
@@ -2910,61 +2924,163 @@ impl DetailsPaneView {
             PrLoad::Ready(detail) => detail,
         };
 
-        let line = |text: String| {
+        let icon_size = ui.px(14.0);
+        let pad_x = ui.px(14.0);
+        let (kind, title) = symbols::title(&detail.title);
+        // A padded block with a rule under it, like the canvas's sections.
+        let section = || {
             div()
-                .text_size(theme.ui_text(12.0))
+                .flex()
+                .flex_col()
+                .px(pad_x)
+                .py(ui.px(12.0))
+                .border_b_1()
+                .border_color(colors.stroke.subtle)
+        };
+        let small = |text: String| {
+            div()
+                .text_size(theme.ui_text(11.5))
                 .text_color(secondary)
                 .child(text)
         };
-        let icon_size = crate::ui_scale::UiScale::current(cx).px(16.0);
-        let (kind, title) = super::super::pr_symbols::title(&detail.title);
-        let mergeable = match detail.mergeable {
-            Some(true) => "No conflicts",
-            Some(false) => "Has conflicts",
-            None => "Checking for conflicts",
+        let section_title = |text: &'static str| {
+            div()
+                .text_size(theme.ui_text(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text)
         };
-        let checks = detail.checks;
-        let checks_line = if checks.total() == 0 {
-            "No checks".to_owned()
-        } else {
-            format!(
-                "Checks: {} passing, {} failing, {} pending",
-                checks.passing, checks.failing, checks.pending
-            )
+        let mut items: Vec<AnyElement> = Vec::new();
+
+        // --- Header: title, chips, author, facts ---------------------------------
+        let mono_pill = |text: &str| {
+            div()
+                .px(ui.px(6.0))
+                .rounded(ui.px(4.0))
+                .border_1()
+                .border_color(colors.stroke.default)
+                .bg(colors.surface.raised)
+                .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
+                .text_size(theme.ui_text(11.5))
+                .text_color(primary)
+                .truncate()
+                .child(text.to_owned())
+        };
+        let fact = |label: &'static str, value: gpui::Div| {
+            div()
+                .flex()
+                .items_start()
+                .gap(ui.px(8.0))
+                .text_size(theme.ui_text(12.5))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_none()
+                        .w(ui.px(76.0))
+                        .h(ui.px(20.0))
+                        .text_color(secondary)
+                        .child(label),
+                )
+                .child(value.flex_1().min_w(px(0.0)))
+        };
+        let value_row = || {
+            div()
+                .flex()
+                .items_center()
+                .gap(ui.px(6.0))
+                .min_h(ui.px(20.0))
+                .min_w(px(0.0))
         };
 
-        let mut panel = div()
-            .id("pr_details")
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_h(px(0.0))
-            .gap_2()
-            .px_3()
-            .py_2()
-            .overflow_y_scroll()
-            .track_scroll(&self.pr_details_scroll)
+        let checks = detail.checks;
+        let mut checks_value = div().flex().flex_col().child(match symbols::checks(checks, theme) {
+            Some(glyph) => {
+                let mut text = format!("{} of {} passing", checks.passing, checks.total());
+                if checks.failing > 0 {
+                    text.push_str(&format!(" · {} failing", checks.failing));
+                }
+                if checks.pending > 0 {
+                    text.push_str(&format!(" · {} pending", checks.pending));
+                }
+                value_row()
+                    .child(glyph.render(
+                        format!("pr_detail_{}_checks", detail.number),
+                        theme,
+                        icon_size,
+                    ))
+                    .child(text)
+            }
+            None => value_row().text_color(secondary).child("No checks"),
+        });
+        for run in detail
+            .check_runs
+            .iter()
+            .filter(|run| run.state != crate::github::CheckState::Passing)
+        {
+            let (status, color) = match run.state {
+                crate::github::CheckState::Failing => ("Failing", colors.status.danger.foreground),
+                crate::github::CheckState::Pending => {
+                    ("Pending", colors.status.warning.foreground)
+                }
+                crate::github::CheckState::Passing => unreachable!(),
+            };
+            checks_value = checks_value.child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(color)
+                    .child(format!("{status}: {}", run.name)),
+            );
+        }
+        let merge_value = match detail.mergeable {
+            Some(true) => value_row().child(format!("No conflicts with {}", detail.base)),
+            Some(false) => value_row()
+                .text_color(colors.status.danger.foreground)
+                .child("Has conflicts"),
+            None => value_row()
+                .text_color(secondary)
+                .child("Checking for conflicts"),
+        };
+        let generated_suffix = generated_count
+            .filter(|count| *count > 0)
+            .map(|count| format!(" ({count} generated)"))
+            .unwrap_or_default();
+        let size_value = value_row()
+            .gap(ui.px(4.0))
+            .child(format!(
+                "{} file{}{generated_suffix} ·",
+                detail.changed_files,
+                if detail.changed_files == 1 { "" } else { "s" }
+            ))
+            .child(
+                div()
+                    .text_color(colors.diff.added.foreground)
+                    .child(format!("+{}", detail.additions)),
+            )
+            .child(
+                div()
+                    .text_color(colors.diff.removed.foreground)
+                    .child(format!("−{}", detail.deletions)),
+            );
+        let mut header = section()
+            .gap(ui.px(12.0))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .text_size(theme.ui_text(15.0))
+                    .gap(ui.px(6.0))
+                    .text_size(theme.ui_text(13.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(
-                        super::super::pr_symbols::state(&detail.state, detail.is_draft, theme)
-                            .render(
-                                format!("pr_detail_{}_state", detail.number),
-                                theme,
-                                icon_size,
-                            ),
-                    )
-                    .when_some(kind, |header, kind| {
-                        header.child(super::super::pr_symbols::kind_tag(
-                            kind,
+                        symbols::state(&detail.state, detail.is_draft, theme).render(
+                            format!("pr_detail_{}_state", detail.number),
                             theme,
-                            theme.ui_text(11.0),
-                        ))
+                            ui.px(16.0),
+                        ),
+                    )
+                    .when_some(kind, |row, kind| {
+                        row.child(symbols::kind_tag(kind, theme, theme.ui_text(11.0)))
                     })
                     .child(
                         div()
@@ -2973,87 +3089,122 @@ impl DetailsPaneView {
                             .text_color(if detail.is_draft && detail.state == "OPEN" {
                                 secondary
                             } else {
-                                theme.colors.foreground.primary
+                                primary
                             })
-                            .child(format!("{title} #{}", detail.number)),
+                            .child(title.to_owned()),
                     )
-                    .when_some(detail.review, |header, review| {
-                        header.child(super::super::pr_symbols::review(review, theme).render(
-                            format!("pr_detail_{}_review", detail.number),
-                            theme,
-                            icon_size,
-                        ))
-                    })
-                    .when_some(
-                        super::super::pr_symbols::checks(detail.checks, theme),
-                        |header, checks| {
-                            header.child(checks.render(
-                                format!("pr_detail_{}_checks", detail.number),
-                                theme,
-                                icon_size,
-                            ))
-                        },
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(secondary)
+                            .child(format!("#{}", detail.number)),
                     ),
             )
-            .child(line(mergeable.to_owned()))
-            .child(line(format!(
-                "{} wants to merge {} into {}",
-                detail.author, detail.head, detail.base
-            )))
-            .child(line(checks_line));
-        for run in detail
-            .check_runs
-            .iter()
-            .filter(|run| run.state != crate::github::CheckState::Passing)
-        {
-            let status = match run.state {
-                crate::github::CheckState::Failing => "Failing",
-                crate::github::CheckState::Pending => "Pending",
-                crate::github::CheckState::Passing => unreachable!(),
-            };
-            panel = panel.child(line(format!("  {status}: {}", run.name)));
-        }
-        let generated_suffix = generated_count
-            .filter(|count| *count > 0)
-            .map(|count| format!(" ({count} generated)"))
-            .unwrap_or_default();
-        panel = panel.child(line(format!(
-            "{} files{generated_suffix} · +{} −{}",
-            detail.changed_files, detail.additions, detail.deletions
-        )));
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(ui.px(6.0))
+                    .child(pr_chip(
+                        symbols::state(&detail.state, detail.is_draft, theme),
+                        format!("pr_detail_{}_state_chip", detail.number),
+                        theme,
+                        ui,
+                    ))
+                    .when_some(detail.review, |row, review| {
+                        row.child(pr_chip(
+                            symbols::review(review, theme),
+                            format!("pr_detail_{}_review", detail.number),
+                            theme,
+                            ui,
+                        ))
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(ui.px(8.0))
+                    .text_size(theme.ui_text(12.5))
+                    .child(components::author_avatar_sized(
+                        theme,
+                        ui.px(18.0),
+                        ui.px(8.0),
+                        &detail.author,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(detail.author.clone()),
+                    )
+                    .child(div().flex_none().text_color(secondary).child(
+                        if detail.state == "OPEN" {
+                            "wants to merge"
+                        } else {
+                            "authored this"
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(ui.px(8.0))
+                    .child(fact(
+                        "Branch",
+                        value_row()
+                            .child(mono_pill(&detail.head).min_w(px(0.0)))
+                            .child(svg_icon("icons/arrow_right.svg", secondary, ui.px(12.0)))
+                            .child(mono_pill(&detail.base).flex_none()),
+                    ))
+                    .child(fact("Checks", checks_value))
+                    .child(fact("Merge", merge_value))
+                    .child(fact("Size", size_value)),
+            );
         if detail.too_large_for_app() {
-            panel = panel.child(line(format!(
+            header = header.child(small(format!(
                 "GitHub lists only the first {} of its {} files; o opens it there.",
                 crate::github::MAX_LISTED_FILES,
                 detail.changed_files
             )));
         }
         if listing {
-            panel = panel.child(line(format!(
+            header = header.child(small(format!(
                 "Listing files… {} of {}",
                 detail.files.len(),
                 detail.changed_files
             )));
         } else if let Some(ref err) = files_error {
-            panel = panel.child(line(format!(
+            header = header.child(small(format!(
                 "Some files couldn't be listed ({err}). R retries."
             )));
         }
-        panel = panel.child(
+        items.push(header.into_any_element());
+
+        // --- Reviewers -----------------------------------------------------------
+        let mut reviewers = section().gap(ui.px(8.0)).child(
             div()
-                .pt_2()
-                .text_size(theme.ui_text(12.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Reviewers"),
+                .flex()
+                .items_center()
+                .gap(ui.px(6.0))
+                .child(section_title("Reviewers"))
+                .child(div().flex_1())
+                .when(review_requested, |row| {
+                    row.child(
+                        div()
+                            .text_size(theme.ui_text(11.0))
+                            .child(symbols::at_pill(theme, "pr_details_at_pill")),
+                    )
+                }),
         );
         if detail.reviewers.is_empty() {
-            panel = panel.child(line("No reviewers yet".to_owned()));
+            reviewers = reviewers.child(small("No reviewers yet".to_owned()));
         } else {
             for reviewer in &detail.reviewers {
-                let status_icon = match super::super::pr_symbols::reviewer_status(
-                    reviewer.status,
-                    theme,
-                ) {
+                let status_icon = match symbols::reviewer_status(reviewer.status, theme) {
                     Ok(symbol) => symbol.render(
                         format!("pr_reviewer_{}_status", reviewer.login),
                         theme,
@@ -3061,50 +3212,102 @@ impl DetailsPaneView {
                     ),
                     Err(text) => div().text_color(secondary).child(text).into_any_element(),
                 };
-                panel = panel.child(
+                reviewers = reviewers.child(
                     div()
+                        .id(SharedString::from(format!("pr_reviewer_{}", reviewer.login)))
                         .flex()
                         .items_center()
-                        .gap_2()
-                        .text_size(theme.ui_text(12.0))
-                        .child(status_icon)
-                        .child(format!("{} · {}", reviewer.login, reviewer.status.label())),
+                        .gap(ui.px(8.0))
+                        .text_size(theme.ui_text(12.5))
+                        .gitcomet_tooltip(theme, SharedString::from(reviewer.status.label()))
+                        .child(components::author_avatar_sized(
+                            theme,
+                            ui.px(20.0),
+                            ui.px(9.0),
+                            &reviewer.login,
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .child(reviewer.login.clone()),
+                        )
+                        .child(status_icon),
                 );
             }
         }
+        items.push(reviewers.into_any_element());
+
+        // --- Stack map -----------------------------------------------------------
         if let Some(members) = stack_members.filter(|members| !members.is_empty()) {
-            panel = panel.child(
-                div()
-                    .pt_2()
-                    .text_size(theme.ui_text(12.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Stack"),
-            );
-            panel = panel.children(pull_request_stack_rows(
-                &members, number, theme, icon_size,
-            ));
+            items.push(pull_request_stack_section(&members, number, theme, ui));
         }
-        panel = panel.child(
+
+        // --- Commits -------------------------------------------------------------
+        let selected_range = commit_selection.range(detail.commits.len());
+        items.push(
             div()
-                .pt_2()
-                .text_size(theme.ui_text(12.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Commits"),
-        );
-        let root_for_all = self.root_view.clone();
-        panel = panel.child(
-            div()
-                .id("pr_all_commits")
-                .px_2()
-                .py_1()
-                .rounded(px(theme.radii.control))
-                .bg(if commit_selection.cursor.is_none() {
-                    theme.colors.interaction.selected_background
-                } else {
-                    theme.colors.surface.panel
+                .flex()
+                .items_center()
+                .gap(ui.px(6.0))
+                .px(pad_x)
+                .pt(ui.px(12.0))
+                .pb(ui.px(4.0))
+                .text_size(theme.ui_text(12.5))
+                .child(section_title("Commits"))
+                .child(
+                    div()
+                        .text_color(secondary)
+                        .child(detail.commits.len().to_string()),
+                )
+                .child(div().flex_1())
+                .child(match selected_range {
+                    Some((first, last)) => div()
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(colors.accent.foreground)
+                        .child(format!("{} selected", last - first + 1)),
+                    None => div()
+                        .text_size(theme.ui_text(11.5))
+                        .text_color(colors.foreground.placeholder)
+                        .child("pick some to read just those"),
                 })
-                .child("All commits")
+                .into_any_element(),
+        );
+        // The canvas's row: 28px, inset 6px from the panel edge.
+        let commit_row = || {
+            div()
+                .flex()
+                .items_center()
+                .gap(ui.px(8.0))
+                .h(ui.px(28.0))
+                .px(ui.px(8.0))
+                .mx(ui.px(6.0))
+                .rounded(px(theme.radii.control))
+                .border_1()
+                .border_color(clear)
+                .text_size(theme.ui_text(12.5))
                 .cursor_pointer()
+        };
+        let root_for_all = self.root_view.clone();
+        let all_selected = commit_selection.cursor.is_none();
+        items.push(
+            commit_row()
+                .id("pr_all_commits")
+                .control_interaction(
+                    controls::InteractionStyle::new(theme).selection_outline(false),
+                    controls::InteractionState::default()
+                        .selected(all_selected, colors.interaction.selected_background),
+                )
+                .child(svg_icon("icons/menu.svg", secondary, icon_size))
+                .child(div().flex_1().min_w(px(0.0)).child("All commits"))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(secondary)
+                        .child("whole PR"),
+                )
                 .on_activate(
                     false,
                     crate::kit::interaction::ControlActivation::Composite,
@@ -3117,7 +3320,8 @@ impl DetailsPaneView {
                             });
                         });
                     }),
-                ),
+                )
+                .into_any_element(),
         );
         let reviewed_ix = last_review
             .ready()
@@ -3133,54 +3337,136 @@ impl DetailsPaneView {
             .first()
             .is_some_and(|commit| commit.oid != detail.head_oid);
         if commits_truncated {
-            panel = panel.child(line(
-                "Only the first 250 commits are listed; newer commits are on GitHub.".to_string(),
-            ));
+            items.push(
+                small(format!(
+                    "Only the first {} commits are listed; newer commits are on GitHub.",
+                    detail.commits.len()
+                ))
+                .px(pad_x)
+                .into_any_element(),
+            );
         }
         if let Some(last) = last_review.ready().and_then(Option::as_ref)
             && reviewed_ix.is_none()
             && !last.commit_id.is_empty()
         {
-            panel = panel.child(line(
-                if commits_truncated {
-                    "Your last review's commit is outside the first 250 listed commits."
-                } else {
-                    "Your last review's commit is gone."
-                }
-                .to_string(),
-            ));
+            items.push(
+                small(
+                    if commits_truncated {
+                        "Your last review's commit is outside the listed commits."
+                    } else {
+                        "Your last review's commit is gone."
+                    }
+                    .to_string(),
+                )
+                .px(pad_x)
+                .into_any_element(),
+            );
         }
-        let selected_range = commit_selection.range(detail.commits.len());
         let now = std::time::SystemTime::now();
+        let cursor_fill = with_alpha(colors.accent.foreground, 0.28);
+        let cursor_border = with_alpha(colors.accent.foreground, 0.7);
+        // Direct children of the scroll container: `scroll_to_item` indexes these.
+        let mut commit_item_ix = Vec::with_capacity(detail.commits.len());
         for (ix, commit) in detail.commits.iter().enumerate() {
             let age = commit
                 .committed_at
                 .parse::<jiff::Timestamp>()
                 .ok()
-                .map(|at| super::super::date_time::format_relative_time(at.as_second(), now))
-                .unwrap_or_else(|| "date unknown".to_string());
-            let dot = if reviewed_ix.is_some_and(|reviewed| ix < reviewed) {
-                "● "
-            } else {
-                ""
-            };
+                .map(|at| compact_age(at.as_second(), now))
+                .unwrap_or_else(|| "—".to_string());
             let short = commit.oid.get(..7).unwrap_or(&commit.oid);
             let selected = selected_range.is_some_and(|(first, last)| (first..=last).contains(&ix));
+            let cursor = commit_selection.cursor == Some(ix);
             let root_for_commit = self.root_view.clone();
-            panel = panel.child(
-                div()
+            if reviewed_ix == Some(ix) {
+                let label = last_review
+                    .ready()
+                    .and_then(Option::as_ref)
+                    .and_then(|last| last.submitted_at.parse::<jiff::Timestamp>().ok())
+                    .map_or_else(
+                        || "your last review".to_string(),
+                        |at| match compact_age(at.as_second(), now).as_str() {
+                            "now" => "your last review · just now".to_string(),
+                            age => format!("your last review · {age} ago"),
+                        },
+                    );
+                let rule = || div().flex_1().h(px(1.0)).bg(colors.stroke.default);
+                items.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(ui.px(8.0))
+                        .mx(pad_x)
+                        .my(ui.px(2.0))
+                        .text_size(theme.ui_text(11.5))
+                        .text_color(secondary)
+                        .child(rule())
+                        .child(label)
+                        .child(rule())
+                        .into_any_element(),
+                );
+            }
+            commit_item_ix.push(items.len());
+            items.push(
+                commit_row()
                     .id(SharedString::from(format!("pr_commit_{ix}")))
-                    .px_2()
-                    .py_1()
-                    .rounded(px(theme.radii.control))
-                    .bg(if selected {
-                        theme.colors.interaction.selected_background
-                    } else {
-                        theme.colors.surface.panel
+                    .control_interaction(
+                        controls::InteractionStyle::new(theme).selection_outline(false),
+                        controls::InteractionState::default().selected(
+                            selected || cursor,
+                            if cursor {
+                                cursor_fill
+                            } else {
+                                colors.accent.subtle_background
+                            },
+                        ),
+                    )
+                    .when(cursor, |row| row.border_color(cursor_border))
+                    // A fixed column, so the shas line up with or without the dot.
+                    .when(reviewed_ix.is_some(), |row| {
+                        let new_since_review = reviewed_ix.is_some_and(|reviewed| ix < reviewed);
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("pr_commit_{ix}_new")))
+                                .flex_none()
+                                .w(ui.px(7.0))
+                                .h(ui.px(7.0))
+                                .rounded_full()
+                                .when(new_since_review, |dot| {
+                                    dot.bg(colors.accent.foreground).gitcomet_tooltip(
+                                        theme,
+                                        SharedString::from("New since your last review"),
+                                    )
+                                }),
+                        )
                     })
-                    .text_size(theme.ui_text(12.0))
-                    .child(format!("{dot}{short}  {} · {age}", commit.headline))
-                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
+                            .text_size(theme.ui_text(11.5))
+                            .text_color(if selected {
+                                colors.accent.foreground
+                            } else {
+                                secondary
+                            })
+                            .child(short.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .child(commit.headline.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(theme.ui_text(12.0))
+                            .text_color(secondary)
+                            .child(age),
+                    )
                     .on_activate(
                         false,
                         crate::kit::interaction::ControlActivation::Composite,
@@ -3193,121 +3479,370 @@ impl DetailsPaneView {
                                 });
                             });
                         }),
-                    ),
+                    )
+                    .into_any_element(),
             );
-            if reviewed_ix == Some(ix) {
-                panel = panel.child(line("Your last review".to_string()));
-            }
         }
         let scroll_key = (detail.number, commit_selection.cursor);
         if self.pr_details_scroll_key != Some(scroll_key) {
-            let target = commit_selection.cursor.map_or(0, |ix| {
-                let checks = detail
-                    .check_runs
-                    .iter()
-                    .filter(|run| run.state != crate::github::CheckState::Passing)
-                    .count();
-                let notices =
-                    usize::from(detail.too_large_for_app())
-                        + usize::from(listing || files_error.is_some())
-                        + usize::from(commits_truncated)
-                        + usize::from(last_review.ready().and_then(Option::as_ref).is_some_and(
-                            |last| reviewed_ix.is_none() && !last.commit_id.is_empty(),
-                        ));
-                8 + checks
-                    + notices
-                    + detail.reviewers.len().max(1)
-                    + ix
-                    + usize::from(reviewed_ix.is_some_and(|reviewed| reviewed < ix))
-            });
+            let target = commit_selection
+                .cursor
+                .and_then(|ix| commit_item_ix.get(ix).copied())
+                .unwrap_or(0);
             self.pr_details_scroll.scroll_to_item(target);
             self.pr_details_scroll_key = Some(scroll_key);
         }
-        panel
-            .child(line(
-                "space checkout · r review · M merge · o GitHub".to_owned(),
-            ))
+
+        // --- Footer: the review button and its hints, pinned below the scroll ----
+        let total = detail.commits.len();
+        let review_label = match (selected_range, total) {
+            (_, 0) => "Review".to_string(),
+            (Some((first, last)), _) if first == last => "Review this commit".to_string(),
+            (Some((first, last)), _) => format!("Review these {} commits", last - first + 1),
+            (None, 1) => "Review the commit".to_string(),
+            (None, n) => format!("Review all {n} commits"),
+        };
+        let root_for_review = self.root_view.clone();
+        let on_solid = colors.accent.on_solid;
+        let hint = |key: &'static str, label: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap(ui.px(5.0))
+                .child(components::shortcut_keys(key, theme, ui))
+                .child(label)
+        };
+        let footer = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(ui.px(8.0))
+            .px(pad_x)
+            .pt(ui.px(12.0))
+            .pb(ui.px(14.0))
+            .border_t_1()
+            .border_color(colors.stroke.subtle)
+            .child(
+                div()
+                    .id("pr_review_button")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(ui.px(8.0))
+                    .h(ui.px(32.0))
+                    .rounded(px(theme.radii.control))
+                    .text_color(on_solid)
+                    .text_size(theme.ui_text(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .control_interaction(
+                        controls::InteractionStyle::new(theme)
+                            .resting_background(colors.accent.solid)
+                            .hover(gpui::StyleRefinement::default().opacity(0.92))
+                            .pressed(gpui::StyleRefinement::default().opacity(0.85)),
+                        controls::InteractionState::default(),
+                    )
+                    .child(review_label)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .min_w(ui.px(17.0))
+                            .h(ui.px(17.0))
+                            .px(ui.px(4.0))
+                            .rounded(ui.px(4.0))
+                            .border_1()
+                            .border_color(with_alpha(on_solid, 0.4))
+                            .bg(with_alpha(on_solid, 0.16))
+                            .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
+                            .text_size(theme.ui_text(11.0))
+                            .child("r"),
+                    )
+                    .on_activate(
+                        false,
+                        crate::kit::interaction::ControlActivation::Composite,
+                        cx.listener(move |_this, _: &ClickEvent, window, cx| {
+                            window.focus(&_this.panel_focus_handle, cx);
+                            let root = root_for_review.clone();
+                            cx.defer(move |cx| {
+                                let _ = root.update(cx, |root, cx| root.start_review(cx));
+                            });
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_x(ui.px(12.0))
+                    .gap_y(ui.px(6.0))
+                    .text_size(theme.ui_text(12.0))
+                    .text_color(secondary)
+                    .child(hint("S", "quick verdict"))
+                    .child(hint("space", "check out"))
+                    .child(hint("M", "merge"))
+                    .child(hint("o", "GitHub")),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .id("pr_details")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .pb(ui.px(6.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.pr_details_scroll)
+                    .children(items),
+            )
+            .child(footer)
             .into_any_element()
     }
 }
 
-/// The Stack section's rows: every pull request in the stack, base at the
-/// bottom like GitHub's own stack map, each with its state, review and
-/// checks symbols; `current` is highlighted.
-fn pull_request_stack_rows(
+/// A status pill: the symbol's glyph and label, tinted with the symbol's own
+/// status color (Open / Draft / Merged / Closed, Review required / Approved / ...).
+fn pr_chip(
+    symbol: super::super::pr_symbols::Symbol,
+    id: String,
+    theme: AppTheme,
+    ui: crate::ui_scale::UiScale,
+) -> AnyElement {
+    let color = symbol.color();
+    let label = symbol.label.clone();
+    div()
+        .flex()
+        .items_center()
+        .flex_none()
+        .gap(ui.px(5.0))
+        .px(ui.px(8.0))
+        .rounded(px(theme.radii.pill))
+        .border_1()
+        .border_color(crate::theme::with_alpha(color, 0.45))
+        .bg(crate::theme::with_alpha(color, 0.14))
+        .text_color(color)
+        .text_size(theme.ui_text(12.0))
+        .child(symbol.render(id, theme, ui.px(12.0)))
+        .child(label)
+        .into_any_element()
+}
+
+/// "5h", "2d", "3w": a commit's age in a right-aligned column.
+pub(in crate::view) fn compact_age(at_secs: i64, now: std::time::SystemTime) -> String {
+    let now = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let delta = now.saturating_sub(at_secs).max(0);
+    match delta {
+        0..60 => "now".to_string(),
+        60..3_600 => format!("{}m", delta / 60),
+        3_600..86_400 => format!("{}h", delta / 3_600),
+        86_400..604_800 => format!("{}d", delta / 86_400),
+        604_800..2_592_000 => format!("{}w", delta / 604_800),
+        2_592_000..31_536_000 => format!("{}mo", delta / 2_592_000),
+        _ => format!("{}y", delta / 31_536_000),
+    }
+}
+
+/// The Stack section: a rail with a dot per pull request and a line joining
+/// them, the highest PR on top and the base branch last, like GitHub's own
+/// stack map. `current` is highlighted; each row keeps its review and checks
+/// symbols at the right.
+fn pull_request_stack_section(
     members: &[crate::github::PullRequestSummary],
     current: u64,
     theme: AppTheme,
-    icon_size: Pixels,
-) -> Vec<AnyElement> {
-    let secondary = theme.colors.foreground.secondary;
+    ui: crate::ui_scale::UiScale,
+) -> AnyElement {
+    use super::super::pr_symbols as symbols;
+    use crate::view::tooltip::GitCometTooltipExt as _;
+
+    let colors = theme.colors;
+    let secondary = colors.foreground.secondary;
+    let clear = gpui::rgba(0x0000_0000);
+    let icon_size = ui.px(13.0);
     let total = members.len();
     // Depth from the stack's base (0 = bottom), following real base/head
     // parent links (`stack_depth`) rather than this list's own order, which
     // a tree (two children on the same pull request) can put out of a line.
     let numbers: Vec<u64> = members.iter().map(|member| member.number).collect();
-    members
-        .iter()
-        .enumerate()
-        .rev()
-        .map(|(ix, member)| {
-            let position = crate::github::stack_depth(&numbers, member.number, members)
-                .unwrap_or(ix);
-            let highlighted = member.number == current;
-            let (_, member_title) = super::super::pr_symbols::title(&member.title);
-            let mut row = div()
+    let rail_line = |visible: bool| {
+        div()
+            .w(ui.px(2.0))
+            .flex_1()
+            .bg(if visible { colors.stroke.default } else { clear })
+    };
+    let rail = |top: bool, mid: AnyElement, bottom: bool| {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .flex_none()
+            .w(ui.px(16.0))
+            .h_full()
+            .child(rail_line(top))
+            .child(mid)
+            .child(rail_line(bottom))
+    };
+    let row_base = || {
+        div()
+            .flex()
+            .items_center()
+            .gap(ui.px(8.0))
+            .h(ui.px(34.0))
+            .px(ui.px(10.0))
+            .rounded(px(theme.radii.control))
+            .text_size(theme.ui_text(12.5))
+    };
+    let mono = |text: String, color: gpui::Rgba| {
+        div()
+            .flex_none()
+            .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
+            .text_size(theme.ui_text(11.5))
+            .text_color(color)
+            .child(text)
+    };
+
+    let mut base_branch: Option<(usize, &str)> = None;
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(total + 1);
+    for (n, (ix, member)) in members.iter().enumerate().rev().enumerate() {
+        let position = crate::github::stack_depth(&numbers, member.number, members).unwrap_or(ix);
+        if base_branch.is_none_or(|(best, _)| position < best) {
+            base_branch = Some((position, member.base.as_str()));
+        }
+        let highlighted = member.number == current;
+        let (_, member_title) = symbols::title(&member.title);
+        let passing = member.checks.total() > 0
+            && member.checks.failing == 0
+            && member.checks.pending == 0;
+        let dot = div()
+            .flex_none()
+            .w(ui.px(9.0))
+            .h(ui.px(9.0))
+            .rounded_full()
+            .border_2()
+            .border_color(if highlighted {
+                colors.accent.solid
+            } else if passing {
+                colors.status.success.foreground
+            } else {
+                colors.stroke.control
+            })
+            .bg(if highlighted { colors.accent.solid } else { clear })
+            .into_any_element();
+        rows.push(
+            row_base()
                 .id(SharedString::from(format!("pr_stack_{}", member.number)))
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_1()
-                .py(px(1.0))
-                .rounded(px(theme.radii.control))
-                .text_size(theme.ui_text(12.0))
                 .when(highlighted, |row| {
-                    row.bg(theme.colors.interaction.selected_background)
+                    row.bg(colors.interaction.selected_background)
                 })
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(secondary)
-                        .child(format!("{}/{total}", position + 1)),
-                )
-                .child(
-                    super::super::pr_symbols::state("OPEN", member.is_draft, theme).render(
-                        format!("pr_stack_{}_state", member.number),
-                        theme,
-                        icon_size,
-                    ),
-                );
-            if let Some(review) = member.review {
-                row = row.child(super::super::pr_symbols::review(review, theme).render(
-                    format!("pr_stack_{}_review", member.number),
-                    theme,
-                    icon_size,
-                ));
-            }
-            if let Some(checks) = super::super::pr_symbols::checks(member.checks, theme) {
-                row = row.child(checks.render(
-                    format!("pr_stack_{}_checks", member.number),
-                    theme,
-                    icon_size,
-                ));
-            }
-            row.child(
-                div()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_color(if highlighted {
-                        theme.colors.foreground.primary
+                .child(rail(n > 0, dot, true))
+                .child(mono(
+                    format!("#{}", member.number),
+                    if highlighted {
+                        colors.accent.foreground
                     } else {
                         secondary
-                    })
-                    .child(format!("{member_title} #{}", member.number)),
-            )
-            .into_any_element()
-        })
-        .collect()
+                    },
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_color(colors.foreground.primary)
+                        .child(member_title.to_owned()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_none()
+                        .gap(ui.px(6.0))
+                        .when(member.is_draft, |glyphs| {
+                            glyphs.child(symbols::state("OPEN", true, theme).render(
+                                format!("pr_stack_{}_state", member.number),
+                                theme,
+                                icon_size,
+                            ))
+                        })
+                        .when_some(member.review, |glyphs, review| {
+                            glyphs.child(symbols::review(review, theme).render(
+                                format!("pr_stack_{}_review", member.number),
+                                theme,
+                                icon_size,
+                            ))
+                        })
+                        .when_some(symbols::checks(member.checks, theme), |glyphs, checks| {
+                            glyphs.child(checks.render(
+                                format!("pr_stack_{}_checks", member.number),
+                                theme,
+                                icon_size,
+                            ))
+                        }),
+                )
+                .gitcomet_tooltip(
+                    theme,
+                    SharedString::from(format!("{} of {total} in the stack", position + 1)),
+                )
+                .into_any_element(),
+        );
+    }
+    if let Some((_, base)) = base_branch {
+        rows.push(
+            row_base()
+                .text_color(secondary)
+                .child(rail(
+                    true,
+                    svg_icon("icons/git_branch.svg", secondary, ui.px(12.0)).into_any_element(),
+                    false,
+                ))
+                .child(mono(base.to_owned(), secondary))
+                .child("base")
+                .into_any_element(),
+        );
+    }
+    div()
+        .flex()
+        .flex_col()
+        .px(ui.px(8.0))
+        .pt(ui.px(12.0))
+        .pb(ui.px(10.0))
+        .border_b_1()
+        .border_color(colors.stroke.subtle)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(ui.px(6.0))
+                .px(ui.px(6.0))
+                .pb(ui.px(8.0))
+                .text_size(theme.ui_text(12.5))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Stack"))
+                .child(
+                    div()
+                        .text_color(secondary)
+                        .child(format!("{total} pull requests")),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(ui.px(4.0))
+                        .child(components::shortcut_keys("<", theme, ui))
+                        .child(components::shortcut_keys(">", theme, ui)),
+                ),
+        )
+        .children(rows)
+        .into_any_element()
 }
 
 impl Render for DetailsPaneView {
@@ -3348,6 +3883,20 @@ mod tests {
     use gitcomet_state::model::{AuthPromptState, PendingCommitRetry};
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn compact_age_picks_the_largest_unit() {
+        let now = UNIX_EPOCH + Duration::from_secs(100_000_000);
+        let at = |ago: i64| compact_age(100_000_000 - ago, now);
+        assert_eq!(at(5), "now");
+        assert_eq!(at(300), "5m");
+        assert_eq!(at(5 * 3_600), "5h");
+        assert_eq!(at(2 * 86_400), "2d");
+        assert_eq!(at(21 * 86_400), "3w");
+        assert_eq!(at(90 * 86_400), "3mo");
+        assert_eq!(at(800 * 86_400), "2y");
+        assert_eq!(at(-50), "now");
+    }
 
     fn repo_state(id: RepoId, path: &str) -> RepoState {
         RepoState::new_opening(

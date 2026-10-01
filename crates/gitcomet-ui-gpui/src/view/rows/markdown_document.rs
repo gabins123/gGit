@@ -1726,7 +1726,7 @@ fn render_row_text(
 
     // Text that scrolls takes the width it needs; text that wraps takes the
     // width it is given.
-    let mut text = if row_scrolls_sideways(row.kind) {
+    let text = if row_scrolls_sideways(row.kind) {
         div().flex_none()
     } else {
         div().flex_1().min_w(px(0.0))
@@ -1738,10 +1738,28 @@ fn render_row_text(
         .map(|span| span.byte_range.clone());
 
     let Some(view) = context.view.clone() else {
-        // Without a view there is no flow text to set fonts per run, so the
-        // whole line takes the editor font if any of it is code.
+        // Without a view there is no selectable flow text, but inline code still
+        // gets the editor font per run: the prose around it keeps the body font.
         if code_ranges.clone().next().is_some() {
-            text = text.font_family(context.editor_font_family.clone());
+            let painted = code_ranges
+                .map(|range| {
+                    crate::view::rows::markdown_flow_painted_offset(row.text.as_ref(), range.start)
+                        ..crate::view::rows::markdown_flow_painted_offset(
+                            row.text.as_ref(),
+                            range.end,
+                        )
+                })
+                .collect::<Vec<_>>();
+            return text
+                .child(
+                    crate::view::rows::markdown_preview_highlighted_text_with_code_font(
+                        styled.text.clone(),
+                        Arc::clone(&styled.highlights),
+                        painted,
+                        context.editor_font_family.clone(),
+                    ),
+                )
+                .into_any_element();
         }
         return if styled.highlights.is_empty() {
             text.child(styled.text.clone()).into_any_element()
@@ -2229,14 +2247,15 @@ fn render_cell_text(
         })
         .collect::<Vec<_>>();
     let Some(view) = context.view.clone() else {
-        let text = text.when(!code_ranges.is_empty(), |text| {
-            text.font_family(context.editor_font_family.clone())
-        });
         return text
-            .child(crate::view::rows::markdown_preview_highlighted_text(
-                styled.text.clone(),
-                Arc::clone(&styled.highlights),
-            ))
+            .child(
+                crate::view::rows::markdown_preview_highlighted_text_with_code_font(
+                    styled.text.clone(),
+                    Arc::clone(&styled.highlights),
+                    code_ranges,
+                    context.editor_font_family.clone(),
+                ),
+            )
             .into_any_element();
     };
     text.cursor(crate::view::rows::MarkdownPreviewHoveredLink::cursor(

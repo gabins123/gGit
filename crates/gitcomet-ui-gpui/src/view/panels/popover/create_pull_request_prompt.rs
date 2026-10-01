@@ -650,6 +650,7 @@ mod tests {
             checks: Default::default(),
             review_requested: false,
             is_mine: false,
+            updated_at: String::new(),
         };
         assert!(opened_from(&pr("feature", "owner"), "feature", "owner"));
         assert!(opened_from(&pr("feature", "Me"), "me:feature", "owner"));

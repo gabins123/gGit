@@ -118,7 +118,8 @@ GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`),
 | Down / up its stack | `<` / `>` | Sidebar, middle panel or Details: selects the pull request below / above the current one in its stack. No-op outside a stack, at either end of it, or in review mode (reviewing one pull request never swaps in another). |
 | Read the pull request | `Enter` | Sidebar or Details: focuses the selected pull request in the middle panel. Reading code starts with `r` (review mode). |
 | Select commits to review | `j` / `k`, `Shift+J` / `Shift+K` | Details: move among newest-first commits and grow a contiguous range; `Escape` returns to All commits. `r` reviews the selection. |
-| Next / previous entry or thread | `j` / `k` | Middle panel: moves through conversation entries or visible review threads. |
+| Next / previous entry or thread | `j` / `k` | Middle panel: moves through conversation entries or visible review threads. An entry or thread taller than the window scrolls by a step first and moves on once its edge is showing; with none selected, `j` scrolls the description. |
+| Scroll the conversation or threads | `PageDown` / `PageUp`, `Ctrl+D` / `Ctrl+U`, `Home` / `End` | Middle panel: half a page down / up, to the top, to the bottom. |
 | Conversation / Comments | `[` / `]` | Middle panel: switches tabs. Comments counts open threads. |
 | Show resolved and outdated threads | `Shift+V` | Middle panel's Comments tab; these threads are hidden by default. |
 | Review at a thread | `Enter` | Middle panel's Comments tab: starts or resumes review mode on the selected thread's file and line. |

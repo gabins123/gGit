@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::kit::TextInput;
 use crate::kit::TextInputOptions;
 use crate::view::components::InteractiveRowExt as _;
+use crate::view::tooltip::GitCometTooltipExt as _;
 use crate::view::panes::main::diff_search::{DiffSearchMatcher, DiffSearchOptions};
 // File rows borrow the branch tree's row height: one rhythm for both lists.
 use crate::view::rows::sidebar::{sidebar_list_row_height, sidebar_list_row_height_px};
@@ -3359,6 +3360,7 @@ impl SidebarPaneView {
                 !review.query.is_empty(),
                 listing,
                 files_missing,
+                review.files.len(),
             );
             (
                 review.number,
@@ -3392,6 +3394,7 @@ impl SidebarPaneView {
             filtering,
             listing,
             files_missing,
+            all_files,
         ) = counts;
         let listed = self.review_rows.len();
         // Keep the open file's row in view as j/k, ]/[ and space move it.
@@ -3410,11 +3413,9 @@ impl SidebarPaneView {
             }
         }
         let query_text = self.review_query_input.read(cx).text().to_string();
-        // "18 files · 7 viewed hidden (V shows)", and the filter when set.
-        let mut state = vec![format!(
-            "{listed} file{}",
-            if listed == 1 { "" } else { "s" }
-        )];
+        // "7 viewed hidden (V shows) · 2 generated files hidden (Shift+G shows)",
+        // and the filter when set; the listed count sits beside "Files".
+        let mut state: Vec<String> = Vec::new();
         if let Some(hidden) = range_hidden {
             state.push(format!("{hidden} outside range hidden"));
         }
@@ -3475,6 +3476,7 @@ impl SidebarPaneView {
         });
         let secondary = theme.colors.foreground.secondary;
         let accent = theme.colors.status.info.foreground;
+        let scale = ui_scale::UiScale::current(cx);
         let list = uniform_list(
             "review_file_rows",
             row_count,
@@ -3483,6 +3485,15 @@ impl SidebarPaneView {
         .flex_1()
         .min_h(px(0.0))
         .track_scroll(&self.review_files_scroll);
+        let legend_item = |icon: AnyElement, label: &'static str| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .child(icon)
+                .child(label)
+        };
 
         div()
             .id("review_files")
@@ -3497,24 +3508,60 @@ impl SidebarPaneView {
                     .pb_1()
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(px(6.0))
                     .child(
                         div()
-                            .text_size(theme.ui_text(12.0))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(theme.ui_text(11.0))
                             .text_color(secondary)
-                            .child(match stacked_on {
-                                Some(base) => format!(
-                                    "Reviewing #{number} · stacked on #{base} · {viewed} of {total} viewed"
+                            .child(super::super::pr_symbols::status_pill(
+                                "Reviewing",
+                                theme.colors.status.info,
+                                theme.ui_text(11.0),
+                                FontWeight::SEMIBOLD,
+                                theme,
+                            ))
+                            .child(div().flex_none().child(format!("#{number}")))
+                            .when_some(stacked_on, |row, base| {
+                                row.child(
+                                    div()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .child(format!("stacked on #{base}")),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(theme.ui_text(11.5))
+                                    .child(format!("{viewed} of {total} viewed")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .when(total > 0, |header| {
+                        header.child(
+                            div()
+                                .w_full()
+                                .h(scale.px(3.0))
+                                .rounded(px(theme.radii.pill))
+                                .bg(theme.colors.stroke.default)
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative((viewed as f32 / total as f32).clamp(0.0, 1.0)))
+                                        .bg(theme.colors.status.success.foreground),
                                 ),
-                                None => format!("Reviewing #{number} · {viewed} of {total} viewed"),
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme.ui_text(11.5))
-                            .text_color(secondary)
-                            .child(state),
-                    )
+                        )
+                    })
                     .when_some(since, |header, since| {
                         header.child(
                             div()
@@ -3522,12 +3569,43 @@ impl SidebarPaneView {
                                 .text_color(accent)
                                 .child(since),
                         )
-                    })
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .pt_1()
+                    .pb_1()
                     .child(
                         div()
-                            .truncate()
+                            .flex_none()
+                            .text_size(theme.ui_text(12.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
+                            .child("Files"),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(theme.ui_text(12.0))
+                            .text_color(secondary)
+                            .child(if listed < all_files {
+                                format!("{listed} of {all_files}")
+                            } else {
+                                listed.to_string()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_right()
+                            .text_size(theme.ui_text(11.0))
+                            .text_color(secondary)
+                            .child(state),
                     ),
             )
             .children(query_bar)
@@ -3544,13 +3622,37 @@ impl SidebarPaneView {
             .child(list)
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
                     .px_3()
                     .py_2()
-                    .text_size(theme.ui_text(11.5))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(theme.ui_text(11.0))
                     .text_color(secondary)
-                    .child(
-                        "space viewed · / filter · V viewed · L changed since · S submit · q leave",
-                    ),
+                    .child(legend_item(
+                        viewed_checkbox(true, 11.0, theme, scale).into_any_element(),
+                        "viewed",
+                    ))
+                    .child(legend_item(
+                        crate::view::icons::svg_icon(
+                            "icons/pencil.svg",
+                            theme.colors.status.warning.foreground,
+                            scale.px(11.0),
+                        )
+                        .into_any_element(),
+                        "yours, pending",
+                    ))
+                    .child(legend_item(
+                        crate::view::icons::svg_icon(
+                            "icons/review_comment.svg",
+                            secondary,
+                            scale.px(11.0),
+                        )
+                        .into_any_element(),
+                        "threads",
+                    )),
             )
             .into_any_element()
     }
@@ -3568,11 +3670,10 @@ impl SidebarPaneView {
         };
         let theme = this.theme;
         let ui_scale_percent = ui_scale::current(cx).percent;
-        // Two lines of text, which grow with the UI font, and the air around.
+        // One line, the same height as the Changes file list's rows.
         let scale = ui_scale::UiScale::current(cx);
-        let row_height = scale.px(8.0) + (scale.ui_text(12.5) + scale.ui_text(11.0)) * 1.618;
+        let row_height = scale.row_height(crate::view::rows::STATUS_ROW_HEIGHT_PX, 32.0);
         let secondary = theme.colors.foreground.secondary;
-        let success = theme.colors.status.success.foreground;
         let warning = theme.colors.status.warning.foreground;
         let accent = theme.colors.status.info.foreground;
         let (repo_id, dir_cursor) = {
@@ -3686,14 +3787,15 @@ impl SidebarPaneView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .mx_1()
-                        .pl(if is_tree {
-                            crate::view::rows::file_row_indent_px(depth, ui_scale_percent)
-                        } else {
-                            px(8.0)
-                        })
+                        // Edge to edge like the folder rows around it: a
+                        // `uniform_list` row is only as wide as its content
+                        // otherwise, which strands the markers mid-row.
+                        .w_full()
+                        .pl(crate::view::rows::file_row_indent_px(
+                            if is_tree { depth } else { 0 },
+                            ui_scale_percent,
+                        ))
                         .pr_2()
-                        .rounded(px(theme.radii.control))
                         .control_interaction(
                             controls::InteractionStyle::new(theme),
                             controls::InteractionState::default()
@@ -3712,41 +3814,33 @@ impl SidebarPaneView {
                                 });
                             }),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(14.0))
-                                .h(px(14.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.0))
-                                .border_1()
-                                .border_color(if is_viewed { success } else { secondary })
-                                .when(is_viewed, |check| {
-                                    check.bg(success).child(crate::view::icons::svg_icon(
-                                        "icons/check.svg",
-                                        theme.colors.surface.chrome,
-                                        scale.px(10.0),
-                                    ))
-                                }),
-                        )
+                        .child(viewed_checkbox(is_viewed, 14.0, theme, scale))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .flex()
-                                .flex_col()
+                                .items_center()
+                                .gap_2()
                                 .child(
                                     div()
                                         .truncate()
-                                        .text_size(theme.ui_text(12.5))
+                                        // The folder rows' label size.
+                                        .text_sm()
                                         .when(is_viewed, |text| text.text_color(secondary))
+                                        // Flat: the folder gives way first, so
+                                        // the name stays readable.
+                                        .when(folder.is_some(), |text| {
+                                            text.flex_none().max_w(relative(0.8))
+                                        })
+                                        .when(folder.is_none(), |text| text.min_w(px(0.0)))
                                         .child(name),
                                 )
                                 .when_some(folder, |row, folder| {
                                     row.child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .truncate()
                                             .text_size(theme.ui_text(11.0))
                                             .text_color(secondary)
@@ -3757,66 +3851,104 @@ impl SidebarPaneView {
                         .when(is_generated, |row| {
                             row.child(
                                 div()
+                                    .id(("review_file_generated", row_ix))
                                     .flex_none()
-                                    .text_size(theme.ui_text(11.5))
+                                    .px(scale.px(4.0))
+                                    .rounded(px(3.0))
+                                    .border_1()
+                                    .border_dashed()
+                                    .border_color(theme.colors.stroke.default)
+                                    .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
+                                    .text_size(theme.ui_text(10.0))
                                     .text_color(secondary)
-                                    .child("generated"),
+                                    .child("generated")
+                                    .gitcomet_tooltip(theme, "Generated file".into()),
                             )
                         })
                         .when(updated, |row| {
                             row.child(
                                 div()
+                                    .id(("review_file_updated", row_ix))
                                     .flex_none()
-                                    .text_size(theme.ui_text(11.5))
+                                    .text_size(theme.ui_text(11.0))
                                     .text_color(accent)
-                                    .child("updated since your review"),
+                                    .child("updated")
+                                    .gitcomet_tooltip(theme, "updated since your review".into()),
                             )
                         })
                         .when(dismissed && !is_viewed, |row| {
                             row.child(
                                 div()
+                                    .id(("review_file_changed", row_ix))
                                     .flex_none()
-                                    .text_size(theme.ui_text(11.5))
+                                    .text_size(theme.ui_text(11.0))
                                     .text_color(warning)
-                                    .child("changed since you viewed"),
+                                    .child("changed")
+                                    .gitcomet_tooltip(theme, "changed since you viewed".into()),
                             )
                         })
                         .when(outdated > 0, |row| {
                             row.child(
                                 div()
+                                    .id(("review_file_outdated", row_ix))
                                     .flex_none()
-                                    .text_size(theme.ui_text(11.5))
+                                    .text_size(theme.ui_text(11.0))
                                     .text_color(secondary)
-                                    .child(format!("{outdated} outdated")),
-                            )
-                        })
-                        .when(threads > 0, |row| {
-                            row.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(theme.ui_text(11.5))
-                                    .text_color(secondary)
-                                    .child(format!(
-                                        "{threads} thread{}",
-                                        if threads == 1 { "" } else { "s" }
-                                    )),
+                                    .child(format!("{outdated} outdated"))
+                                    .gitcomet_tooltip(
+                                        theme,
+                                        format!(
+                                            "{outdated} thread{} on lines that have since changed",
+                                            if outdated == 1 { "" } else { "s" }
+                                        )
+                                        .into(),
+                                    ),
                             )
                         })
                         .when(comments > 0, |row| {
                             row.child(
                                 div()
+                                    .id(("review_file_pending", row_ix))
                                     .flex_none()
                                     .flex()
                                     .items_center()
                                     .gap_1()
-                                    .text_size(theme.ui_text(11.5))
+                                    .text_size(theme.ui_text(11.0))
                                     .text_color(warning)
                                     .child(crate::view::icons::svg_icon(
                                         "icons/pencil.svg",
                                         warning,
                                         scale.px(11.0),
                                     ))
-                                    .child(comments.to_string()),
+                                    .child(comments.to_string())
+                                    .gitcomet_tooltip(
+                                        theme,
+                                        format!(
+                                            "{comments} pending review comment{}",
+                                            if comments == 1 { "" } else { "s" }
+                                        )
+                                        .into(),
+                                    ),
+                            )
+                        })
+                        .when(threads > 0, |row| {
+                            row.child(
+                                div()
+                                    .id(("review_file_threads", row_ix))
+                                    .flex_none()
+                                    .child(super::super::pr_symbols::bubble_count(
+                                        threads,
+                                        theme,
+                                        scale.px(11.0),
+                                    ))
+                                    .gitcomet_tooltip(
+                                        theme,
+                                        format!(
+                                            "{threads} thread{}",
+                                            if threads == 1 { "" } else { "s" }
+                                        )
+                                        .into(),
+                                    ),
                             )
                         })
                         .into_any_element(),
@@ -3909,7 +4041,14 @@ impl SidebarPaneView {
             })
             .collect();
         let secondary = theme.colors.foreground.secondary;
-        let icon_size = crate::ui_scale::UiScale::current(cx).px(14.0);
+        let primary = theme.colors.foreground.primary;
+        let ui = crate::ui_scale::UiScale::current(cx);
+        // The state icon sits on the title line; the symbols in the meta line
+        // are a size down so that line stays one text line tall.
+        let icon_size = ui.px(14.0);
+        let symbol_size = ui.px(12.0);
+        let title_height = theme.ui_text(13.0) * 1.5;
+        let now = std::time::SystemTime::now();
         let drafts = self
             .root_view
             .upgrade()
@@ -3921,31 +4060,18 @@ impl SidebarPaneView {
             .unwrap_or_default();
         let ranks: Vec<u8> =
             super::super::pull_requests::stack_adjusted_ranks(list, &drafts, stacks);
-        // Section titles only once something is waiting on you.
-        let sectioned = ranks.iter().any(|rank| *rank < 2);
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .child(
-                div()
-                    .text_size(theme.ui_text(12.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(if sectioned {
-                        format!("Pull requests · {}", list.len())
-                    } else {
-                        format!("Open · {}", list.len())
-                    }),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_size(theme.ui_text(11.0))
-                    .text_color(secondary)
-                    .child("n new · R refresh"),
-            );
+        // Where a row's target branch is worth showing: the bottom of a stack,
+        // or any root row when the roots don't all target the same branch.
+        let root_bases: FxHashSet<&str> = list
+            .iter()
+            .filter(|pr| {
+                stack_position
+                    .get(&pr.number)
+                    .is_none_or(|(depth, _)| *depth == 0)
+            })
+            .map(|pr| pr.base.as_str())
+            .collect();
+        let mixed_bases = root_bases.len() > 1;
 
         let row = |pr: &crate::github::PullRequestSummary| {
             let number = pr.number;
@@ -3953,30 +4079,32 @@ impl SidebarPaneView {
             let stack_pos = stack_position.get(&number).copied();
             let (kind, title) = super::super::pr_symbols::title(&pr.title);
             let mut symbols = Vec::new();
-            if let Some(review) = pr.review {
-                symbols.push(super::super::pr_symbols::review(review, theme).render(
-                    format!("pr_{number}_review"),
-                    theme,
-                    icon_size,
-                ));
-            }
-            if let Some(checks) = super::super::pr_symbols::checks(pr.checks, theme) {
-                symbols.push(checks.render(format!("pr_{number}_checks"), theme, icon_size));
-            }
             if let Some(pending) = drafts.get(&number) {
                 symbols.push(
                     div()
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap_1()
+                        .text_color(theme.colors.status.warning.foreground)
                         .child(super::super::pr_symbols::pending(*pending, theme).render(
                             format!("pr_{number}_pending"),
                             theme,
-                            icon_size,
+                            symbol_size,
                         ))
-                        .child(pending.to_string())
+                        .child(format!("{pending} pending"))
                         .into_any_element(),
                 );
+            }
+            if let Some(checks) = super::super::pr_symbols::checks(pr.checks, theme) {
+                symbols.push(checks.render(format!("pr_{number}_checks"), theme, symbol_size));
+            }
+            if let Some(review) = pr.review {
+                symbols.push(super::super::pr_symbols::review(review, theme).render(
+                    format!("pr_{number}_review"),
+                    theme,
+                    symbol_size,
+                ));
             }
             if pr.review_requested {
                 symbols.push(super::super::pr_symbols::at_pill(
@@ -3984,15 +4112,23 @@ impl SidebarPaneView {
                     SharedString::from(format!("pr_{number}_at")),
                 ));
             }
+            let mut meta = format!("#{number} · {}", pr.author);
+            if let Ok(at) = pr.updated_at.parse::<jiff::Timestamp>() {
+                meta.push_str(" · ");
+                meta.push_str(&super::details::compact_age(at.as_second(), now));
+            }
+            if stack_depth == 0 && (stack_pos.is_some() || mixed_bases) {
+                meta.push_str(&format!(" · → {}", pr.base));
+            }
             div()
                 .id(SharedString::from(format!("pull_request_row_{number}")))
                 .flex()
-                .flex_col()
-                .gap(px(2.0))
+                .items_start()
+                .gap_2()
                 .mx_1()
                 .ml(px(2.0 + stack_depth as f32 * 14.0))
                 .px_2()
-                .py_1()
+                .py(ui.px(6.0))
                 .rounded(px(theme.radii.control))
                 .control_interaction(
                     controls::InteractionStyle::new(theme),
@@ -4014,83 +4150,111 @@ impl SidebarPaneView {
                         });
                     }),
                 )
+                .when(stack_depth > 0, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .h(title_height)
+                            .flex()
+                            .items_center()
+                            .text_size(theme.ui_text(13.0))
+                            .text_color(secondary)
+                            .child("└"),
+                    )
+                })
                 .child(
                     div()
+                        .flex_none()
+                        .h(title_height)
                         .flex()
                         .items_center()
-                        .gap_1()
-                        .text_size(theme.ui_text(13.0))
-                        .when(stack_depth > 0, |row| {
-                            row.child(
-                                div()
-                                    .flex_none()
-                                    .text_color(secondary)
-                                    .child("└"),
-                            )
-                        })
                         .child(
                             super::super::pr_symbols::state("OPEN", pr.is_draft, theme).render(
                                 format!("pr_{number}_state"),
                                 theme,
                                 icon_size,
                             ),
-                        )
-                        .when_some(stack_pos, |row, (ix, total)| {
-                            row.child(
-                                div()
-                                    .flex_none()
-                                    .rounded(px(3.0))
-                                    .px_1()
-                                    .bg(theme.colors.surface.panel)
-                                    .text_size(theme.ui_text(10.0))
-                                    .text_color(secondary)
-                                    .child(format!("{}/{total}", ix + 1)),
-                            )
-                        })
-                        .when(pr.is_mine, |row| {
-                            row.child(super::super::pr_symbols::person(theme).render(
-                                format!("pr_{number}_mine"),
-                                theme,
-                                icon_size,
-                            ))
-                        })
-                        .when_some(kind, |row, kind| {
-                            row.child(super::super::pr_symbols::kind_tag(
-                                kind,
-                                theme,
-                                theme.ui_text(10.0),
-                            ))
-                        })
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_color(if pr.is_draft {
-                                    secondary
-                                } else {
-                                    theme.colors.foreground.primary
-                                })
-                                .child(title.to_owned()),
                         ),
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
-                        .gap_2()
-                        .text_size(theme.ui_text(11.0))
-                        .text_color(secondary)
-                        .child(div().flex_1().min_w(px(0.0)).truncate().child(format!(
-                            "#{number} · {} · {} → {}",
-                            pr.author, pr.head, pr.base
-                        )))
-                        .children(symbols),
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .h(title_height)
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(theme.ui_text(13.0))
+                                .when_some(kind, |row, kind| {
+                                    row.child(super::super::pr_symbols::kind_tag(
+                                        kind,
+                                        theme,
+                                        theme.ui_text(10.0),
+                                    ))
+                                })
+                                .child(
+                                    div()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_color(if pr.is_draft { secondary } else { primary })
+                                        .child(title.to_owned()),
+                                )
+                                .when_some(stack_pos, |row, (ix, total)| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .rounded(px(theme.radii.pill))
+                                            .border_1()
+                                            .border_color(theme.colors.stroke.default)
+                                            .px(ui.px(5.0))
+                                            .font_family(
+                                                crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY,
+                                            )
+                                            .text_size(theme.ui_text(10.0))
+                                            .text_color(secondary)
+                                            .child(format!("{}/{total}", ix + 1)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(theme.ui_text(11.0))
+                                .text_color(secondary)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .when(pr.is_mine, |line| {
+                                            line.child(
+                                                super::super::pr_symbols::person(theme).render(
+                                                    format!("pr_{number}_mine"),
+                                                    theme,
+                                                    symbol_size,
+                                                ),
+                                            )
+                                        })
+                                        .child(div().min_w(px(0.0)).truncate().child(meta)),
+                                )
+                                .children(symbols),
+                        ),
                 )
                 .into_any_element()
         };
         let mut rows: Vec<AnyElement> = Vec::new();
         for (ix, pr) in list.iter().enumerate() {
             let rank = ranks[ix];
-            if sectioned && (ix == 0 || ranks[ix - 1] != rank) {
+            if ix == 0 || ranks[ix - 1] != rank {
                 let title = match rank {
                     0 => "Waiting for your review",
                     1 => "Your reviews in progress",
@@ -4106,15 +4270,27 @@ impl SidebarPaneView {
                         .pt_2()
                         .pb_1()
                         .text_size(theme.ui_text(11.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(secondary)
                         .when(rank == 0, |header| {
                             header.child(super::super::pr_symbols::at_pill(
                                 theme,
                                 "pr_section_at_pill",
                             ))
                         })
-                        .child(format!("{title} · {count}"))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(primary)
+                                .child(title),
+                        )
+                        .child(div().text_color(secondary).child(count.to_string()))
+                        .when(ix == 0, |header| {
+                            header.child(div().flex_1()).child(
+                                div()
+                                    .text_size(theme.ui_text(11.0))
+                                    .text_color(secondary)
+                                    .child("n new · R refresh"),
+                            )
+                        })
                         .into_any_element(),
                 );
             }
@@ -4122,23 +4298,48 @@ impl SidebarPaneView {
         }
 
         div()
+            .id("pull_request_list")
             .flex()
             .flex_col()
             .size_full()
             .min_h(px(0.0))
-            .child(header)
-            .child(
-                div()
-                    .id("pull_request_list")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
+            .overflow_y_scroll()
+            .children(rows)
             .into_any_element()
     }
+}
+
+/// The review list's "viewed" checkbox (and the footer legend's tiny copy): a
+/// success-filled box with a check when viewed, a quiet outline when not.
+fn viewed_checkbox(
+    viewed: bool,
+    size: f32,
+    theme: AppTheme,
+    scale: crate::ui_scale::UiScale,
+) -> gpui::Div {
+    let success = theme.colors.status.success.foreground;
+    let side = scale.px(size);
+    div()
+        .flex_none()
+        .w(side)
+        .h(side)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(scale.px(3.0))
+        .border_1()
+        .border_color(if viewed {
+            success
+        } else {
+            theme.colors.stroke.default
+        })
+        .when(viewed, |check| {
+            check.bg(success).child(crate::view::icons::svg_icon(
+                "icons/check.svg",
+                theme.colors.surface.chrome,
+                scale.px(size - 4.0),
+            ))
+        })
 }
 
 impl Render for SidebarPaneView {

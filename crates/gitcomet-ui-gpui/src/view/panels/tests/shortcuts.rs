@@ -6632,6 +6632,8 @@ fn dismissing_change_tracking_settings_with_escape_restores_diff_panel_focus(
     );
 }
 
+#[cfg(debug_assertions)]
+mod control_bridge;
 mod generated_files;
 mod hook_activity;
 mod image_diff_modes;

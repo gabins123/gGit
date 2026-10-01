@@ -4,6 +4,8 @@ mod assets;
 mod bundled_fonts;
 mod clipboard;
 mod codex;
+#[cfg(debug_assertions)]
+mod control_bridge;
 mod external_editor;
 pub mod focused_diff;
 mod font_preferences;
