@@ -40,7 +40,9 @@ impl GixBackend {
             cancellation.check_cancelled()?;
         }
 
-        Ok(Arc::new(GixRepo::new(workdir, repo.into_sync())))
+        let mut repo = repo.into_sync();
+        crate::open::share_object_store(&mut repo);
+        Ok(Arc::new(GixRepo::new(workdir, repo)))
     }
 }
 
