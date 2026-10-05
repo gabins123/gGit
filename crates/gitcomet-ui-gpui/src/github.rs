@@ -1463,7 +1463,8 @@ pub(crate) struct ThreadComment {
 }
 
 /// A review thread already on GitHub: where it sits and what was said. Its
-/// text is from anyone who can comment, shown as plain text only.
+/// text is from anyone who can comment: markdown with remote images off in
+/// the PR view, plain text in Your review.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReviewThread {
     /// The first comment's id, which replies answer.

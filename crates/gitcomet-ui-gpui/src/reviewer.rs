@@ -1,10 +1,12 @@
-//! `.reviewer/` folder support for Codex-based PR review (PR mode v2, phase
-//! 6): parsing what a repository authors under `.reviewer/`, and the small
-//! JSON shapes Codex is asked to answer in for the checklist review and the
-//! "brief me" summary.
+//! `.reviewer/` folder support for Codex-based PR review (reviewer agents,
+//! docs/pr-mode.md): parsing what a repository authors under `.reviewer/`,
+//! and the small JSON shapes Codex is asked to answer in for the checklist
+//! review and the "brief me" summary.
 //!
-//! Everything here is read from the pull request's **base commit**, never
-//! its head or the worktree: a PR cannot rewrite the rules it is reviewed
+//! Everything here is read from where the pull request leaves the default
+//! branch (the merge base of its base commit and the default branch, see
+//! `reviewer_trusted_base_commit`), never its head or the worktree: a PR
+//! cannot rewrite the rules it is reviewed
 //! against. The text this module produces is trusted (it goes in a Codex
 //! prompt's instructions); PR material (diffs, descriptions, threads) stays
 //! untrusted and out of this module's business (`codex.rs` fences it).
@@ -13,8 +15,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Total `.reviewer` text sent to Codex in one request is capped here, so a
-/// large folder can't blow the prompt budget on its own; `codex.rs` still
-/// caps the whole prompt (instructions + material) on top of this.
+/// large folder can't blow the prompt budget on its own. It goes into the
+/// instructions, which `codex.rs` never cuts (it cuts only the material).
 pub(crate) const REVIEWER_TEXT_CAP: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

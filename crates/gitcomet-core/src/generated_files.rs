@@ -1,6 +1,6 @@
 //! Whether a path counts as a "generated file" the way GitHub does: hidden by
 //! default in a pull request's Files list, and left out of reviewer-agent
-//! material (Phase 6) unless the scope is exactly that file.
+//! material (docs/pr-mode.md) unless the scope is exactly that file.
 //!
 //! Matches GitHub's `linguist-generated` attribute:
 //! <https://docs.github.com/en/repositories/working-with-files/managing-files/customizing-how-changed-files-appear-on-github>
