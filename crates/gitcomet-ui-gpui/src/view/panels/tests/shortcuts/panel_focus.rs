@@ -550,7 +550,7 @@ fn less_and_greater_walk_a_pull_requests_stack(cx: &mut gpui::TestAppContext) {
 
 /// Reviewing PR 1 in the stack 1<-2: `<`/`>` must not swap in a neighboring
 /// PR out from under the open review (it would silently diff/list the wrong
-/// PR — see AGENTS.md HIGH finding on `handle_pull_request_key`).
+/// PR; `handle_pull_request_key` guards against it).
 #[gpui::test]
 fn stack_keys_are_inert_while_reviewing(cx: &mut gpui::TestAppContext) {
     let _guard = lock_visual_test();

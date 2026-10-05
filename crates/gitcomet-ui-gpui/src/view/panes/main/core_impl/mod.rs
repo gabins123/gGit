@@ -1335,9 +1335,9 @@ impl MainPaneView {
         &self,
         approval_view: Option<Entity<MainPaneView>>,
     ) -> rows::MarkdownRemoteImageAccess {
-        // A commit-range target is how review mode and the pull request
-        // "enter" diff show a file's diff (Phase 5, pr-mode-v2): its content
-        // can come from a fork's pull request, so remote images never load
+        // A commit-range target is how review mode shows a pull request
+        // file's diff (docs/pr-mode.md; History's range list uses it too):
+        // its content can come from a fork's pull request, so remote images never load
         // automatically here, regardless of the user's general preference —
         // the same rule `pr_markdown` already applies to the PR description
         // and conversation.

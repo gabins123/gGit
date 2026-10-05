@@ -114,6 +114,8 @@ Details lists every changed file once, staged or not, the way lazygit does. Two 
 
 ### Pull requests tab
 
+How PR mode is built, for changing it: [pr-mode.md](pr-mode.md).
+
 GitHub pull requests go through the [GitHub CLI](https://cli.github.com) (`gh`), which owns sign-in; GitComet never sees a token. The tab lists the open pull requests of the repository's github.com remote: `upstream` first (a fork's parent, where gh sends pull requests too), then `origin`. A branch pushed to a fork opens its pull request as `owner:branch`.
 
 | Action | Key | Notes |
@@ -155,7 +157,7 @@ Re-reviewing works like GitHub's: Your review opens with your last submitted rev
 | Suggest a change | `Alt+S` | Comment box | Puts the selected lines in a GitHub suggestion block, after what's typed, to edit into the fix. GitHub then offers to commit it. Not on removed lines. |
 | Next / previous thread | `t` / `Shift+T` | Diff | Threads already on GitHub, marked in blue (your pending comments are amber). Details shows the thread under the cursor. |
 | Reply | `r` | Diff | To the thread on the line under the cursor. The reply waits with the rest of the review and posts right after it. |
-| Codex suggestions | `i` then `p` | Any panel | In review mode, Codex reviews the pull request's patch as suggested line comments, marked in grey; `t` steps to them too and Details shows the one under the cursor. Nothing is posted: `a` adopts it as your pending comment (edit or delete it like any other), `x` drops it. |
+| Codex suggestions | `i` then `r` | Any panel | In review mode, the reviewer menu's review against the rules turns Codex's findings into suggested line comments, marked in grey; `t` steps to them too and Details shows the one under the cursor. Nothing is posted: `a` adopts it as your pending comment (edit or delete it like any other), `x` drops it. |
 | Next / previous change | `}` / `{` | Diff | In the rendered Markdown preview, jumps between changed blocks instead of changed lines. |
 | Next / previous file | `]` / `[` | Any panel | `j` / `k` in the Sidebar too, in flat layout; in tree layout `]` / `[` still move file to file (folder rows have no ordinal), while `j` / `k` step one row at a time, folder rows included — landing on a file opens it, landing on a folder rests the cursor there for `Enter`. Either way, only the files listed. |
 | Tree or flat file list | `` ` `` | Sidebar | Same key and folded-chain folders as the Changes list's. `Enter` on a folder row toggles it; hidden (filtered out) files never create a folder, so an empty one never shows. |
@@ -178,7 +180,7 @@ Read-only suggestions from Codex through the `codex` CLI on your ChatGPT subscri
 | Action | Key | Notes |
 | --- | --- | --- |
 | Codex actions | `i` | A menu: `m` commit message, `r` review local changes, `d` explain the open diff, `c` explain the selected commit, `f` explain the open file, `p` review the selected pull request, `q` ask about the repository. On the Pull requests tab or in review mode, `i` opens the reviewer menu instead (below). |
-| Focus the Codex panel | `0` | The answer is editable. In the panel: `y` copy, `u` use as the selected pull request's review, `e` edit, `a` ask, `s` stop a run, `x` or `Escape` close. When the answer is a list (`b` brief me, `r` review against the rules), `j` / `k` move over its rows and `Enter` jumps a `b` row to its file and line in review mode. |
+| Focus the Codex panel | `0` | The answer is editable. In the panel: `y` copy, `u` use as the selected pull request's review, `e` edit, `a` ask, `s` stop a run, `x` or `Escape` close. When the answer is a list (`b` brief me, `r` review against the rules), `j` / `k` move over its rows and `Enter` jumps a row that names a file and line (a `b` row or an `r` finding) to it, in review mode on the same pull request and head. |
 | Draft a review with Codex | `Alt+G` | In the review dialog. The draft fills the box when it is still empty. |
 
 ### Reviewer menu

@@ -1,4 +1,4 @@
-//! The `i` menu on a pull request (PR mode v2, phase 6): a scope picker and
+//! The `i` menu on a pull request (reviewer agents, docs/pr-mode.md): a scope picker and
 //! a set of Codex actions driven by `.reviewer/`, replacing the plain Codex
 //! menu (`codex_panel.rs`) while a pull request is on screen (the PR tab or
 //! review mode). Everywhere else `i` still opens the plain menu unchanged.
@@ -27,7 +27,7 @@ pub(super) enum ReviewScope {
     Lines,
     /// The open file's diff.
     File,
-    /// The reviewed commit range's diff (review mode's own — the Phase 2
+    /// The reviewed commit range's diff (review mode's own — the commit
     /// picker selection or `L` since your last review — else the whole PR).
     Commits,
     /// The whole pull request's diff, `merge_base..head`.
@@ -353,7 +353,7 @@ impl GitCometView {
     }
 
     /// The base/head a Lines, File or Commits scope's diff runs between:
-    /// review mode's own choice (a Phase 2 commit range, or `L` since your
+    /// review mode's own choice (a picked commit range, or `L` since your
     /// last review), matching exactly what's on screen — not always the
     /// pull request's raw merge base and head.
     fn scope_diff_range(&self, context: &ReviewerContext) -> Result<(String, String), &'static str> {
