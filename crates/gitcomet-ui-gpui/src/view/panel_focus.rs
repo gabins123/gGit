@@ -79,6 +79,7 @@ impl FocusPanel {
                 ("n", "new"),
                 ("o", "PR"),
                 ("m", "menu"),
+                ("/", "search"),
             ],
             Self::History => &[
                 ("j/k", "commit"),
@@ -117,6 +118,7 @@ impl FocusPanel {
                 ("o", "Open a pull request for it on GitHub"),
                 ("O", "New pull request from it: base, title, body"),
                 ("m", "The branch's menu"),
+                ("/", "Search the branches; enter keeps it, esc clears it"),
                 ("[ / ]", "Branches / Files / Pull requests tab"),
             ],
             Self::History => &[
@@ -515,7 +517,7 @@ impl GitCometView {
             };
         }
         if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
-            return &[("[ ]", "tab")];
+            return &[("/", "search"), ("[ ]", "tab")];
         }
         if self.state.sidebar_mode == SidebarMode::PullRequests {
             match panel {
@@ -742,7 +744,10 @@ impl GitCometView {
             };
         }
         if panel == FocusPanel::Sidebar && self.state.sidebar_mode == SidebarMode::Files {
-            return &[("[ / ]", "Branches / Files / Pull requests tab")];
+            return &[
+                ("/", "Search the files; enter keeps it, esc clears it"),
+                ("[ / ]", "Branches / Files / Pull requests tab"),
+            ];
         }
         if self.state.sidebar_mode == SidebarMode::PullRequests {
             match panel {
@@ -947,7 +952,10 @@ impl GitCometView {
             .active_repo()
             .is_some_and(|repo| repo.history_state.selected_commit.is_some())
         {
-            self.store.dispatch(Msg::ClearCommitSelection { repo_id });
+            self.store.dispatch(Msg::ClearCommitSelection {
+                request_id: None,
+                repo_id,
+            });
         }
         self.focus_commit_requested = Some(std::time::Instant::now());
         cx.notify();
@@ -1246,7 +1254,14 @@ impl GitCometView {
             (Some(FocusPanel::Details), "a") if worktree_shown => {
                 self.stage_or_unstage_all(window, cx)
             }
-            // From any panel, or none: the Changes list is the one list
+            // The Sidebar's own search box, hidden until asked for.
+            (Some(FocusPanel::Sidebar), "/")
+                if self.state.sidebar_mode != SidebarMode::PullRequests =>
+            {
+                self.sidebar_pane
+                    .update(cx, |pane, cx| pane.open_sidebar_search(cx));
+            }
+            // From any other panel, or none: the Changes list is the one list
             // it filters, and it's on screen whenever this is true.
             (_, "/") if self.changes_list_shown() => {
                 if self.details_collapsed {
@@ -1291,7 +1306,10 @@ impl GitCometView {
                 ) {
                     self.store.dispatch(Msg::ClearDiffSelection { repo_id });
                 }
-                self.store.dispatch(Msg::ClearCommitSelection { repo_id });
+                self.store.dispatch(Msg::ClearCommitSelection {
+                    request_id: None,
+                    repo_id,
+                });
             }
             (Some(FocusPanel::Details), "J" | "K" | "DOWN" | "UP") if self.changes_list_shown() => {
                 let direction = if matches!(key.as_str(), "J" | "DOWN") {

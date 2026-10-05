@@ -22,6 +22,8 @@ pub(in crate::view) use pull_request::pr_content_child_index;
 pub(in crate::view) use review_cursor::{ReviewCommentScope, ReviewMark, SinceLines};
 pub(in crate::view) mod submodule_summary;
 mod surface;
+mod text_format;
+pub(in crate::view) use text_format::TextEncodingMenuState;
 
 #[cfg(feature = "benchmarks")]
 #[allow(unused_imports)]
@@ -87,6 +89,42 @@ pub(in crate::view) fn pane_content_width_for_layout(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::view) enum MainPaneSurface {
+    History,
+    Diff,
+    InteractiveRebase,
+    PullRequest,
+    /// A generated file (GitHub's `linguist-generated`, e.g. a lockfile) in
+    /// review shows a placeholder instead of its diff until `enter` dismisses
+    /// it for the rest of the review — usually uninteresting, and sometimes
+    /// large. Not gated on a diff target: its diff is deliberately never
+    /// requested while the placeholder is up (`review_open_file`), so
+    /// `diff_target` may be unset or still pointing at a previous file.
+    GeneratedPlaceholder,
+}
+
+impl MainPaneView {
+    pub(in crate::view) fn active_surface(&self) -> MainPaneSurface {
+        if self.pull_request_shown {
+            return MainPaneSurface::PullRequest;
+        }
+        if self.review_active && self.review_generated_placeholder {
+            return MainPaneSurface::GeneratedPlaceholder;
+        }
+        match self.active_repo() {
+            Some(repo) if repo.diff_state.diff_target.is_some() => MainPaneSurface::Diff,
+            Some(repo)
+                if repo.interactive_rebase_setup.is_some()
+                    || repo.interactive_cherry_pick_setup.is_some() =>
+            {
+                MainPaneSurface::InteractiveRebase
+            }
+            _ => MainPaneSurface::History,
+        }
+    }
+}
+
 impl Render for MainPaneView {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         // A new frame re-reads from disk what the surface depends on.
@@ -107,50 +145,34 @@ impl Render for MainPaneView {
             v.set_history_content_width(history_content_width);
         });
 
-        let show_pull_request = self
+        self.pull_request_shown = self
             .root_view
             .upgrade()
             .is_some_and(|root| root.read(cx).pull_request_content_active());
-        if !show_pull_request {
+        let surface = self.active_surface();
+        if surface != MainPaneSurface::PullRequest {
             self.pull_request_scroll_key = None;
         }
-        let show_diff = self
-            .active_repo()
-            .and_then(|r| r.diff_state.diff_target.as_ref())
-            .is_some();
-        let in_rebase = self.active_repo().is_some_and(|r| {
-            r.interactive_rebase_setup.is_some() || r.interactive_cherry_pick_setup.is_some()
-        });
         self.release_stale_submodule_summary_cache();
         // Keep blame in sync with the displayed file/revision while annotate is
         // on; the request is a no-op when the target is unchanged. Render must not
         // force a retry — a persistent error would re-dispatch every frame.
-        if self.annotate_enabled && show_diff && !show_pull_request {
+        if self.annotate_enabled && surface == MainPaneSurface::Diff {
             self.request_blame_for_current_target(false, cx);
         }
-        // A generated file (GitHub's `linguist-generated`, e.g. a lockfile)
-        // shows a placeholder instead of its diff until `enter` dismisses it
-        // for the rest of the review — usually uninteresting, and sometimes
-        // large. Not gated on `show_diff`: its diff is deliberately never
-        // requested while the placeholder is up (`review_open_file`), so
-        // `diff_target` may be unset or still pointing at a previous file.
-        let show_generated_placeholder =
-            !show_pull_request && self.review_active && self.review_generated_placeholder;
-        let inner = if show_pull_request {
-            self.pull_request_view(cx)
-        } else if show_generated_placeholder {
-            components::empty_state(
+        let inner = match surface {
+            MainPaneSurface::PullRequest => self.pull_request_view(cx),
+            MainPaneSurface::GeneratedPlaceholder => components::empty_state(
                 self.theme,
                 "Generated file",
                 "GitHub hides generated files like this one by default. Press enter to load its diff.",
             )
-            .into_any_element()
-        } else if show_diff {
-            self.diff_view(window, cx).into_any_element()
-        } else if in_rebase {
-            self.interactive_rebase_view(window, cx).into_any_element()
-        } else {
-            self.history_view.clone().into_any_element()
+            .into_any_element(),
+            MainPaneSurface::Diff => self.diff_view(window, cx).into_any_element(),
+            MainPaneSurface::InteractiveRebase => {
+                self.interactive_rebase_view(window, cx).into_any_element()
+            }
+            MainPaneSurface::History => self.history_view.clone().into_any_element(),
         };
         let search_action = std::mem::take(&mut self.diff_search_probe_render);
         crate::ui_probe::action_phase(search_action, "rendered", || {

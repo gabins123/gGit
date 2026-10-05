@@ -11,7 +11,9 @@ pub(crate) enum CopySource {
     TerminalShortcut,
     TerminalContextMenu,
     HookActivity,
+    ErrorDetails,
     ContextMenu,
+    EnvironmentDetails,
 }
 
 impl CopySource {
@@ -29,7 +31,9 @@ impl CopySource {
             Self::TerminalShortcut => "terminal-shortcut",
             Self::TerminalContextMenu => "terminal-context-menu",
             Self::HookActivity => "hook-activity",
+            Self::ErrorDetails => "error-details",
             Self::ContextMenu => "context-menu",
+            Self::EnvironmentDetails => "environment-details",
         }
     }
 }
@@ -269,9 +273,9 @@ mod tests {
             let is_test_source = relative
                 .components()
                 .any(|component| component.as_os_str() == "tests")
-                || relative
-                    .file_name()
-                    .is_some_and(|name| name == "smoke_tests.rs" || name == "test_support.rs");
+                || relative.file_name().is_some_and(|name| {
+                    name == "tests.rs" || name == "smoke_tests.rs" || name == "test_support.rs"
+                });
             if relative == std::path::Path::new("clipboard.rs") || is_test_source {
                 continue;
             }

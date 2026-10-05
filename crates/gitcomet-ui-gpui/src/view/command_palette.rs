@@ -499,7 +499,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         label: "Search in Current View",
         shortcut: Shortcut::Secondary("F"),
         category: "Navigation",
-        keywords: "",
+        keywords: "find commit history sha diff file",
         requires_repo: true,
         needs: Needs::Nothing,
     },
@@ -546,6 +546,26 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "open-workspace",
+        label: "Open Workspace",
+        shortcut: Shortcut::Secondary("Shift+R"),
+        category: "Window",
+        keywords: "workspace switch window restore saved",
+        requires_repo: false,
+        needs: Needs::Nothing,
+    },
+    // The tab's right-click menu, for the keyboard: moving the repository to
+    // a new window or another workspace lives only there.
+    CommandEntry {
+        id: "repo-tab-menu",
+        label: "Repository Tab Menu",
+        shortcut: Shortcut::None,
+        category: "Window",
+        keywords: "move new window workspace tab",
+        requires_repo: true,
         needs: Needs::Nothing,
     },
     CommandEntry {

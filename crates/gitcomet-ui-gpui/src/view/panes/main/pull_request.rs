@@ -1268,6 +1268,8 @@ impl MainPaneView {
         };
         let ui_scale = crate::ui_scale::UiScale::current(cx);
         rows::render_markdown_document(
+            // PR text belongs to no file, so no file's tab-width attribute applies.
+            usize::from(crate::view::tab_width::DEFAULT_TAB_WIDTH),
             &document,
             &rows::MarkdownDocumentContext {
                 theme: self.theme,

@@ -43,6 +43,11 @@ fn fixture(cx: &mut gpui::TestAppContext) -> (View, &mut gpui::VisualTestContext
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
     });
+    // Text inputs take typing only in the active window. Activate before any
+    // repo is open: activation refreshes the open repo from the test backend,
+    // which would replace the fixture's files.
+    cx.update(|window, _app| window.activate_window());
+    draw_and_drain_test_window(cx);
     apply_state(cx, &view, app_state_with_active_repo(panel_repo()));
     bind_app_keys_and_global_diff_fallback_for_test(cx);
     cx.update(|_window, app| crate::app::bind_text_input_keys_for_test(app));
@@ -254,6 +259,74 @@ fn sidebar_j_and_k_step_through_branches(cx: &mut gpui::TestAppContext) {
     press(cx, "k");
     assert_eq!(selected_branch(cx, &view), Some(first));
     assert_eq!(focused(cx, &view), Some(Sidebar));
+}
+
+/// Leaving the app blurs the window (a text field must not take typing on the
+/// way back), but the focused panel gets the keyboard back.
+#[gpui::test]
+fn switching_away_and_back_keeps_the_focused_panel(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    press(cx, "1");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+    cx.deactivate_window();
+    draw_and_drain_test_window(cx);
+    assert_eq!(focused(cx, &view), None, "deactivation blurs");
+    cx.update(|window, _app| window.activate_window());
+    draw_and_drain_test_window(cx);
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+
+    // A text field is not refocused.
+    press(cx, "c");
+    assert_eq!(focused(cx, &view), None, "c focuses the commit message");
+    cx.deactivate_window();
+    cx.update(|window, _app| window.activate_window());
+    draw_and_drain_test_window(cx);
+    assert!(cx.update(|window, app| window.focused(app).is_none()));
+}
+
+/// A pinned branch is listed twice: in the pins on top and in the tree. `j`
+/// and `k` step through each copy, so the selection has to know which one
+/// it is on.
+#[gpui::test]
+fn sidebar_j_and_k_tell_a_pinned_copy_from_the_tree_copy(cx: &mut gpui::TestAppContext) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    cx.update(|_window, app| {
+        view.read(app).sidebar_pane.clone().update(app, |pane, cx| {
+            pane.toggle_pinned_branch(
+                REPO,
+                crate::view::branch_sidebar::BranchSection::Local,
+                "feature",
+                cx,
+            )
+        })
+    });
+    draw_and_drain_test_window(cx);
+    let feature = crate::view::branch_sidebar::BranchMenuTarget::Local {
+        name: "feature".into(),
+    };
+    let on_tree_copy = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .sidebar_pane
+                .read(app)
+                .selected_branch_for_row(None)
+                .is_some()
+        })
+    };
+
+    // The pins come first.
+    press(cx, "1 j");
+    assert_eq!(selected_branch(cx, &view), Some(feature.clone()));
+    assert!(!on_tree_copy(cx), "j starts on the pinned copy");
+    // Into the tree, and back up to the pinned copy rather than stopping at
+    // the tree's own `feature`.
+    press(cx, "j");
+    assert!(on_tree_copy(cx), "j steps from the pins into the tree");
+    press(cx, "k");
+    assert_eq!(selected_branch(cx, &view), Some(feature));
+    assert!(!on_tree_copy(cx), "k returns to the pinned copy");
 }
 
 fn pull_request_state() -> Arc<AppState> {
@@ -1947,6 +2020,54 @@ fn slash_filters_the_changes_list_fuzzily_and_by_file_type(cx: &mut gpui::TestAp
 }
 
 #[gpui::test]
+fn slash_in_the_sidebar_opens_its_search_and_esc_returns_to_the_list(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = lock_visual_test();
+    let (view, cx) = fixture(cx);
+    let query = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .sidebar_pane
+                .read(app)
+                .branch_filter_query
+                .clone()
+        })
+    };
+
+    // The search box is hidden until `/` shows it; from the Sidebar it is the
+    // Sidebar's own box, not the Changes filter. Letters type, not run keys.
+    press(cx, "1 /");
+    press(cx, "f e a");
+    assert_eq!(query(cx), "fea");
+    assert_eq!(focused(cx, &view), None);
+
+    // Enter keeps the search and hands the list the keyboard: `j` walks what
+    // it shows. Esc there clears it.
+    press(cx, "enter");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+    assert_eq!(query(cx), "fea");
+    press(cx, "j");
+    assert_eq!(
+        selected_branch(cx, &view),
+        Some(crate::view::branch_sidebar::BranchMenuTarget::Local {
+            name: "feature".into()
+        })
+    );
+    press(cx, "escape");
+    assert_eq!(query(cx), "");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+
+    // Esc from the box clears and closes it too.
+    press(cx, "/");
+    press(cx, "m a");
+    assert_eq!(query(cx), "ma");
+    press(cx, "escape");
+    assert_eq!(query(cx), "");
+    assert_eq!(focused(cx, &view), Some(Sidebar));
+}
+
+#[gpui::test]
 fn shift_j_and_k_select_a_range_of_changes_and_esc_drops_it(cx: &mut gpui::TestAppContext) {
     let _guard = lock_visual_test();
     let (view, cx) = fixture(cx);
@@ -2343,16 +2464,18 @@ fn a_tall_description_scrolls_with_j_k_and_the_page_keys(cx: &mut gpui::TestAppC
         "k scrolls back up by the same step"
     );
 
+    // A page step there and back can land a float rounding off.
+    let near = |a: gpui::Pixels, b: gpui::Pixels| f32::from(a - b).abs() < 0.01;
     press(cx, "pagedown");
     let after_page = scroll.offset().y;
     assert!(after_page < after_j);
     press(cx, "pageup");
-    assert_eq!(scroll.offset().y, after_j);
+    assert!(near(scroll.offset().y, after_j), "pageup undoes pagedown");
 
     press(cx, "ctrl-d");
     assert!(scroll.offset().y < after_j, "ctrl-d is a half page down");
     press(cx, "ctrl-u");
-    assert_eq!(scroll.offset().y, after_j, "ctrl-u is a half page up");
+    assert!(near(scroll.offset().y, after_j), "ctrl-u is a half page up");
 
     press(cx, "end");
     assert_eq!(scroll.offset().y, -max);

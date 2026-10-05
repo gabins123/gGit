@@ -7,6 +7,7 @@ Source of truth:
 - `crates/gitcomet-ui-gpui/src/focused_diff.rs`
 - `crates/gitcomet-ui-gpui/src/view/terminal_panel.rs`
 - `crates/gitcomet-ui-gpui/src/view/panels/main/diff_view.rs`
+- `crates/gitcomet-ui-gpui/src/view/panes/history/find.rs`
 - `crates/gitcomet-ui-gpui/src/view/conflict_resolver.rs`
 - `crates/gitcomet-ui-gpui/src/view/panel_focus.rs`
 
@@ -24,12 +25,14 @@ These shortcuts apply in the normal GitComet window.
 | Open a new window | `Cmd-N`, `Cmd-Shift-N` | `Ctrl-N`, `Ctrl-Shift-N` | |
 | Open Settings | `Cmd-,` | `Ctrl-,` | |
 | Open a repository | `Cmd-O` | `Ctrl-O` | |
+| Open a workspace | `Cmd-Shift-R` | `Ctrl-Shift-R` | Lists saved workspaces. In an empty window the chosen workspace opens there; otherwise its own window is focused or opened. Also in the command palette and the app menu. |
 | Go to a commit | `Cmd-G` | `Ctrl-G` | Opens the Go to dialog. Accepts a full or short SHA (4+ characters, unique), a branch, a tag, or any revision such as `HEAD~3`; matches are exact. In an embedded terminal the shell keeps `Ctrl-G`. |
 | Toggle open and recently closed repositories | `Ctrl-Shift-A`, `Cmd-Shift-O`, `Option-Cmd-O` | `Ctrl-Shift-A`, `Ctrl-Shift-O` | In an embedded terminal on Windows/Linux, `Ctrl-Shift-A` keeps its terminal “Select All” behavior. |
 | Open active repository in external code editor | `Cmd-Shift-E` | `Ctrl-Shift-E` | Only active when an external code editor is configured. |
 | Show the open file in the file explorer | `Cmd-Shift-L` | `Ctrl-Shift-L` | Switches the sidebar to Files, expands the folders leading to the file, and scrolls it into view. |
 | Open the repository's remote in a web browser | `Cmd-K` | `Ctrl-K` | Opens the remote's page on its host (GitHub, GitLab, Bitbucket, Azure DevOps, Gitea/Codeberg, AWS CodeCommit, or a self-hosted forge). With several such remotes a menu lists them, `origin` first; `1`–`9` pick directly. Also in the command palette, the app menu, and a remote's right-click menu in the sidebar. In an embedded terminal on Windows/Linux the shell keeps `Ctrl-K`. |
 | Close the active repository tab, or close the window if no repo tab can close | `Cmd-W` | `Ctrl-W` | |
+| The active repository tab's menu | Command palette: Repository Tab Menu | Command palette: Repository Tab Menu | The tab's right-click menu, driven with the arrow keys and `Enter`: move the repository to a new window or another workspace, close it, and the rest. |
 | Close the active window | `Cmd-Shift-W` | `Ctrl-Shift-W` | |
 | Previous repository tab | `Cmd-PageUp`, `Cmd-{`, `Option-Cmd-Left` | `Ctrl-PageUp`, `Ctrl-Shift-Tab` | |
 | Next repository tab | `Cmd-PageDown`, `Cmd-}`, `Option-Cmd-Right` | `Ctrl-PageDown`, `Ctrl-Tab` | |
@@ -56,6 +59,7 @@ These keys only work while a panel itself has focus (or nothing does). They are 
 | Back from a diff | `Escape` | Closes the diff and returns focus to the panel it was opened from. |
 | Back from a commit to your changes | `Escape` | History or Details, while a selected commit fills Details: drops the selection so Details lists your changes again. |
 | Previous / next sidebar tab | `[` / `]` | Branches, Files and Pull requests. |
+| Search the sidebar | `/` | Sidebar, on the Branches or Files tab: shows the tab's search box (also the 🔍 button) and focuses it. `Enter` keeps the search and goes back to the list, where `j` / `k` and the branch keys work on what it shows; `Escape` closes it and clears the search, from the box or the list. |
 | List the focused panel's keys | `?` | Modal; `Escape` or `?` closes it. The status bar also shows the focused panel's main keys. |
 
 When a dialog or menu opened from these keys closes, focus returns to the panel it was opened from. Focus whose element disappears (a dialog confirmed, a row removed) likewise returns to the last focused panel.
@@ -102,7 +106,7 @@ Details lists every changed file once, staged or not, the way lazygit does. Two 
 | Stage or unstage everything shown | `a` | Stages what the list shows; when none of it is unstaged, unstages it. Unfiltered, that is every change. |
 | Stage or unstage the open file's folder | `Shift+Space` | Details. The same rule over the folder's shown files; also a folder row's hover button in the tree. |
 | Stage / unstage only | `Ctrl+S` / `Ctrl+U` | Diff. One direction of `Space`, whichever side of the file the diff shows. |
-| Filter by path or file type | `/` | Any panel, while Details shows the Changes list. A box opens above the list and filters as you type. Each word must fuzzy-match the path (its letters in that order, anything between: `pnl` finds `panel_focus.rs`); `.rs` or `*.rs` keeps that file type, and several types keep any of them. The most common types are chips under the box that add or remove themselves on click. `Enter` keeps the filter and goes back to the list, where `j` / `k`, `space` and `a` work on what it shows; `Esc` clears it, from the box or the list. |
+| Filter by path or file type | `/` | Any panel but the Sidebar on its Branches or Files tab (there `/` searches the Sidebar), while Details shows the Changes list. A box opens above the list and filters as you type. Each word must fuzzy-match the path (its letters in that order, anything between: `pnl` finds `panel_focus.rs`); `.rs` or `*.rs` keeps that file type, and several types keep any of them. The most common types are chips under the box that add or remove themselves on click. `Enter` keeps the filter and goes back to the list, where `j` / `k`, `space` and `a` work on what it shows; `Esc` clears it, from the box or the list. |
 | Kind | `Shift+F` | Cycles All, Unstaged, Staged, Untracked, like lazygit's file filter. The chips above the list show each count and switch on click. |
 | Tree or flat list | `` ` `` | lazygit's key. A folder's hover button stages it, or unstages it once it is all staged. |
 | Sort | `o` | Path, file type or size of the change. |
@@ -243,6 +247,18 @@ Compatibility note:
 | Action | macOS | Windows / Linux | Notes |
 | --- | --- | --- | --- |
 | Commit staged changes | `Cmd-Enter` | `Ctrl-Enter` | Commit message input only, and only when the Commit action is enabled. |
+
+## History view shortcuts
+
+These shortcuts apply while the commit history list is showing.
+
+| Action | macOS | Windows / Linux | Notes |
+| --- | --- | --- | --- |
+| Find a commit | `Cmd-F` | `Ctrl-F` | Opens the find bar over the history. Matches the commit summary or the author (each on its own), or the start of the SHA (4+ hex characters), across the whole history, not only the loaded rows. Typing selects the first match. With the bar already open, refocuses it with the query selected. |
+| Find options | `Aa`, `W`, `.*` buttons | `Aa`, `W`, `.*` buttons | Match Case, Whole Word and Regex toggles, as in diff search; toggling one searches again and selects the first match. Without Match Case, plain text ignores ASCII letter case only (`É` and `é` differ), while a regex ignores Unicode case. The SHA prefix always ignores case and Whole Word, and applies only while Regex is off. An invalid regex reads "Invalid regex" and searches nothing. |
+| Next match | `Enter`, `F3` | `Enter`, `F3` | Selects the next match below the selected commit, wrapping to the top. `Enter` only from the find bar; `F3` also from the list. Also the ↓ button. |
+| Previous match | `Shift-Enter`, `F2` | `Shift-Enter`, `F2` | Selects the previous match above the selected commit, wrapping to the bottom. `Shift-Enter` only from the find bar; `F2` also from the list. Also the ↑ button. |
+| Close the find bar | `Escape` | `Escape` | Also the × button. Focus returns to the history list. |
 
 ## Picker shortcuts
 

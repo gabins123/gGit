@@ -1087,6 +1087,7 @@ fn history_author_filter_focuses_its_search_box_and_narrows_the_list(
     let _visual_guard = crate::test_support::lock_visual_test();
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
         super::super::GitCometView::new(store, events, None, window, cx)
     });
 
@@ -1212,6 +1213,7 @@ fn history_author_filter_applies_the_selected_author(cx: &mut gpui::TestAppConte
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_assert = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
         super::super::GitCometView::new(store, events, None, window, cx)
     });
 
@@ -1262,6 +1264,7 @@ fn history_author_filter_applies_free_form_text(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_assert = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
         super::super::GitCometView::new(store, events, None, window, cx)
     });
 
@@ -1303,6 +1306,7 @@ fn history_author_filter_enter_applies_the_row_the_list_highlights(cx: &mut gpui
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_assert = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
         super::super::GitCometView::new(store, events, None, window, cx)
     });
 
@@ -3286,6 +3290,7 @@ fn diff_search_secondary_f_selects_existing_query(cx: &mut gpui::TestAppContext)
 fn diff_search_input_accepts_spaces_without_staging_file(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
         super::super::GitCometView::new(store, events, None, window, cx)
     });
 
@@ -3334,6 +3339,7 @@ fn diff_search_input_accepts_spaces_without_staging_file(cx: &mut gpui::TestAppC
 fn diff_search_close_clears_query_and_input(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
         super::super::GitCometView::new(store, events, None, window, cx)
     });
 
@@ -3953,6 +3959,7 @@ fn diff_search_arrow_buttons_are_disabled_without_matches(cx: &mut gpui::TestApp
 fn diff_search_shift_enter_inserts_a_newline(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
         super::super::GitCometView::new(store, events, None, window, cx)
     });
     open_diff_search_on_two_hunk_diff(cx, &view, RepoId(70943), "diff_search_shift_enter");
@@ -5371,8 +5378,11 @@ fn commit_message_text_input_secondary_f_activates_diff_search(cx: &mut gpui::Te
     });
 }
 
+/// With no diff visible the main pane shows the history list, so Cmd-F from
+/// the commit-message input opens the history find bar instead of the diff
+/// search.
 #[gpui::test]
-fn commit_message_text_input_secondary_f_without_visible_diff_is_noop(
+fn commit_message_text_input_secondary_f_without_visible_diff_opens_history_find(
     cx: &mut gpui::TestAppContext,
 ) {
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
@@ -5399,9 +5409,16 @@ fn commit_message_text_input_secondary_f_without_visible_diff_is_noop(
     apply_state(cx, &view, app_state_with_active_repo(repo));
     focus_commit_message_input(cx, &view);
     cx.update(|window, app| {
+        window.activate_window();
         crate::app::bind_app_keys_for_test(app);
         let _ = window.draw(app);
     });
+    let history_view =
+        cx.update(|_window, app| view.read(app).main_pane.read(app).history_view.clone());
+    assert!(
+        !cx.update(|_window, app| history_view.read(app).history_find_is_open()),
+        "the history find bar starts closed"
+    );
 
     cx.simulate_keystrokes("secondary-f");
     draw_and_drain_test_window(cx);
@@ -5411,8 +5428,40 @@ fn commit_message_text_input_secondary_f_without_visible_diff_is_noop(
         "expected secondary-f to avoid activating diff search when no diff is visible"
     );
     assert!(
-        commit_message_input_is_focused(cx, &view),
-        "expected secondary-f with no visible diff to leave focus unchanged"
+        cx.update(|_window, app| history_view.read(app).history_find_is_open()),
+        "expected secondary-f with no visible diff to open the history find bar"
+    );
+    assert!(
+        cx.debug_bounds("history_find_input_slot").is_some(),
+        "expected the history find bar to be rendered"
+    );
+    assert!(
+        !commit_message_input_is_focused(cx, &view),
+        "expected secondary-f to move focus out of the commit-message input"
+    );
+    cx.update(|window, app| {
+        let focus = &history_view.read(app).history_panel_focus_handle;
+        assert!(
+            focus.contains_focused(window, app) && !focus.is_focused(window),
+            "expected focus inside the history find bar, not on the list itself"
+        );
+    });
+
+    // Typing lands in the find input: the query matches the fixture's only
+    // commit ("Initial commit" by Alice).
+    cx.simulate_input("initial");
+    wait_until(cx, "the history find query to match the commit", |cx| {
+        cx.update(|_window, app| {
+            history_view.update(app, |history, _cx| {
+                history
+                    .history_find_matches()
+                    .is_some_and(|matches| matches.visible == [0])
+            })
+        })
+    });
+    assert!(
+        !diff_search_active(cx, &view),
+        "typing in the history find bar must not open the diff search"
     );
 }
 
@@ -6643,6 +6692,46 @@ mod review_files_tree;
 mod reviewer_menu;
 mod status_selection;
 mod window_and_file_actions;
+
+#[gpui::test]
+fn open_workspace_shortcut_opens_the_workspace_chooser_with_nothing_focused(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    cx.update(|window, app| {
+        app.clear_key_bindings();
+        crate::app::install_app_shortcuts_for_test(app, Arc::new(TestBackend));
+        let _ = window.draw(app);
+        window.activate_window();
+    });
+    focus_detached_window_focus(cx);
+
+    cx.simulate_keystrokes("secondary-shift-r");
+    cx.run_until_parked();
+    draw_and_drain_test_window(cx);
+
+    // One press opens it: a chord handled twice would toggle it shut again.
+    assert_eq!(
+        cx.update(|_window, app| crate::view::test_support::popover_kind(view.read(app), app)),
+        Some(PopoverKind::RepoPicker {
+            scope: RepoPickerScope::WorkspacesOnly
+        }),
+        "Ctrl/Cmd+Shift+R opens the workspace chooser"
+    );
+
+    cx.simulate_keystrokes("secondary-shift-r");
+    cx.run_until_parked();
+    draw_and_drain_test_window(cx);
+    assert_eq!(
+        cx.update(|_window, app| crate::view::test_support::popover_kind(view.read(app), app)),
+        None,
+        "pressing it again closes the chooser"
+    );
+}
 
 #[gpui::test]
 fn background_search_keeps_latest_query_and_queued_navigation(cx: &mut gpui::TestAppContext) {

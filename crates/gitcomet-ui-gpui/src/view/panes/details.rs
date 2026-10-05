@@ -2,6 +2,7 @@ use super::super::path_display;
 use super::super::*;
 use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use crate::kit::text_truncation::path_alignment_visible_signature;
+use gitcomet_core::history_find::HistoryFindQuery;
 use gitcomet_state::model::{AuthRetryOperation, CommandLogEntry};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
@@ -72,6 +73,10 @@ pub(in super::super) struct DetailsPaneView {
     pub(in super::super) show_timezone: bool,
     _ui_model_subscription: gpui::Subscription,
     _commit_message_input_subscription: gpui::Subscription,
+    _history_find_subscription: Option<gpui::Subscription>,
+    /// The history find bar's query, highlighted in the commit details. It
+    /// lives on the history view, so this copy is what repaints the pane.
+    pub(in super::super) history_find_query: Option<HistoryFindQuery>,
     root_view: WeakEntity<GitCometView>,
     main_pane: WeakEntity<MainPaneView>,
     pub(in crate::view) tooltip_host: WeakEntity<TooltipHost>,
@@ -333,6 +338,7 @@ impl DetailsPaneView {
             repo.log_rev.hash(&mut hasher);
             repo.history_state.indexed.rev.hash(&mut hasher);
             repo.history_state.commit_details_rev.hash(&mut hasher);
+            repo.stashes_rev.hash(&mut hasher);
             repo.history_state.commit_signatures_rev.hash(&mut hasher);
             repo.history_state.worktree_selection_rev.hash(&mut hasher);
             repo.history_state.range_files_rev.hash(&mut hasher);
@@ -403,6 +409,7 @@ impl DetailsPaneView {
             });
 
         let commit_message_scroll = ScrollHandle::new();
+        let commit_scroll = ScrollHandle::new();
         let commit_message_input = cx.new(|cx| {
             let mut input = components::TextInput::new(
                 components::TextInputOptions {
@@ -419,7 +426,7 @@ impl DetailsPaneView {
         });
 
         let commit_details_message_input = cx.new(|cx| {
-            components::TextInput::new(
+            let mut input = components::TextInput::new(
                 components::TextInputOptions {
                     multiline: true,
                     read_only: true,
@@ -429,7 +436,12 @@ impl DetailsPaneView {
                 },
                 window,
                 cx,
-            )
+            );
+            // The message scrolls inside a capped container. Without its
+            // handle the input treats all of its height as visible and shapes
+            // every line of a long message when a commit is selected.
+            input.set_vertical_scroll_handle(Some(commit_scroll.clone()));
+            input
         });
         let commit_details_message_link_menu = cx.new(|_cx| {
             components::CommitLinkMenu::new(
@@ -513,6 +525,21 @@ impl DetailsPaneView {
                 this.commit_message_user_edited = true;
             }
         });
+        let history_view = main_pane
+            .upgrade()
+            .map(|main_pane| main_pane.read(cx).history_view.clone());
+        let history_find_query = history_view
+            .as_ref()
+            .and_then(|history| history.read(cx).history_find_query().cloned());
+        let history_find_subscription = history_view.map(|history_view| {
+            cx.observe(&history_view, |this, history, cx| {
+                let query = history.read(cx).history_find_query();
+                if this.history_find_query.as_ref() != query {
+                    this.history_find_query = query.cloned();
+                    cx.notify();
+                }
+            })
+        });
         let mut pane = Self {
             store,
             state,
@@ -525,6 +552,8 @@ impl DetailsPaneView {
             show_timezone,
             _ui_model_subscription: subscription,
             _commit_message_input_subscription: commit_message_subscription,
+            _history_find_subscription: history_find_subscription,
+            history_find_query,
             root_view,
             main_pane,
             tooltip_host,
@@ -555,7 +584,7 @@ impl DetailsPaneView {
             range_files_scroll: UniformListScrollHandle::default(),
             worktree_files_scroll: UniformListScrollHandle::default(),
             commit_message_scroll,
-            commit_scroll: ScrollHandle::new(),
+            commit_scroll,
             pr_details_scroll: ScrollHandle::new(),
             pr_details_scroll_key: None,
             commit_message_input,

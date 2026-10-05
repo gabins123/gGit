@@ -5,6 +5,7 @@ mod effects;
 mod external_and_history;
 mod git_hook_activity;
 mod history_authors;
+mod history_find;
 #[cfg(test)]
 mod index_overlay_tests;
 mod indexed_history;
@@ -14,8 +15,8 @@ mod repo_management;
 mod util;
 
 use crate::model::{
-    AppState, AuthPromptState, AuthRetryOperation, BannerErrorState, BranchExistsPromptOperation,
-    Loadable, PendingCommitRetry, RepoId, SubmoduleAddProgressState, SubmoduleTrustCheckOperation,
+    AppState, AuthPromptState, AuthRetryOperation, BranchExistsPromptOperation, Loadable,
+    PendingCommitRetry, RepoId, SubmoduleAddProgressState, SubmoduleTrustCheckOperation,
     SubmoduleTrustCheckState, SubmoduleTrustPromptOperation, SubmoduleTrustPromptState,
 };
 use crate::msg::{
@@ -249,6 +250,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::CompareWithMarked { .. }
             | Msg::CompareWithWorkingTree { .. }
             | Msg::SelectDiff { .. }
+            | Msg::SetTextOverride { .. }
             | Msg::SelectConflictDiff { .. }
             | Msg::SelectWorktreeUncommitted { .. }
             | Msg::LoadStashes { .. }
@@ -313,6 +315,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::DiscardWorktreeChangesPaths { .. }
             | Msg::SaveWorktreeFile { .. }
             | Msg::AppendGitignorePatterns { .. }
+            | Msg::AppendGitattributesRule { .. }
             | Msg::Commit { .. }
             | Msg::CommitAmend { .. }
             | Msg::SafePushAfterCommit { .. }
@@ -476,24 +479,17 @@ fn retry_msg_for_auth_operation(operation: AuthRetryOperation) -> Option<Msg> {
     }
 }
 
-fn clear_banner_error_for_auth_operation(state: &mut AppState, operation: &AuthRetryOperation) {
-    match operation {
-        AuthRetryOperation::RepoCommand { repo_id, .. }
-        | AuthRetryOperation::SafePushAfterCommit { repo_id, .. }
-        | AuthRetryOperation::Commit { repo_id, .. } => {
-            util::clear_banner_error_for_repo(state, *repo_id);
-        }
-        AuthRetryOperation::Clone { .. } => clear_stale_clone_banner_error(state),
+/// Record an error for the UI to show: on its repo when there is one still
+/// open, else as an app notification.
+fn report_error(state: &mut AppState, repo_id: Option<RepoId>, message: String) {
+    if message.trim().is_empty() {
+        return;
     }
-}
-
-fn clear_stale_clone_banner_error(state: &mut AppState) {
-    if state
-        .banner_error
-        .as_ref()
-        .is_some_and(|banner| banner.message.starts_with("Clone failed"))
-    {
-        state.banner_error = None;
+    match repo_id.and_then(|repo_id| state.repos.iter_mut().find(|r| r.id == repo_id)) {
+        Some(repo_state) => {
+            util::push_diagnostic(repo_state, crate::model::DiagnosticKind::Error, message)
+        }
+        None => util::push_notification(state, crate::model::AppNotificationKind::Error, message),
     }
 }
 
@@ -708,7 +704,8 @@ fn retry_msg_for_repo_command(repo_id: RepoId, command: RepoCommandKind) -> Opti
         // want of credentials — and this replay path exists only to re-run a
         // command after an auth prompt. Retaining `patterns` would make a replay
         // possible; there is just nothing here that an auth prompt could fix.
-        RepoCommandKind::AppendGitignorePatterns { .. } => return None,
+        RepoCommandKind::AppendGitignorePatterns { .. }
+        | RepoCommandKind::AppendGitattributesRule { .. } => return None,
         // Not replayable because command metadata does not retain original content.
         RepoCommandKind::SaveWorktreeFile { .. }
         | RepoCommandKind::StageHunk
@@ -907,8 +904,6 @@ fn submit_auth_prompt(
         }
     };
 
-    clear_banner_error_for_auth_operation(state, &prompt.operation);
-
     match retry_msg_for_auth_operation(prompt.operation) {
         Some(msg) => attach_git_auth_to_effects(reduce(repos, id_alloc, state, msg), auth),
         None => Vec::new(),
@@ -926,6 +921,34 @@ pub(super) fn reduce(
         Msg::GlobalNavBack { .. } | Msg::GlobalNavForward { .. }
     );
     let push = is_view_navigation(&msg);
+    let selection_request = match &msg {
+        Msg::SelectCommit {
+            repo_id,
+            request_id,
+            ..
+        }
+        | Msg::SelectCommitMulti {
+            repo_id,
+            request_id,
+            ..
+        }
+        | Msg::SelectWorktreeUncommitted {
+            repo_id,
+            request_id,
+            ..
+        }
+        | Msg::ClearCommitSelection {
+            repo_id,
+            request_id,
+            ..
+        }
+        | Msg::IndexedHistory(crate::indexed_history::IndexedHistoryMsg::Select {
+            repo_id,
+            request_id,
+            ..
+        }) => request_id.map(|id| (*repo_id, id)),
+        _ => None,
+    };
 
     if reconcile {
         reconcile_active_nav_history(state, false);
@@ -936,6 +959,13 @@ pub(super) fn reduce(
     effects::follow_history_selection(state, &mut effects);
 
     finalize_reduced_state(state, reconcile.then_some(push));
+    // Acknowledge processing, including no-ops and rejected stale projections.
+    // The published selection is the authoritative outcome of this request.
+    if let Some((repo_id, request_id)) = selection_request
+        && let Some(repo) = state.repos.iter_mut().find(|repo| repo.id == repo_id)
+    {
+        repo.history_state.selection_ack = Some(request_id);
+    }
 
     effects
 }
@@ -1029,30 +1059,35 @@ fn reduce_inner(
         Msg::OpenRepoFromExternalDrop(path) => {
             repo_management::open_repo_from_external_drop(repos, id_alloc, state, path)
         }
+        Msg::AcknowledgeRepoOpenFailures { through_revision } => {
+            if state
+                .repo_open_failures
+                .values()
+                .any(|revision| *revision <= through_revision)
+            {
+                Arc::make_mut(&mut state.repo_open_failures)
+                    .retain(|_, revision| *revision > through_revision);
+            }
+            Vec::new()
+        }
         Msg::RestoreSession {
             open_repos,
             active_repo,
         } => repo_management::restore_session(repos, id_alloc, state, open_repos, active_repo),
         Msg::CloseRepo { repo_id } => repo_management::close_repo(repos, state, repo_id),
+        Msg::MoveRepoOut { repo_id } => repo_management::move_repo_out(repos, state, repo_id),
         Msg::CloseRepos {
             repo_ids,
             activate_after,
         } => repo_management::close_repos(repos, state, repo_ids, activate_after),
-        Msg::ShowBannerError { repo_id, message } => {
-            if !message.trim().is_empty() {
-                state.banner_error = Some(BannerErrorState { repo_id, message });
-            }
-            Vec::new()
-        }
-        Msg::DismissBannerError => {
-            state.banner_error = None;
+        Msg::ReportError { repo_id, message } => {
+            report_error(state, repo_id, message);
             Vec::new()
         }
         Msg::DismissRepoError { repo_id } => {
             if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
                 repo_state.feedback.last_error = None;
             }
-            util::clear_banner_error_for_repo(state, repo_id);
             Vec::new()
         }
         Msg::CancelGitOperation {
@@ -1205,13 +1240,18 @@ fn reduce_inner(
                         | crate::msg::InternalMsg::RepoPathsActionFinished { .. }
                         | crate::msg::InternalMsg::RepoActionFinishedInWorktree { .. }
                 );
-            let previous_diagnostic_len = suppress_nested_diagnostics
+            let previous_diagnostics = suppress_nested_diagnostics
                 .then(|| {
                     state
                         .repos
                         .iter()
                         .find(|repo| repo.id == repo_id)
-                        .map(|repo| repo.feedback.diagnostics.len())
+                        .map(|repo| {
+                            (
+                                repo.feedback.diagnostics.clone(),
+                                repo.feedback.diagnostics_seq,
+                            )
+                        })
                 })
                 .flatten();
             if has_hooks && let Some(repo) = state.repos.iter_mut().find(|repo| repo.id == repo_id)
@@ -1223,8 +1263,9 @@ fn reduce_inner(
 
             if let Some(repo) = state.repos.iter_mut().find(|repo| repo.id == repo_id) {
                 repo.feedback.command_log_operation_id = None;
-                if let Some(previous_diagnostic_len) = previous_diagnostic_len {
-                    repo.feedback.diagnostics.truncate(previous_diagnostic_len);
+                if let Some((entries, seq)) = previous_diagnostics {
+                    repo.feedback.diagnostics = entries;
+                    repo.feedback.diagnostics_seq = seq;
                 }
                 git_hook_activity::finished(repo, operation_id, outer_outcome, duration);
             }
@@ -1285,15 +1326,16 @@ fn reduce_inner(
             external_and_history::set_history_author_filter(state, repo_id, author)
         }
         Msg::LoadMoreHistory { repo_id } => external_and_history::load_more_history(state, repo_id),
-        Msg::SelectCommit { repo_id, commit_id } => {
-            effects::select_commit(state, repo_id, commit_id)
-        }
+        Msg::SelectCommit {
+            repo_id, commit_id, ..
+        } => effects::select_commit(state, repo_id, commit_id),
         Msg::SelectCommitMulti {
             repo_id,
             commit_id,
             mode,
             clicked_index,
             visible_order,
+            ..
         } => effects::select_commit_multi(
             state,
             repo_id,
@@ -1302,7 +1344,9 @@ fn reduce_inner(
             clicked_index,
             visible_order,
         ),
-        Msg::ClearCommitSelection { repo_id } => effects::clear_commit_selection(state, repo_id),
+        Msg::ClearCommitSelection { repo_id, .. } => {
+            effects::clear_commit_selection(state, repo_id)
+        }
         Msg::CompareCommitRange {
             repo_id,
             from,
@@ -1346,6 +1390,11 @@ fn reduce_inner(
         Msg::SelectDiff { repo_id, target } => {
             diff_selection::select_diff(repos, state, repo_id, target)
         }
+        Msg::SetTextOverride {
+            repo_id,
+            path,
+            value,
+        } => diff_selection::set_text_override(state, repo_id, path, value),
         Msg::OpenInlineSubmoduleDiff {
             repo_id,
             origin,
@@ -1401,7 +1450,7 @@ fn reduce_inner(
         } => effects::load_blame(state, repo_id, path, source),
         Msg::LoadWorktrees { repo_id } => effects::load_worktrees(state, repo_id),
         Msg::LoadWorktreeDirty { repo_id } => effects::load_worktree_dirty(state, repo_id),
-        Msg::SelectWorktreeUncommitted { repo_id, path } => {
+        Msg::SelectWorktreeUncommitted { repo_id, path, .. } => {
             effects::select_worktree_uncommitted(state, repo_id, path)
         }
         Msg::LoadRefMetadata { repo_id } => effects::load_ref_metadata(state, repo_id),
@@ -1930,13 +1979,18 @@ fn reduce_inner(
             path,
             contents,
             stage,
+            completion,
         } => {
             begin_local_action(state, repo_id);
-            actions_emit_effects::save_worktree_file(repo_id, path, contents, stage)
+            actions_emit_effects::save_worktree_file(repo_id, path, contents, stage, completion)
         }
         Msg::AppendGitignorePatterns { repo_id, patterns } => {
             begin_local_action(state, repo_id);
             actions_emit_effects::append_gitignore_patterns(repo_id, patterns)
+        }
+        Msg::AppendGitattributesRule { repo_id, rule } => {
+            begin_local_action(state, repo_id);
+            vec![Effect::AppendGitattributesRule { repo_id, rule }]
         }
         Msg::Commit {
             repo_id,
@@ -2477,6 +2531,7 @@ fn reduce_inner(
         }
         Msg::IndexedHistory(event) => indexed_history::reduce(state, event),
         Msg::HistoryAuthors(event) => history_authors::reduce(state, event),
+        Msg::HistoryFind(event) => history_find::reduce(state, event),
         Msg::Internal(crate::msg::InternalMsg::LogLoaded {
             repo_id,
             seq,
@@ -2551,7 +2606,13 @@ fn reduce_inner(
             path,
             result,
             conflict_session,
-        }) => effects::conflict_file_loaded(state, repo_id, path, *result, conflict_session),
+        }) => effects::conflict_file_loaded(
+            state,
+            repo_id,
+            path,
+            *result,
+            conflict_session.map(|session| *session),
+        ),
         Msg::Internal(crate::msg::InternalMsg::WorktreesLoaded { repo_id, result }) => {
             effects::worktrees_loaded(state, repo_id, result)
         }
@@ -2609,10 +2670,11 @@ fn reduce_inner(
                     Vec::new()
                 }
                 Err(error) => {
-                    state.banner_error = Some(BannerErrorState {
-                        repo_id: Some(repo_id),
-                        message: util::format_failure_summary("Submodule trust check", &error),
-                    });
+                    report_error(
+                        state,
+                        Some(repo_id),
+                        util::format_failure_summary("Submodule trust check", &error),
+                    );
                     Vec::new()
                 }
             }
@@ -2637,10 +2699,11 @@ fn reduce_inner(
                     Vec::new()
                 }
                 Err(error) => {
-                    state.banner_error = Some(BannerErrorState {
-                        repo_id: Some(repo_id),
-                        message: util::format_failure_summary("Submodule trust check", &error),
-                    });
+                    report_error(
+                        state,
+                        Some(repo_id),
+                        util::format_failure_summary("Submodule trust check", &error),
+                    );
                     Vec::new()
                 }
             }
@@ -2670,10 +2733,11 @@ fn reduce_inner(
                     Vec::new()
                 }
                 Err(error) => {
-                    state.banner_error = Some(BannerErrorState {
-                        repo_id: Some(repo_id),
-                        message: util::format_failure_summary("Submodule trust check", &error),
-                    });
+                    report_error(
+                        state,
+                        Some(repo_id),
+                        util::format_failure_summary("Submodule trust check", &error),
+                    );
                     Vec::new()
                 }
             }
@@ -2749,6 +2813,11 @@ fn reduce_inner(
             target,
             result,
         }) => diff_selection::diff_file_loaded(state, repo_id, target, result),
+        Msg::Internal(crate::msg::InternalMsg::TextAttributesLoaded {
+            repo_id,
+            target,
+            result,
+        }) => diff_selection::text_attributes_loaded(state, repo_id, target, result),
         Msg::Internal(crate::msg::InternalMsg::DiffPreviewTextFileLoaded {
             repo_id,
             target,
@@ -3099,6 +3168,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::SelectCommit {
+                request_id: None,
                 repo_id,
                 commit_id: commit.clone(),
             },
@@ -3106,6 +3176,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::SelectWorktreeUncommitted {
+                request_id: None,
                 repo_id,
                 path: worktree.clone(),
             },
@@ -3190,6 +3261,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::SelectCommit {
+                request_id: None,
                 repo_id,
                 commit_id: commit_a.clone(),
             },
@@ -3249,6 +3321,7 @@ mod nav_history_tests {
             },
         }));
         assert!(is_view_navigation(&Msg::SelectCommit {
+            request_id: None,
             repo_id: RepoId(1),
             commit_id: CommitId("a".into()),
         }));
@@ -3260,7 +3333,10 @@ mod nav_history_tests {
         }));
         // Background / non-navigation messages do not push a step (they are
         // folded into the current entry in place, so they can't pollute history).
-        assert!(!is_view_navigation(&Msg::DismissBannerError));
+        assert!(!is_view_navigation(&Msg::ReportError {
+            repo_id: None,
+            message: String::new(),
+        }));
     }
 
     #[test]
@@ -3269,6 +3345,7 @@ mod nav_history_tests {
             repo_id: RepoId(1),
         }));
         assert!(!is_view_navigation(&Msg::ClearCommitSelection {
+            request_id: None,
             repo_id: RepoId(1),
         }));
         assert!(!is_view_navigation(&Msg::ViewerNavBack {
@@ -3356,6 +3433,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::SelectCommit {
+                request_id: None,
                 repo_id,
                 commit_id: commit_a.clone(),
             },
@@ -3408,6 +3486,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::SelectCommit {
+                request_id: None,
                 repo_id,
                 commit_id: commit_a.clone(),
             },
@@ -3424,6 +3503,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::SelectCommit {
+                request_id: None,
                 repo_id,
                 commit_id: commit_b.clone(),
             },
@@ -3469,6 +3549,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::SelectCommit {
+                request_id: None,
                 repo_id,
                 commit_id: commit_a.clone(),
             },
@@ -3629,6 +3710,7 @@ mod comparison_tests {
         dispatch_effects(
             state,
             Msg::SelectCommitMulti {
+                request_id: None,
                 repo_id,
                 commit_id: CommitId(id.into()),
                 mode,
@@ -4130,5 +4212,73 @@ mod comparison_tests {
                 .any(|e| matches!(e, Effect::LoadRangeFiles { .. })),
             "a commit↔commit comparison is immutable and must not refresh"
         );
+    }
+}
+
+#[cfg(test)]
+mod history_selection_ack_tests {
+    use super::*;
+    use crate::model::RepoState;
+    use gitcomet_core::domain::{CommitId, LogScope, RepoSpec};
+
+    #[test]
+    fn history_selection_acknowledges_noops_and_rejected_requests_by_id() {
+        let repo_id = RepoId(1);
+        let mut state = AppState::test_default();
+        state.repos.push(RepoState::new_opening(
+            repo_id,
+            RepoSpec {
+                workdir: "/tmp/history-selection-ack".into(),
+            },
+        ));
+        let mut repos = FxHashMap::default();
+        let ids = AtomicU64::new(2);
+        for request_id in [11, 12] {
+            reduce(
+                &mut repos,
+                &ids,
+                &mut state,
+                Msg::SelectCommit {
+                    repo_id,
+                    request_id: Some(request_id),
+                    commit_id: CommitId("1111111".into()),
+                },
+            );
+            assert_eq!(state.repos[0].history_state.selection_ack, Some(request_id));
+        }
+        let revision = state.repos[0].history_state.selected_commit_rev;
+        let index = gitcomet_core::history_index::HistoryIndexBuilder::new(
+            gitcomet_core::services::HistorySnapshot("stale".into()),
+            LogScope::AllBranches,
+            20,
+        )
+        .unwrap()
+        .finish(&gitcomet_core::services::CancellationToken::new())
+        .unwrap();
+        reduce(
+            &mut repos,
+            &ids,
+            &mut state,
+            Msg::IndexedHistory(crate::indexed_history::IndexedHistoryMsg::Select {
+                request_id: Some(13),
+                repo_id,
+                commit_id: CommitId("2222222".into()),
+                mode: crate::msg::CommitSelectMode::Single,
+                projection: gitcomet_core::history_index::HistoryProjection::new(index, Vec::new()),
+            }),
+        );
+        assert_eq!(state.repos[0].history_state.selection_ack, Some(13));
+        assert_eq!(state.repos[0].history_state.selected_commit_rev, revision);
+        reduce(
+            &mut repos,
+            &ids,
+            &mut state,
+            Msg::SelectCommit {
+                repo_id,
+                request_id: None,
+                commit_id: CommitId("3333333".into()),
+            },
+        );
+        assert_eq!(state.repos[0].history_state.selection_ack, Some(13));
     }
 }
