@@ -1178,8 +1178,8 @@ pub(in crate::view) use self::markdown_flow_text::{
 pub(in crate::view) use self::markdown_flow_text::{
     markdown_flow_painted_offset, markdown_flow_range_rects, markdown_flow_row_offset,
 };
-pub(in crate::view) use self::sidebar::active_workspace_paths_by_branch;
-pub(in crate::view) use self::sidebar::listed_workspace_paths_by_branch;
+pub(in crate::view) use self::sidebar::active_worktree_paths_by_branch;
+pub(in crate::view) use self::sidebar::listed_worktree_paths_by_branch;
 
 #[cfg(any(test, feature = "benchmarks"))]
 pub(in crate::view) use diff_text::has_pending_prepared_diff_syntax_chunk_builds_for_document;
@@ -1202,7 +1202,7 @@ pub(in crate::view) use diff_text::{
     prepared_diff_syntax_line_for_one_based_line,
     prepared_diff_syntax_occurrences_at_display_offset,
     prepared_diff_syntax_pair_at_display_offset, prepared_diff_syntax_reparse_seed,
-    query_highlight_colors, request_syntax_highlights_for_prepared_document_byte_range,
+    query_highlight_style, request_syntax_highlights_for_prepared_document_byte_range,
     resolved_output_line_text, shared_byte_affix_bounds, syntax_highlights_for_line,
     whitespace_visible_line_text,
 };

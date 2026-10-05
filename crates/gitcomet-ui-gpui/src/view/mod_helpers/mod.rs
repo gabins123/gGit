@@ -970,6 +970,7 @@ pub(super) struct ConflictTextHitbox {
 /// The wrapped layout a row painted, plus what it takes to read offsets back
 /// in row coordinates.
 pub(super) struct DiffTextWrappedHit {
+    pub(super) tab_width: usize,
     pub(super) layout: gpui::TextLayout,
     /// The row's raw text, when tabs were expanded for painting.
     pub(super) untabbed: Option<SharedString>,
@@ -978,8 +979,12 @@ pub(super) struct DiffTextWrappedHit {
 impl DiffTextWrappedHit {
     /// Offset in row coordinates for an offset in the painted text.
     pub(super) fn row_offset(&self, painted_offset: usize) -> usize {
+        let tab_width = self.tab_width;
+
         match &self.untabbed {
-            Some(raw) => crate::view::rows::markdown_flow_row_offset(raw, painted_offset),
+            Some(raw) => {
+                crate::view::rows::markdown_flow_row_offset(tab_width, raw, painted_offset)
+            }
             None => painted_offset,
         }
     }
@@ -987,8 +992,12 @@ impl DiffTextWrappedHit {
     /// Offset in the painted text for an offset in row coordinates — the
     /// inverse of [`Self::row_offset`].
     pub(super) fn painted_offset(&self, row_offset: usize) -> usize {
+        let tab_width = self.tab_width;
+
         match &self.untabbed {
-            Some(raw) => crate::view::rows::markdown_flow_painted_offset(raw, row_offset),
+            Some(raw) => {
+                crate::view::rows::markdown_flow_painted_offset(tab_width, raw, row_offset)
+            }
             None => row_offset,
         }
     }
@@ -1032,13 +1041,26 @@ pub struct GitCometView {
     pub(super) _poller: Poller,
     pub(super) _ui_model_subscription: gpui::Subscription,
     pub(super) _activation_subscription: gpui::Subscription,
+    pub(super) _window_bounds_subscription: gpui::Subscription,
     pub(super) _appearance_subscription: gpui::Subscription,
     pub(super) _terminal_keystroke_interceptor: gpui::Subscription,
     pub(super) _auth_prompt_username_input_subscription: gpui::Subscription,
     pub(super) _auth_prompt_secret_input_subscription: gpui::Subscription,
+    pub(super) _toast_errors_subscription: gpui::Subscription,
     pub(super) _open_repo_input_subscription: gpui::Subscription,
+    pub(super) _home_search_input_subscription: gpui::Subscription,
     pub(super) view_mode: GitCometViewMode,
+    pub(super) workspace_id: Option<gitcomet_state::session::WorkspaceId>,
+    pub(super) persisted_workspace_repo_paths: Vec<std::path::PathBuf>,
+    pub(super) persisted_workspace_active_repository: Option<std::path::PathBuf>,
+    pub(super) window_placement: Option<gitcomet_state::session::PortableWindowPlacement>,
+    pub(super) native_window_title: String,
+    /// Always the global preference; the override lives beside it.
     pub(super) theme_mode: ThemeMode,
+    /// The window's workspace theme, winning over `theme_mode` when set.
+    pub(super) workspace_theme_mode: Option<ThemeMode>,
+    /// Cached so the theme can be re-resolved from snapshot paths with no `Window`.
+    pub(super) window_appearance: gpui::WindowAppearance,
     pub(super) theme: AppTheme,
     pub(super) title_bar: Entity<TitleBarView>,
     pub(super) sidebar_pane: Entity<SidebarPaneView>,
@@ -1062,6 +1084,8 @@ pub struct GitCometView {
     pub(super) focused_mergetool_bootstrap: Option<FocusedMergetoolBootstrap>,
     pub(super) submodule_diff_bootstrap: Option<SubmoduleDiffBootstrap>,
     pub(super) deferred_repo_bootstrap: Option<DeferredRepoBootstrap>,
+    pub(super) pending_repo_open_reservations: FxHashMap<std::path::PathBuf, PendingRepoOpen>,
+    pub(super) pending_repo_open_active: Option<std::path::PathBuf>,
     pub(super) startup_repo_bootstrap_pending: bool,
     pub(super) splash_backdrop_image: Arc<gpui::Image>,
 
@@ -1071,6 +1095,9 @@ pub struct GitCometView {
     /// repo list changes rather than collected on every store snapshot.
     pub(super) synced_repo_paths: std::sync::Arc<[std::path::PathBuf]>,
     pub(super) ui_settings_persist_seq: u64,
+    pub(super) workspace_persist_seq: u64,
+    #[cfg(test)]
+    pub(super) ui_settings_persist_requests_for_test: u64,
     pub(super) last_repo_activation_dispatch_at: FxHashMap<RepoId, Instant>,
     /// Set when a deactivation was caused by a move/resize grab we requested, so
     /// the matching re-activation does not trigger a repo refresh.
@@ -1111,6 +1138,7 @@ pub struct GitCometView {
     pub(super) annotate_enabled: bool,
     pub(super) diff_reveal_whitespace_chars: bool,
     pub(super) diff_word_wrap: bool,
+    pub(super) diff_tab_size: u8,
     pub(super) diff_show_line_numbers: bool,
     pub(super) auto_save_file_edits: bool,
     pub(super) remote_markdown_image_policy: RemoteMarkdownImagePolicy,
@@ -1122,6 +1150,15 @@ pub struct GitCometView {
 
     pub(super) open_repo_panel: bool,
     pub(super) open_repo_input: Entity<components::TextInput>,
+    pub(super) home_search_input: Entity<components::TextInput>,
+    pub(super) home_search_query: String,
+    pub(super) home_rows: super::home::HomeRows,
+    /// Index into `home_rows` in keyboard order (workspaces, then repositories).
+    pub(super) home_selected: Option<usize>,
+    pub(super) home_workspaces_scroll: gpui::UniformListScrollHandle,
+    pub(super) home_repositories_scroll: gpui::UniformListScrollHandle,
+    pub(super) home_pinned_repos: Vec<std::path::PathBuf>,
+    pub(super) home_recent_repos: Vec<std::path::PathBuf>,
     pub(super) external_drag_paths: Option<gpui::ExternalPaths>,
     pub(super) external_drag_payload: Option<external_drag::ClassifiedExternalPaths>,
     pub(super) external_drag_classification_seq: u64,
@@ -1176,6 +1213,9 @@ pub struct GitCometView {
     /// The panel that last held focus, where focus returns when the element
     /// holding it goes away.
     pub(super) last_focused_panel: Option<super::panel_focus::FocusPanel>,
+    /// The panel that held focus when the window was deactivated, which blurs
+    /// it; the panel gets it back on activation (a text field never does).
+    pub(super) panel_before_deactivation: Option<super::panel_focus::FocusPanel>,
     /// When `c` asked for the commit message, to focus it as soon as Details
     /// shows it.
     pub(super) focus_commit_requested: Option<std::time::Instant>,
@@ -1209,6 +1249,7 @@ pub struct GitCometView {
     /// Waits for the dispatched writes to drain before the close/quit it was
     /// asked to retry.
     pub(super) pending_unsaved_file_edits_flush: Option<gpui::Task<()>>,
+    pub(super) pending_file_edits_action: Option<UnsavedFileEditsAction>,
     pub(super) pending_quit_other_views: Vec<gpui::WeakEntity<GitCometView>>,
     pub(super) pending_pull_reconcile_prompt: Option<RepoId>,
     pub(super) pending_branch_exists_prompt: Option<BranchExistsPromptState>,
@@ -1237,7 +1278,6 @@ pub struct GitCometView {
     #[cfg(target_os = "macos")]
     pub(super) recent_repos_menu_fingerprint: Vec<std::path::PathBuf>,
 
-    pub(super) error_banner_input: Entity<components::TextInput>,
     pub(super) auth_prompt_username_input: Entity<components::TextInput>,
     pub(super) auth_prompt_secret_input: Entity<components::TextInput>,
     pub(super) auth_prompt_key: Option<String>,

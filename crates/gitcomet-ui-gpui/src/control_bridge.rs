@@ -352,12 +352,22 @@ async fn poll(window: AnyWindowHandle, dir: PathBuf, cx: &mut AsyncApp) {
     }
 }
 
+/// The window the bridge drives, once started.
+static BRIDGED: std::sync::OnceLock<gpui::WindowId> = std::sync::OnceLock::new();
+
+/// Whether `window` is the bridged one: it counts as active for typing even in
+/// the background (`window_focus::is_active`).
+pub(crate) fn is_bridged(window: gpui::WindowId) -> bool {
+    BRIDGED.get() == Some(&window)
+}
+
 /// Starts polling `GITCOMET_CONTROL_DIR`, if set. No-op otherwise.
 pub(crate) fn start(window: WindowHandle<GitCometView>, cx: &mut App) {
     let Some(dir) = std::env::var_os("GITCOMET_CONTROL_DIR").filter(|dir| !dir.is_empty()) else {
         return;
     };
-    // Later windows (File > New Window) are not bridged: one poller per directory.
+    // Other windows (startup's others, File > New Window) are not bridged:
+    // one poller per directory.
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -369,6 +379,7 @@ pub(crate) fn start(window: WindowHandle<GitCometView>, cx: &mut App) {
     }
     eprintln!("control bridge: watching {}", dir.display());
     let window = AnyWindowHandle::from(window);
+    let _ = BRIDGED.set(window.window_id());
     cx.spawn(async move |cx| poll(window, dir, cx).await)
         .detach();
 }

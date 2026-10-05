@@ -15,14 +15,20 @@ test-support = []
 benchmarks = []
 
 [dependencies]
+chardetng = { workspace = true }
+encoding_rs = { workspace = true }
+gix-quote = { workspace = true }
 memchr = { workspace = true }
 process-wrap = { workspace = true }
 regex = { workspace = true }
 rustc-hash = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true }
 smallvec = { workspace = true }
 strsim = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }

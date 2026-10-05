@@ -11,7 +11,9 @@ development tooling, not a user-facing feature, so the keyboard-first rule in
   contain it. No cargo feature is needed.
 - Starts only when `GITCOMET_CONTROL_DIR` is set to a directory (created if
   missing). Unset, nothing runs: no thread, no timer, no polling.
-- Only the first normal window is bridged.
+- Only the window startup lands in is bridged (with several workspaces
+  restored, the last-activated one). It takes typing even in the background:
+  text fields there accept the bridge's keys without the window being active.
 
 ## Launch
 

@@ -38,6 +38,7 @@ impl MainPaneView {
         let annotate_enabled = preferences.diff.annotate_enabled;
         let diff_reveal_whitespace_chars = preferences.diff.reveal_whitespace_chars;
         let diff_word_wrap = preferences.diff.word_wrap;
+        let default_tab_size = preferences.diff.tab_size;
         let diff_show_line_numbers = preferences.diff.show_line_numbers;
         let remote_markdown_image_policy = preferences.security.remote_markdown_images;
         let auto_save_file_edits = preferences.file_editing.auto_save;
@@ -341,6 +342,8 @@ impl MainPaneView {
             rendered_preview_modes: RenderedPreviewModes::default(),
             remote_markdown_images: RemoteMarkdownImages::new(remote_markdown_image_policy),
             diff_word_wrap,
+            default_tab_size,
+            display_tab_width: usize::from(default_tab_size),
             diff_show_line_numbers,
             diff_scroll_sync,
             diff_content_mode,
@@ -526,6 +529,8 @@ impl MainPaneView {
             conflict_image_preview_cancel: None,
             worktree_preview_path: None,
             worktree_preview_source_path: None,
+            worktree_preview_decode_key: None,
+            worktree_preview_text_format: None,
             worktree_preview: Loadable::NotLoaded,
             worktree_preview_source_len: 0,
             worktree_preview_text: SharedString::default(),
@@ -549,8 +554,13 @@ impl MainPaneView {
             file_editor_reread_seq: 0,
             file_editor_disk: DiskIdentity::default(),
             file_editor_error: None,
+            file_editor_text_format: None,
+            file_editor_source_text_format: None,
+            file_editor_decode_key: None,
+            file_editor_waiting_for_attributes: false,
             file_editor_dirty: false,
             file_editor_first_dirty_line: None,
+            file_editor_save_error: None,
             unsaved_file_edits_rev: 0,
             file_editor_saved_fingerprint: None,
             file_disk_notice: None,
@@ -558,6 +568,8 @@ impl MainPaneView {
             file_disk_check_in_flight: None,
             file_disk_seen: None,
             file_editor_stash: FxHashMap::default(),
+            file_editor_pending_saves: FxHashMap::default(),
+            file_editor_failed_saves: FxHashSet::default(),
             file_editor_autosave: None,
             file_editor_live_syntax: None,
             file_editor_live_syntax_source: None,
@@ -636,6 +648,7 @@ impl MainPaneView {
             pull_request_scroll: ScrollHandle::new(),
             pr_markdown_cache: Default::default(),
             pull_request_scroll_key: None,
+            pull_request_shown: false,
             diff_scroll: UniformListScrollHandle::default(),
             diff_split_right_scroll: UniformListScrollHandle::default(),
             conflict_resolver_diff_scroll: UniformListScrollHandle::default(),

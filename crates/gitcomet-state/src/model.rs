@@ -14,6 +14,7 @@ use gitcomet_core::services::{
     SubmoduleTrustTarget,
 };
 use gitcomet_core::signing_tools::SigningToolsState;
+use gitcomet_core::text_format::{TextAttributes, TextEncoding, TextOverride};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -437,11 +438,7 @@ impl ConflictFile {
 fn conflict_file_side_from_payload(
     payload: &ConflictPayload,
 ) -> (Option<Arc<[u8]>>, Option<Arc<str>>) {
-    match payload {
-        ConflictPayload::Text(text) => (None, Some(text.clone())),
-        ConflictPayload::Binary(bytes) => (Some(bytes.clone()), None),
-        ConflictPayload::Absent => (None, None),
-    }
+    payload.clone().into_stage_parts()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -711,9 +708,13 @@ impl<T: Clone + PartialEq> NavStack<T> {
 pub struct AppState {
     pub repos: Vec<RepoState>,
     pub active_repo: Option<RepoId>,
+    /// Unacknowledged open failures, shared by snapshots until they change.
+    /// Window routing releases its reservations before acknowledging these.
+    pub repo_open_failures: Arc<FxHashMap<PathBuf, u64>>,
+    /// Store-wide sequence; acknowledgements must not reset retry baselines.
+    pub repo_open_failure_revision: u64,
     pub clone: Option<CloneOpState>,
     pub notifications: Vec<AppNotification>,
-    pub banner_error: Option<BannerErrorState>,
     pub auth_prompt: Option<AuthPromptState>,
     pub branch_exists_prompt: Option<BranchExistsPromptState>,
     pub submodule_trust_prompt: Option<SubmoduleTrustPromptState>,
@@ -772,12 +773,6 @@ pub struct BranchExistsPromptState {
     pub name: String,
     pub target: String,
     pub operation: BranchExistsPromptOperation,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BannerErrorState {
-    pub repo_id: Option<RepoId>,
-    pub message: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1059,6 +1054,7 @@ pub struct PendingCommitRetry {
 pub struct HistoryState {
     pub indexed: crate::indexed_history::IndexedHistoryState,
     pub authors: crate::history_authors::HistoryAuthorsState,
+    pub find: crate::history_find::HistoryFindState,
     pub history_scope: LogScope,
     /// Case-insensitive author filter for the history, or `None` for all
     /// authors. Matches the author name shown in the UI.
@@ -1082,6 +1078,9 @@ pub struct HistoryState {
     pub retained_blame_while_loading: Option<Shared<Vec<BlameLine>>>,
     pub selected_commit: Option<CommitId>,
     pub selected_commit_rev: u64,
+    /// Last processed UI selection request, even when it did not change focus.
+    /// Automatic store reconciliation leaves this acknowledgment unchanged.
+    pub selection_ack: Option<u64>,
     /// The commit a "reveal in history" is currently walking toward.
     ///
     /// It is selected the moment the reveal starts, before the log has paged far
@@ -1216,6 +1215,7 @@ impl Default for HistoryState {
         Self {
             indexed: Default::default(),
             authors: Default::default(),
+            find: Default::default(),
             history_scope: LogScope::default(),
             history_author_filter: None,
             log: Loadable::NotLoaded,
@@ -1232,6 +1232,7 @@ impl Default for HistoryState {
             retained_blame_while_loading: None,
             selected_commit: None,
             selected_commit_rev: 0,
+            selection_ack: None,
             reveal_target: None,
             commit_details: Loadable::NotLoaded,
             commit_details_rev: 0,
@@ -1286,6 +1287,126 @@ impl CommitMultiSelection {
     pub fn contains(&self, id: &CommitId) -> bool {
         self.commits.iter().any(|c| c == id)
     }
+}
+
+impl CommitMultiSelection {
+    /// Predicts focus and membership for a history input without scheduling loads.
+    /// Shared by the reducer and the UI while selection replies are in flight.
+    pub fn select(
+        &self,
+        commit_id: CommitId,
+        mode: crate::msg::CommitSelectMode,
+        clicked_index: Option<usize>,
+        mut visible_order: Option<Vec<CommitId>>,
+        log_rev: u64,
+    ) -> (Self, Option<CommitId>) {
+        let mut sel = self.clone();
+        let focus = match mode {
+            crate::msg::CommitSelectMode::Single => {
+                collapse_multi_selection_to(&mut sel, commit_id.clone(), clicked_index, log_rev);
+                commit_id
+            }
+            crate::msg::CommitSelectMode::Toggle => {
+                if let Some(ix) = sel.commits.iter().position(|c| *c == commit_id) {
+                    Arc::make_mut(&mut sel.commits).remove(ix);
+                    let Some(focus) = sel.commits.last().cloned() else {
+                        // Toggled the last commit away: clear the selection
+                        // entirely (also dissolves the multi-selection).
+                        return (Self::default(), None);
+                    };
+                    focus
+                } else {
+                    Arc::make_mut(&mut sel.commits).push(commit_id.clone());
+                    sel.anchor = Some(commit_id.clone());
+                    sel.anchor_index = clicked_index;
+                    sel.anchor_log_rev = Some(log_rev);
+                    commit_id
+                }
+            }
+            crate::msg::CommitSelectMode::Range => {
+                let entries = visible_order.as_deref().unwrap_or(&[]);
+                let clicked_ix = commit_selection_entry_index(entries, &commit_id, clicked_index);
+                match clicked_ix {
+                    None => {
+                        collapse_multi_selection_to(
+                            &mut sel,
+                            commit_id.clone(),
+                            clicked_index,
+                            log_rev,
+                        );
+                    }
+                    Some(clicked_ix) => {
+                        let anchor_ix = sel
+                            .anchor
+                            .as_ref()
+                            .and_then(|anchor| {
+                                let trusted_hint = sel
+                                    .anchor_index
+                                    .filter(|_| sel.anchor_log_rev == Some(log_rev));
+                                commit_selection_entry_index(entries, anchor, trusted_hint)
+                            })
+                            .unwrap_or(clicked_ix);
+                        let (a, b) = if anchor_ix <= clicked_ix {
+                            (anchor_ix, clicked_ix)
+                        } else {
+                            (clicked_ix, anchor_ix)
+                        };
+                        sel.commits = Arc::new(if a == 0 && b + 1 == entries.len() {
+                            visible_order.take().unwrap()
+                        } else {
+                            entries[a..=b].to_vec()
+                        });
+                        if sel.anchor.is_none() {
+                            sel.anchor = Some(commit_id.clone());
+                        }
+                        sel.anchor_index = Some(anchor_ix);
+                        sel.anchor_log_rev = Some(log_rev);
+                    }
+                }
+                commit_id
+            }
+            crate::msg::CommitSelectMode::PreserveIfSelected => {
+                // Keep an existing multi-selection intact when the clicked commit
+                // is already part of it — only the focus moves. Otherwise collapse
+                // to the clicked commit like a plain click.
+                if !sel.commits.contains(&commit_id) {
+                    collapse_multi_selection_to(
+                        &mut sel,
+                        commit_id.clone(),
+                        clicked_index,
+                        log_rev,
+                    );
+                }
+                commit_id
+            }
+        };
+
+        (sel, Some(focus))
+    }
+}
+
+fn collapse_multi_selection_to(
+    sel: &mut crate::model::CommitMultiSelection,
+    commit_id: CommitId,
+    clicked_index: Option<usize>,
+    log_rev: u64,
+) {
+    sel.commits = Arc::new(vec![commit_id.clone()]);
+    sel.anchor = Some(commit_id);
+    sel.anchor_index = clicked_index;
+    sel.anchor_log_rev = Some(log_rev);
+}
+
+/// Resolves `target`'s index in `entries`, preferring the index hint when it
+/// still points at the target.
+fn commit_selection_entry_index(
+    entries: &[CommitId],
+    target: &CommitId,
+    index_hint: Option<usize>,
+) -> Option<usize> {
+    index_hint
+        .filter(|&ix| entries.get(ix) == Some(target))
+        .or_else(|| entries.iter().position(|id| id == target))
 }
 
 /// A "compare two points" selection. `from` is the base/older side and `to`
@@ -1351,6 +1472,36 @@ pub struct DiffState {
     pub inline_submodule_diff_rev: u64,
     pub inline_submodule_diff: Option<InlineSubmoduleDiffState>,
     pub diff_file_image: Loadable<Option<Shared<FileDiffImage>>>,
+    pub text_attributes_rev: u64,
+    /// `.gitattributes` and config for the selected file.
+    pub text_attributes: Loadable<Arc<TextAttributes>>,
+    pub text_override_rev: u64,
+    /// The user's encoding / line-ending / tab-size choice for the open file.
+    /// Dropped when another path is selected.
+    pub text_override: Option<OpenFileTextOverride>,
+}
+
+/// A [`TextOverride`] and the file it belongs to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenFileTextOverride {
+    pub path: PathBuf,
+    pub value: TextOverride,
+}
+
+impl DiffState {
+    /// The override for `path` when it is the open file.
+    pub fn text_override_for(&self, path: &std::path::Path) -> Option<TextOverride> {
+        self.text_override
+            .as_ref()
+            .filter(|open| open.path == path)
+            .map(|open| open.value)
+    }
+
+    /// The user's encoding choice for the selected file.
+    pub fn selected_encoding_override(&self) -> Option<TextEncoding> {
+        let path = self.diff_target.as_ref()?.file_path()?;
+        self.text_override_for(path)?.encoding
+    }
 }
 
 impl Default for DiffState {
@@ -1374,6 +1525,10 @@ impl Default for DiffState {
             inline_submodule_diff_rev: 0,
             inline_submodule_diff: None,
             diff_file_image: Loadable::NotLoaded,
+            text_attributes_rev: 0,
+            text_attributes: Loadable::NotLoaded,
+            text_override_rev: 0,
+            text_override: None,
         }
     }
 }
@@ -1661,6 +1816,8 @@ pub struct RepoFeedbackState {
     pub missing_on_disk: bool,
     pub last_error: Option<String>,
     pub diagnostics: Vec<DiagnosticEntry>,
+    /// Number appended, including entries evicted from the bounded history.
+    pub diagnostics_seq: u64,
     pub command_log: Vec<CommandLogEntry>,
     pub hook_activity: Vec<GitHookOperation>,
     pub hook_activity_rev: u64,
@@ -1943,12 +2100,18 @@ impl RepoState {
         repo
     }
 
-    pub(crate) fn is_provisional_external_drop_open(&self) -> bool {
+    pub fn is_provisional_external_drop_open(&self) -> bool {
         self.provisional_external_drop_open
     }
 
     pub(crate) fn external_drop_previous_active_repo(&self) -> Option<RepoId> {
         self.external_drop_previous_active_repo
+    }
+
+    pub(crate) fn set_external_drop_previous_active_repo(&mut self, repo_id: Option<RepoId>) {
+        if self.provisional_external_drop_open {
+            self.external_drop_previous_active_repo = repo_id;
+        }
     }
 
     /// Commits a successfully opened external-drop candidate. Returns whether
@@ -2952,7 +3115,33 @@ impl RepoState {
         if self.diff_state.diff_target != target {
             self.diff_state.diff_target_rev = self.diff_state.diff_target_rev.wrapping_add(1);
         }
+        // The override lasts while its file stays open, across views of it.
+        let keeps_override = self.diff_state.text_override.as_ref().is_none_or(|open| {
+            target.as_ref().and_then(DiffTarget::file_path) == Some(open.path.as_path())
+        });
+        if !keeps_override {
+            self.diff_state.text_override = None;
+            self.bump_text_override_rev();
+        }
+        // Attributes belong to one path; another file must not be read under
+        // them while its own are loading.
+        let old_path = self
+            .diff_state
+            .diff_target
+            .as_ref()
+            .and_then(DiffTarget::file_path);
+        if old_path != target.as_ref().and_then(DiffTarget::file_path)
+            && !matches!(self.diff_state.text_attributes, Loadable::NotLoaded)
+        {
+            self.diff_state.text_attributes = Loadable::NotLoaded;
+            self.diff_state.text_attributes_rev =
+                self.diff_state.text_attributes_rev.wrapping_add(1);
+        }
         self.diff_state.diff_target = target;
+    }
+
+    pub(crate) fn bump_text_override_rev(&mut self) {
+        self.diff_state.text_override_rev = self.diff_state.text_override_rev.wrapping_add(1);
     }
 
     pub(crate) fn bump_diff_state_rev(&mut self) {
@@ -2988,6 +3177,7 @@ impl RepoState {
         self.load_epoch = self.load_epoch.wrapping_add(1);
         self.history_state.indexed.cancel();
         self.history_state.authors.cancellation.cancel();
+        self.history_state.find.interrupt();
         previous
     }
 }
